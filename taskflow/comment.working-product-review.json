@@ -1,0 +1,16 @@
+{
+  "type": "POST",
+  "id": "5e52c9c1-fbc0-4a07-b984-fa60f9aa2351",
+  "name": "Echo first working product ready for review",
+  "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
+  "content": {
+    "body": "First working product is ready for review. Main now includes a runnable `agent-harness serve` CLI, FastAPI service, v1 sessions/runs/messages/backends endpoints, firehose/session/run SSE stream endpoints, in-memory event bus/repository, watchfiles-backed transcript watch service, observer materialization into repository state, and OpenAPI/hybrid docs. Verification: uv run pytest -> 27 passed; OpenAPI YAML parses; smoke test served on 127.0.0.1:8876 and returned 200 for /health and /v1/backends. Latest commit: 665ebb7."
+  },
+  "relations": {
+    "replies_to": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ]
+  }
+}

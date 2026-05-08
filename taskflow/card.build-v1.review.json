@@ -1,0 +1,31 @@
+{
+  "type": "BOARD_CARD",
+  "id": "200994f6-2ad1-4d9c-86e6-596d3e4712c9",
+  "name": "Build agent-harness Echo v1 in Review",
+  "instruction": "A TaskFlow board card placing the Echo v1 build task in the Review column.",
+  "content": {
+    "position": 0
+  },
+  "relations": {
+    "task": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ],
+    "board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "board_state": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.84a1907e-fe07-4055-ba23-2f1a2ad8fd42"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.d3e9b505-1122-4d8f-96c1-ff3715b063da"
+      }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "type": "BOARD_CARD",
+  "id": "52d1b39b-f63e-402d-9f20-ba5abeaca59e",
+  "name": "Build agent-harness Echo v1 in Refinement",
+  "instruction": "A TaskFlow board card placing the Echo v1 build task in the Refinement column.",
+  "content": {
+    "position": 0
+  },
+  "relations": {
+    "task": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ],
+    "board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "board_state": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.aff85efb-f9c2-40ff-a0fb-834d0bb4cf2a"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.d3e9b505-1122-4d8f-96c1-ff3715b063da"
+      }
+    ]
+  }
+}

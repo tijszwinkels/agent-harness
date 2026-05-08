@@ -1,0 +1,35 @@
+{
+  "type": "TASK",
+  "id": "eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6",
+  "name": "Build agent-harness Echo v1",
+  "instruction": "A TaskFlow task. Display title, description, priority, and completion status.",
+  "content": {
+    "title": "Build agent-harness Echo v1",
+    "body": "Create a clean-slate Python HTTP/SSE service and Python SDK for CLI-based coding agents under /home/claude/projects/agent-harness-echo. The v1 spine is Session and Run with the agreed /v1 API shape. The defining product constraint is the hybrid orchestrator + observer model: harness-launched runs own lifecycle, while externally-started Claude Code and Codex sessions are discovered from transcript files and surfaced through the same normalized messages and SSE events. Keep v1 single-user, no auth endpoints, no OpenCode, no UI. Keep notes in ~/.agents/echo and coordinate sub-sessions only with agentcom.",
+    "completed": false,
+    "priority": 2,
+    "kind": "feature",
+    "labels": [
+      "agent-harness",
+      "echo",
+      "hybrid"
+    ]
+  },
+  "relations": {
+    "project": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.172989f5-eaf1-406b-91f5-c250c828dfac"
+      }
+    ],
+    "in_application": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.bb2908d9-072c-4c19-9de3-afabe6acb341"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.948d3824-c5fa-40ad-b79e-d0d0371baa09"
+      }
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "type": "PROJECT",
+  "id": "172989f5-eaf1-406b-91f5-c250c828dfac",
+  "name": "Agent Harness (Echo)",
+  "instruction": "A TaskFlow project grouping tasks for Echo's autonomous clean-slate agent-harness build.",
+  "content": {
+    "name": "Agent Harness (Echo)",
+    "shortcode": "ahe",
+    "description": "Echo's implementation track for a Python HTTP/SSE service and SDK for CLI coding agents, with hybrid orchestrator plus filesystem observer behavior as the defining constraint.",
+    "directory": "/home/claude/projects/agent-harness-echo",
+    "environment": "local"
+  },
+  "relations": {
+    "default_board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "in_application": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.bb2908d9-072c-4c19-9de3-afabe6acb341"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.76f14f28-c838-4352-864f-750c3c1444ed"
+      }
+    ]
+  }
+}

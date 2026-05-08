@@ -1,0 +1,22 @@
+{
+  "type": "BOARD",
+  "id": "1bc48d06-17dc-4886-a378-be5ac8d4eb2e",
+  "name": "Agent Harness (Echo)",
+  "instruction": "A TaskFlow board for the autonomous Echo build of agent-harness. Display workflow columns and cards for this project.",
+  "content": {
+    "name": "Agent Harness (Echo)",
+    "description": "Default board for Echo's clean-slate agent-harness implementation."
+  },
+  "relations": {
+    "in_application": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.bb2908d9-072c-4c19-9de3-afabe6acb341"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.c805aac7-d64d-4530-a80a-0e2e5391b76a"
+      }
+    ]
+  }
+}

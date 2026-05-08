@@ -1,0 +1,24 @@
+{
+  "type": "BOARD_STATE",
+  "id": "4986907e-d5e4-4265-8c19-0ed88e8bf5af",
+  "name": "Landed",
+  "instruction": "A TaskFlow board column for work that is complete and confirmed.",
+  "content": {
+    "name": "Landed",
+    "position": 3,
+    "kind": "done",
+    "color": "#16a34a"
+  },
+  "relations": {
+    "board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.7f6fa664-c544-49d0-a8ba-574da6281ff0"
+      }
+    ]
+  }
+}

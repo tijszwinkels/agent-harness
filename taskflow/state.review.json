@@ -1,0 +1,24 @@
+{
+  "type": "BOARD_STATE",
+  "id": "84a1907e-fe07-4055-ba23-2f1a2ad8fd42",
+  "name": "Review",
+  "instruction": "A TaskFlow board column for work that is ready for review.",
+  "content": {
+    "name": "Review",
+    "position": 2,
+    "kind": "active",
+    "color": "#d97706"
+  },
+  "relations": {
+    "board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.7f6fa664-c544-49d0-a8ba-574da6281ff0"
+      }
+    ]
+  }
+}

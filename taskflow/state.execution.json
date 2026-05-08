@@ -1,0 +1,24 @@
+{
+  "type": "BOARD_STATE",
+  "id": "879f8890-9cd2-42bf-97ce-7260026a4ae9",
+  "name": "Execution",
+  "instruction": "A TaskFlow board column for active implementation work.",
+  "content": {
+    "name": "Execution",
+    "position": 1,
+    "kind": "active",
+    "color": "#2563eb"
+  },
+  "relations": {
+    "board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.7f6fa664-c544-49d0-a8ba-574da6281ff0"
+      }
+    ]
+  }
+}

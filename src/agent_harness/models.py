@@ -161,5 +161,15 @@ class CreateSessionRequest(HarnessModel):
     title: str | None = None
 
 
+class CreateRunRequest(HarnessModel):
+    message: str = Field(min_length=1)
+    model: str | None = None
+
+
+class CreateRunResponse(HarnessModel):
+    session_id: str
+    run_id: str
+
+
 class DataList(HarnessModel):
     data: list[Any]

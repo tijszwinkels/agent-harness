@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from agent_harness.models import (
     BackendCapabilities,
+    CreateRunRequest,
     CreateSessionRequest,
     Event,
     Message,
@@ -75,3 +76,8 @@ def test_run_model_defaults_to_queued_lifecycle() -> None:
     assert run.status == "queued"
     assert run.origin == "harness"
     assert run.session_id == session.id
+
+
+def test_create_run_request_requires_message_text() -> None:
+    with pytest.raises(ValidationError):
+        CreateRunRequest(message="")

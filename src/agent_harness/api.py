@@ -10,8 +10,8 @@ from starlette.responses import StreamingResponse
 
 from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import CreateSessionRequest, Event
-from agent_harness.repository import InMemoryRepository, SessionNotFoundError
+from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event
+from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,50 @@ def create_app(
             )
         )
         return session
+
+    @app.post("/v1/sessions/{session_id}/runs", status_code=status.HTTP_202_ACCEPTED)
+    async def create_run(session_id: str, request: CreateRunRequest) -> CreateRunResponse:
+        try:
+            run = repo.create_run(session_id, request)
+        except SessionNotFoundError as exc:
+            logger.warning("Run create failed because session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+
+        await events.publish(Event(event="run.started", session_id=session_id, run_id=run.id, data={}))
+        return CreateRunResponse(session_id=session_id, run_id=run.id)
+
+    @app.get("/v1/sessions/{session_id}/runs")
+    async def list_runs(session_id: str) -> dict[str, object]:
+        try:
+            return {"data": repo.list_runs(session_id)}
+        except SessionNotFoundError as exc:
+            logger.warning("Run list failed because session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+
+    @app.get("/v1/sessions/{session_id}/runs/{run_id}")
+    async def get_run(session_id: str, run_id: str) -> object:
+        try:
+            return repo.get_run(session_id, run_id)
+        except SessionNotFoundError as exc:
+            logger.warning("Run lookup failed because session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+        except RunNotFoundError as exc:
+            logger.warning("Run lookup failed: session=%s run=%s", session_id, run_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found") from exc
+
+    @app.delete("/v1/sessions/{session_id}/runs/{run_id}")
+    async def interrupt_run(session_id: str, run_id: str) -> object:
+        try:
+            run = repo.interrupt_run(session_id, run_id)
+        except SessionNotFoundError as exc:
+            logger.warning("Run interrupt failed because session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+        except RunNotFoundError as exc:
+            logger.warning("Run interrupt failed: session=%s run=%s", session_id, run_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found") from exc
+
+        await events.publish(Event(event="run.interrupted", session_id=session_id, run_id=run.id, data={}))
+        return run
 
     @app.get("/v1/events")
     async def stream_events(

@@ -9,7 +9,7 @@ Clean-slate Python scaffold for an HTTP/SSE service and SDK primitives for CLI c
 - In-memory session repository.
 - In-memory event bus with monotonic sequence numbers, replay, and live subscriptions.
 - Backend registry stubs for `claude-code` and `codex`.
-- FastAPI app factory with health, backend listing, session create/list/get/archive, and SSE event streaming endpoints.
+- FastAPI app factory with health, backend listing, session create/list/get, DELETE-based session archival, and SSE event streaming endpoints.
 
 ## Development
 

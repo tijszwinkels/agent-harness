@@ -1,0 +1,690 @@
+openapi: 3.1.0
+info:
+  title: agent-harness API
+  version: 0.1.0-beta
+  summary: HTTP and SSE API for CLI-agent sessions and runs.
+  description: |
+    v1 is a local/trusted single-user API. Identity and auth are deliberately
+    outside the wire contract. The primary nouns are Session, the persistent
+    conversation, and Run, one addressable invocation inside a session.
+servers:
+  - url: http://localhost:8000
+tags:
+  - name: Sessions
+  - name: Runs
+  - name: Events
+  - name: Backends
+paths:
+  /v1/sessions:
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      summary: Create a harness-origin session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Created session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List the caller's sessions.
+      description: In v1 this returns all known sessions for the single local caller.
+      responses:
+        "200":
+          description: Sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Session"
+
+  /v1/sessions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: Get a session.
+      responses:
+        "200":
+          description: Session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Sessions]
+      operationId: archiveSession
+      summary: Archive a session.
+      description: Soft-archives the session. It does not stop external CLI processes.
+      responses:
+        "200":
+          description: Archived session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      tags: [Sessions]
+      operationId: listSessionMessages
+      summary: List normalized session messages.
+      responses:
+        "200":
+          description: Messages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Message"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/runs:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      tags: [Runs]
+      operationId: createRun
+      summary: Start a run in a session.
+      description: |
+        Starts a harness-origin run and returns immediately with session_id and
+        run_id. If the session is external, the harness attempts backend resume;
+        unsupported resume returns 409 Conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRunRequest"
+      responses:
+        "202":
+          description: Run accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateRunResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Runs]
+      operationId: listSessionRuns
+      summary: List runs in a session.
+      responses:
+        "200":
+          description: Runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/RunId"
+    get:
+      tags: [Runs]
+      operationId: getRun
+      summary: Get a run.
+      responses:
+        "200":
+          description: Run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Runs]
+      operationId: interruptRun
+      summary: Interrupt a run.
+      description: |
+        Interrupts a harness-origin run when the harness owns the process.
+        External-origin runs return 409 Conflict in v1.
+      responses:
+        "200":
+          description: Interrupted run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/forks:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      tags: [Sessions]
+      operationId: forkSession
+      summary: Fork a session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkSessionRequest"
+      responses:
+        "201":
+          description: Forked session, with optional first run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForkSessionResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/runs/{run_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/EventFrom"
+    get:
+      tags: [Events, Runs]
+      operationId: streamRunEvents
+      summary: Stream events for one run.
+      responses:
+        "200":
+          $ref: "#/components/responses/EventStream"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/EventFrom"
+    get:
+      tags: [Events, Sessions]
+      operationId: streamSessionEvents
+      summary: Stream events for a whole session.
+      responses:
+        "200":
+          $ref: "#/components/responses/EventStream"
+        "404":
+          $ref: "#/components/responses/Error"
+
+  /v1/events:
+    get:
+      tags: [Events]
+      operationId: streamFirehoseEvents
+      summary: Stream events for all sessions and runs.
+      parameters:
+        - $ref: "#/components/parameters/EventFrom"
+      responses:
+        "200":
+          $ref: "#/components/responses/EventStream"
+
+  /v1/backends:
+    get:
+      tags: [Backends]
+      operationId: listBackends
+      summary: List supported backends.
+      responses:
+        "200":
+          description: Backend descriptors.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Backend"
+
+  /v1/backends/{name}/models:
+    parameters:
+      - $ref: "#/components/parameters/BackendName"
+    get:
+      tags: [Backends]
+      operationId: listBackendModels
+      summary: List models for a backend.
+      responses:
+        "200":
+          description: Model names.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/Error"
+
+components:
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Harness id, or stable external id such as claude_<uuid> or codex_<uuid>.
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+    BackendName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+    EventFrom:
+      name: from
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [now, beginning]
+        default: now
+      description: Unknown query parameters must be ignored for wrapper compatibility.
+
+  responses:
+    Error:
+      description: Error response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    EventStream:
+      description: Server-Sent Events encoded as text/event-stream.
+      content:
+        text/event-stream:
+          schema:
+            type: string
+          examples:
+            runStarted:
+              value: |
+                id: 42
+                event: run.started
+                data: {"sequence":42,"run_id":"run_abc123","session_id":"ses_abc123"}
+
+  schemas:
+    Session:
+      type: object
+      required: [id, backend, model, project, title, created_at, updated_at, status, origin, stats]
+      properties:
+        id:
+          type: string
+        backend:
+          type: string
+        model:
+          type: string
+        project:
+          $ref: "#/components/schemas/Project"
+        title:
+          type: [string, "null"]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [idle, running, waiting_for_input, archived]
+        origin:
+          $ref: "#/components/schemas/Origin"
+        stats:
+          $ref: "#/components/schemas/SessionStats"
+
+    Run:
+      type: object
+      required: [id, session_id, status, started_at, completed_at, input_message_id, stop_reason, origin, usage]
+      properties:
+        id:
+          type: string
+        session_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, completed, failed, interrupted]
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+        input_message_id:
+          type: [string, "null"]
+        stop_reason:
+          type: [string, "null"]
+          enum: [end_turn, tool_use, max_tokens, interrupted, null]
+        origin:
+          $ref: "#/components/schemas/Origin"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    Message:
+      type: object
+      required: [id, role, timestamp, blocks, run_id]
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant]
+        timestamp:
+          type: string
+          format: date-time
+        blocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageBlock"
+        model:
+          type: [string, "null"]
+        run_id:
+          type: [string, "null"]
+
+    MessageBlock:
+      oneOf:
+        - $ref: "#/components/schemas/TextBlock"
+        - $ref: "#/components/schemas/ThinkingBlock"
+        - $ref: "#/components/schemas/ToolUseBlock"
+        - $ref: "#/components/schemas/ToolResultBlock"
+        - $ref: "#/components/schemas/ImageBlock"
+      discriminator:
+        propertyName: type
+
+    TextBlock:
+      type: object
+      required: [type, text]
+      properties:
+        type:
+          const: text
+        text:
+          type: string
+    ThinkingBlock:
+      type: object
+      required: [type, text]
+      properties:
+        type:
+          const: thinking
+        text:
+          type: string
+    ToolUseBlock:
+      type: object
+      required: [type, name, input, id]
+      properties:
+        type:
+          const: tool_use
+        name:
+          type: string
+        input:
+          type: object
+          additionalProperties: true
+        id:
+          type: string
+    ToolResultBlock:
+      type: object
+      required: [type, tool_use_id, content, is_error]
+      properties:
+        type:
+          const: tool_result
+        tool_use_id:
+          type: string
+        content:
+          type: string
+        is_error:
+          type: boolean
+    ImageBlock:
+      type: object
+      required: [type, media_type, data]
+      properties:
+        type:
+          const: image
+        media_type:
+          type: string
+        data:
+          type: string
+
+    Backend:
+      type: object
+      required: [name, display_name, available, capabilities]
+      properties:
+        name:
+          type: string
+        display_name:
+          type: string
+        available:
+          type: boolean
+        capabilities:
+          $ref: "#/components/schemas/BackendCapabilities"
+
+    BackendCapabilities:
+      type: object
+      required:
+        - fork
+        - subagents
+        - permission_detection
+        - interactive_pty
+        - stream_json
+        - structured_output
+        - session_id_choice
+        - max_budget
+        - mcp
+        - sandbox
+        - tools
+      properties:
+        fork:
+          type: boolean
+        subagents:
+          type: boolean
+        permission_detection:
+          type: boolean
+        interactive_pty:
+          type: boolean
+        stream_json:
+          type: boolean
+        structured_output:
+          type: boolean
+        session_id_choice:
+          type: boolean
+        max_budget:
+          type: boolean
+        mcp:
+          type: boolean
+        sandbox:
+          oneOf:
+            - type: "null"
+            - type: array
+              items:
+                type: string
+                enum: [read-only, workspace-write, danger]
+        tools:
+          type: string
+          enum: [granular, name-list, none]
+        interrupt_external_runs:
+          type: boolean
+          default: false
+
+    Event:
+      type: object
+      required: [sequence, event, data]
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        event:
+          type: string
+          enum:
+            - run.started
+            - message.delta
+            - message
+            - tool.call
+            - tool.result
+            - permission.denied
+            - run.completed
+            - run.failed
+            - run.interrupted
+            - session.updated
+            - ping
+        data:
+          type: object
+          additionalProperties: true
+
+    CreateSessionRequest:
+      type: object
+      required: [backend, model, project]
+      properties:
+        backend:
+          type: string
+        model:
+          type: string
+        project:
+          $ref: "#/components/schemas/Project"
+        title:
+          type: [string, "null"]
+
+    CreateRunRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+        model:
+          type: [string, "null"]
+
+    CreateRunResponse:
+      type: object
+      required: [session_id, run_id]
+      properties:
+        session_id:
+          type: string
+        run_id:
+          type: string
+
+    ForkSessionRequest:
+      type: object
+      properties:
+        title:
+          type: [string, "null"]
+        message:
+          type: [string, "null"]
+          description: Optional first user message to start a run in the fork.
+
+    ForkSessionResponse:
+      type: object
+      required: [session]
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        run:
+          oneOf:
+            - $ref: "#/components/schemas/Run"
+            - type: "null"
+
+    Project:
+      type: object
+      required: [path, name]
+      properties:
+        path:
+          type: string
+        name:
+          type: string
+
+    SessionStats:
+      type: object
+      required: [messages, tokens, cost_usd]
+      properties:
+        messages:
+          type: integer
+          minimum: 0
+        tokens:
+          type: object
+          additionalProperties: true
+        cost_usd:
+          type: number
+          minimum: 0
+
+    Usage:
+      type: object
+      required: [input, output, cache_read, cache_creation, cost_usd]
+      properties:
+        input:
+          type: integer
+          minimum: 0
+        output:
+          type: integer
+          minimum: 0
+        cache_read:
+          type: integer
+          minimum: 0
+        cache_creation:
+          type: integer
+          minimum: 0
+        cost_usd:
+          type: number
+          minimum: 0
+
+    Origin:
+      type: string
+      enum: [harness, external]
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: object
+              additionalProperties: true

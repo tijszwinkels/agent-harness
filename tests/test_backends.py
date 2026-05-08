@@ -5,8 +5,8 @@ def test_default_backend_registry_lists_claude_code_and_codex() -> None:
     registry = default_backend_registry()
 
     backends = registry.list()
-    backend_ids = {backend.id for backend in backends}
+    backend_names = {backend.name for backend in backends}
 
-    assert backend_ids == {"claude-code", "codex"}
-    assert all(backend.capabilities.supports_sse for backend in backends)
+    assert backend_names == {"claude-code", "codex"}
+    assert all(backend.capabilities.stream_json for backend in backends)
     assert registry.get("codex").display_name == "Codex"

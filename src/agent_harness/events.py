@@ -28,12 +28,12 @@ class InMemoryEventBus:
 
     async def replay(self, after: int = 0) -> list[Event]:
         async with self._lock:
-            return [event for event in self._history if event.seq is not None and event.seq > after]
+            return [event for event in self._history if event.sequence is not None and event.sequence > after]
 
     async def _register(self, after: int) -> tuple[list[Event], asyncio.Queue[Event]]:
         queue: asyncio.Queue[Event] = asyncio.Queue()
         async with self._lock:
-            replay = [event for event in self._history if event.seq is not None and event.seq > after]
+            replay = [event for event in self._history if event.sequence is not None and event.sequence > after]
             self._subscribers.add(queue)
         return replay, queue
 

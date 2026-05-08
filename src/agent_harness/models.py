@@ -2,23 +2,48 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-BackendId = Literal["claude-code", "codex"]
-LaunchMode = Literal["orchestrated", "observed"]
-SessionStatus = Literal["active", "archived"]
-RunStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
-MessageRole = Literal["system", "user", "assistant", "tool", "observer"]
+BackendName = Literal["claude-code", "codex"]
+Origin = Literal["harness", "external"]
+SessionStatus = Literal["idle", "running", "waiting_for_input", "archived"]
+RunStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
+StopReason = Literal["end_turn", "tool_use", "max_tokens", "interrupted"]
+MessageRole = Literal["user", "assistant"]
+ToolMode = Literal["granular", "name-list", "none"]
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex}"
+
+
 class HarnessModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class Project(HarnessModel):
+    path: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+
+class Usage(HarnessModel):
+    input: int = Field(default=0, ge=0)
+    output: int = Field(default=0, ge=0)
+    cache_read: int = Field(default=0, ge=0)
+    cache_creation: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0, ge=0)
+
+
+class SessionStats(HarnessModel):
+    messages: int = Field(default=0, ge=0)
+    tokens: dict[str, Any] = Field(default_factory=dict)
+    cost_usd: float = Field(default=0, ge=0)
 
 
 class TextBlock(HarnessModel):
@@ -26,28 +51,44 @@ class TextBlock(HarnessModel):
     text: str = Field(min_length=1)
 
 
-class ToolCallBlock(HarnessModel):
-    type: Literal["tool_call"] = "tool_call"
-    call_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1)
+class ThinkingBlock(HarnessModel):
+    type: Literal["thinking"] = "thinking"
+    text: str = Field(min_length=1)
+
+
+class ToolUseBlock(HarnessModel):
+    type: Literal["tool_use"] = "tool_use"
     name: str = Field(min_length=1)
     input: dict[str, Any] = Field(default_factory=dict)
+    id: str = Field(default_factory=lambda: new_id("tool"), min_length=1)
 
 
 class ToolResultBlock(HarnessModel):
     type: Literal["tool_result"] = "tool_result"
-    call_id: str = Field(min_length=1)
-    output: Any
+    tool_use_id: str = Field(min_length=1)
+    content: str = ""
     is_error: bool = False
 
 
-MessageBlock = Annotated[TextBlock | ToolCallBlock | ToolResultBlock, Field(discriminator="type")]
+class ImageBlock(HarnessModel):
+    type: Literal["image"] = "image"
+    media_type: str = Field(min_length=1)
+    data: str = Field(min_length=1)
+
+
+MessageBlock = Annotated[
+    TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock | ImageBlock,
+    Field(discriminator="type"),
+]
 
 
 class Message(HarnessModel):
-    id: UUID = Field(default_factory=uuid4)
+    id: str = Field(default_factory=lambda: new_id("msg"))
     role: MessageRole
+    timestamp: datetime = Field(default_factory=utc_now)
     blocks: list[MessageBlock] = Field(min_length=1)
-    created_at: datetime = Field(default_factory=utc_now)
+    model: str | None = None
+    run_id: str | None = None
 
     @classmethod
     def user(cls, text: str) -> "Message":
@@ -55,67 +96,70 @@ class Message(HarnessModel):
 
 
 class BackendCapabilities(HarnessModel):
-    launch_modes: list[LaunchMode] = Field(min_length=1)
-    supports_sse: bool
-    supports_transcript_observation: bool
-    supports_working_directory: bool
-    supports_resume: bool
+    fork: bool
+    subagents: bool
+    permission_detection: bool
+    interactive_pty: bool
+    stream_json: bool
+    structured_output: bool
+    session_id_choice: bool
+    max_budget: bool
+    mcp: bool
+    sandbox: list[Literal["read-only", "workspace-write", "danger"]] | None
+    tools: ToolMode
+    interrupt_external_runs: bool = False
 
 
 class Backend(HarnessModel):
-    id: BackendId
+    name: BackendName
     display_name: str = Field(min_length=1)
+    available: bool = True
     capabilities: BackendCapabilities
 
 
 class Run(HarnessModel):
-    id: UUID = Field(default_factory=uuid4)
-    session_id: UUID
-    backend_id: BackendId
+    id: str = Field(default_factory=lambda: new_id("run"))
+    session_id: str = Field(min_length=1)
     status: RunStatus = "queued"
-    working_directory: str | None = None
-    command: list[str] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    input_message_id: str | None = None
+    stop_reason: StopReason | None = None
+    origin: Origin = "harness"
+    usage: Usage = Field(default_factory=Usage)
 
 
 class Session(HarnessModel):
-    id: UUID = Field(default_factory=uuid4)
-    backend_id: BackendId
+    id: str = Field(default_factory=lambda: new_id("ses"))
+    backend: BackendName
+    model: str = Field(min_length=1)
+    project: Project
     title: str | None = None
-    status: SessionStatus = "active"
-    messages: list[Message] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    status: SessionStatus = "idle"
+    origin: Origin = "harness"
+    stats: SessionStats = Field(default_factory=SessionStats)
 
 
 class Event(HarnessModel):
-    seq: int | None = Field(default=None, ge=1)
-    type: str = Field(min_length=1)
+    sequence: int | None = Field(default=None, ge=1)
+    event: str = Field(min_length=1)
     data: dict[str, Any] = Field(default_factory=dict)
-    run_id: UUID | None = None
-    session_id: UUID | None = None
+    run_id: str | None = None
+    session_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
-    def with_sequence(self, seq: int) -> "Event":
-        return self.model_copy(update={"seq": seq})
+    def with_sequence(self, sequence: int) -> "Event":
+        return self.model_copy(update={"sequence": sequence})
 
 
 class CreateSessionRequest(HarnessModel):
-    backend_id: BackendId
+    backend: BackendName
+    model: str = Field(min_length=1)
+    project: Project
     title: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class SessionResponse(HarnessModel):
-    session: Session
-
-
-class SessionListResponse(HarnessModel):
-    sessions: list[Session]
-
-
-class BackendListResponse(HarnessModel):
-    backends: list[Backend]
+class DataList(HarnessModel):
+    data: list[Any]

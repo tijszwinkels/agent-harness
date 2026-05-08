@@ -10,38 +10,45 @@ def test_health_and_backend_listing() -> None:
 
     response = client.get("/v1/backends")
     assert response.status_code == 200
-    assert {item["id"] for item in response.json()["backends"]} == {"claude-code", "codex"}
+    assert {item["name"] for item in response.json()["data"]} == {"claude-code", "codex"}
 
 
 def test_session_create_list_get_archive_flow() -> None:
     client = TestClient(create_app())
+    payload = {
+        "backend": "codex",
+        "model": "gpt-5.4",
+        "project": {"path": "/tmp/proj", "name": "proj"},
+        "title": "Implement scaffold",
+    }
 
-    create_response = client.post(
-        "/v1/sessions",
-        json={"backend_id": "codex", "title": "Implement scaffold", "metadata": {"branch": "scaffold-core"}},
-    )
+    create_response = client.post("/v1/sessions", json=payload)
     assert create_response.status_code == 201
-    session = create_response.json()["session"]
-    assert session["backend_id"] == "codex"
-    assert session["status"] == "active"
+    session = create_response.json()
+    assert session["backend"] == "codex"
+    assert session["status"] == "idle"
+    assert session["origin"] == "harness"
 
     list_response = client.get("/v1/sessions")
     assert list_response.status_code == 200
-    assert [item["id"] for item in list_response.json()["sessions"]] == [session["id"]]
+    assert [item["id"] for item in list_response.json()["data"]] == [session["id"]]
 
     get_response = client.get(f"/v1/sessions/{session['id']}")
     assert get_response.status_code == 200
-    assert get_response.json()["session"]["id"] == session["id"]
+    assert get_response.json()["id"] == session["id"]
 
-    archive_response = client.post(f"/v1/sessions/{session['id']}/archive")
+    archive_response = client.delete(f"/v1/sessions/{session['id']}")
     assert archive_response.status_code == 200
-    assert archive_response.json()["session"]["status"] == "archived"
+    assert archive_response.json()["status"] == "archived"
 
 
 def test_session_create_rejects_unknown_backend() -> None:
     client = TestClient(create_app())
 
-    response = client.post("/v1/sessions", json={"backend_id": "unknown"})
+    response = client.post(
+        "/v1/sessions",
+        json={"backend": "unknown", "model": "x", "project": {"path": "/tmp", "name": "tmp"}},
+    )
 
     assert response.status_code == 422
 
@@ -49,6 +56,6 @@ def test_session_create_rejects_unknown_backend() -> None:
 def test_missing_session_returns_404() -> None:
     client = TestClient(create_app())
 
-    response = client.get("/v1/sessions/00000000-0000-0000-0000-000000000000")
+    response = client.get("/v1/sessions/ses_missing")
 
     assert response.status_code == 404

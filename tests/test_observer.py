@@ -38,7 +38,7 @@ def test_codex_transcript_path_and_external_id_helpers() -> None:
     )
 
     assert path.as_posix() == (
-        "/tmp/home/.codex/sessions/2026/5/8/"
+        "/tmp/home/.codex/sessions/2026/05/08/"
         "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
     )
     assert external_session_id_from_codex_path(path) == "codex_123e4567-e89b-12d3-a456-426614174000"
@@ -89,15 +89,15 @@ def test_parser_materializes_external_session_for_supported_claude_line() -> Non
         identity=identity,
     )
 
-    assert [event.event for event in observations] == ["session.updated", "message.observed"]
+    assert [event.event for event in observations] == ["session.updated", "message"]
     assert observations[0].data["session"]["origin"] == "external"
     assert observations[0].session_id == identity.session_id
-    assert observations[1].data["role"] == "assistant"
+    assert observations[1].data["message"]["role"] == "assistant"
 
 
 @pytest.mark.asyncio
 async def test_observer_deduplicates_by_file_offset(tmp_path) -> None:
-    path = tmp_path / ".codex" / "sessions" / "2026" / "5" / "8"
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
     transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text(
@@ -115,7 +115,7 @@ async def test_observer_deduplicates_by_file_offset(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_observer_publishes_event_sequence_through_bus(tmp_path) -> None:
-    path = tmp_path / ".codex" / "sessions" / "2026" / "5" / "8"
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
     transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text(
@@ -134,6 +134,6 @@ async def test_observer_publishes_event_sequence_through_bus(tmp_path) -> None:
     published = await observer.tail_file(transcript)
 
     assert [event.sequence for event in published] == [1, 2]
-    assert [event.event for event in published] == ["session.updated", "message.observed"]
+    assert [event.event for event in published] == ["session.updated", "message"]
     assert published[0].data["session"]["origin"] == "external"
     assert [event.sequence for event in await bus.replay()] == [1, 2]

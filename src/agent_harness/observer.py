@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import BackendName, Event, MessageRole, Project, Session
+from agent_harness.models import BackendName, Event, Message, MessageRole, Project, Session, TextBlock
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +121,8 @@ def codex_transcript_path(
         / ".codex"
         / "sessions"
         / str(year)
-        / str(month)
-        / str(day)
+        / str(month).zfill(2)
+        / str(day).zfill(2)
         / f"rollout-{timestamp}-{rollout_uuid}.jsonl"
     )
 
@@ -315,14 +315,17 @@ def _message_event(
     model: str | None,
     offset: int | None,
 ) -> Event:
+    message = Message(
+        role=role,
+        blocks=[TextBlock(text=f"Observed external {role} message")],
+        model=model,
+    )
     data: dict[str, Any] = {
         **_source_data(identity, offset=offset),
-        "role": role,
+        "message": message.model_dump(mode="json"),
         "source_type": source_type,
     }
-    if model:
-        data["model"] = model
-    return Event(event="message.observed", session_id=identity.session_id, data=data)
+    return Event(event="message", session_id=identity.session_id, data=data)
 
 
 def _source_data(identity: TranscriptIdentity, *, offset: int | None) -> dict[str, Any]:

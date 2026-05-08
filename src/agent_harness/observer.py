@@ -6,10 +6,17 @@ import re
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from pathlib import Path
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, Mapping
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import BackendName, Event, Message, MessageRole, Project, Session, TextBlock
+from agent_harness.repository import InMemoryRepository
+
+try:
+    from watchfiles import awatch
+except ImportError:  # pragma: no cover - dependency is declared, this protects embedded use.
+    awatch = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +52,15 @@ class ObserverState:
 
 
 class ExternalTranscriptObserver:
-    def __init__(self, event_bus: InMemoryEventBus, *, state: ObserverState | None = None) -> None:
+    def __init__(
+        self,
+        event_bus: InMemoryEventBus,
+        *,
+        repository: InMemoryRepository | None = None,
+        state: ObserverState | None = None,
+    ) -> None:
         self._event_bus = event_bus
+        self._repository = repository
         self._state = state or ObserverState()
 
     async def tail_file(self, path: str | Path) -> list[Event]:
@@ -93,8 +107,39 @@ class ExternalTranscriptObserver:
         resolved_identity = identity or transcript_identity_from_path(transcript_path)
         published: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
-            published.append(await self._event_bus.publish(event))
+            published_event = await self._event_bus.publish(event)
+            if self._repository is not None:
+                self._repository.materialize_event(published_event)
+            published.append(published_event)
         return published
+
+
+Watcher = Callable[..., AsyncIterator[Iterable[tuple[object, str]]]]
+
+
+class TranscriptWatchService:
+    def __init__(
+        self,
+        *,
+        roots: Iterable[str | Path],
+        observer: ExternalTranscriptObserver,
+        watcher: Watcher | None = None,
+    ) -> None:
+        self._roots = tuple(Path(root) for root in roots)
+        self._observer = observer
+        if watcher is not None:
+            self._watcher = watcher
+        elif awatch is not None:
+            self._watcher = awatch
+        else:
+            raise RuntimeError("watchfiles is required for live transcript watching")
+
+    async def watch_forever(self, *, stop_event: object | None = None) -> None:
+        async for changes in self._watcher(*self._roots, stop_event=stop_event):
+            for _change, changed_path in changes:
+                path = Path(changed_path)
+                if path.suffix == ".jsonl":
+                    await self._observer.tail_file(path)
 
 
 def claude_project_dir_name(cwd: str | Path) -> str:

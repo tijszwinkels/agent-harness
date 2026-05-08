@@ -5,6 +5,7 @@ import pytest
 from agent_harness.events import InMemoryEventBus
 from agent_harness.observer import (
     ExternalTranscriptObserver,
+    TranscriptWatchService,
     codex_transcript_path,
     external_session_id_from_codex_path,
     external_session_id_from_claude_path,
@@ -14,6 +15,7 @@ from agent_harness.observer import (
     parse_transcript_line,
     transcript_identity_from_path,
 )
+from agent_harness.repository import InMemoryRepository
 
 
 def test_claude_transcript_path_and_external_id_helpers() -> None:
@@ -137,3 +139,56 @@ async def test_observer_publishes_event_sequence_through_bus(tmp_path) -> None:
     assert [event.event for event in published] == ["session.updated", "message"]
     assert published[0].data["session"]["origin"] == "external"
     assert [event.sequence for event in await bus.replay()] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_observer_materializes_external_session_and_message(tmp_path) -> None:
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
+                '{"type":"event_msg","payload":{"type":"user_message","role":"user","content":"hello"}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    repository = InMemoryRepository()
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+
+    await observer.tail_file(transcript)
+
+    session_id = "codex_123e4567-e89b-12d3-a456-426614174000"
+    session = repository.get_session(session_id)
+    messages = repository.list_messages(session_id)
+    assert session.origin == "external"
+    assert session.backend == "codex"
+    assert messages[0].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_watch_service_uses_changed_jsonl_paths(tmp_path) -> None:
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n',
+        encoding="utf-8",
+    )
+
+    async def fake_watcher(*_roots, **_kwargs):
+        yield {("modified", str(transcript)), ("modified", str(path / "ignore.txt"))}
+
+    bus = InMemoryEventBus()
+    service = TranscriptWatchService(
+        roots=[tmp_path],
+        observer=ExternalTranscriptObserver(bus),
+        watcher=fake_watcher,
+    )
+
+    await service.watch_forever()
+
+    assert [event.event for event in await bus.replay()] == ["session.updated"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from threading import RLock
 
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Message, Run, Session, utc_now
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Run, Session, utc_now
 
 
 class SessionNotFoundError(KeyError):
@@ -18,6 +18,7 @@ class InMemoryRepository:
         self._lock = RLock()
         self._sessions: dict[str, Session] = {}
         self._runs: dict[str, Run] = {}
+        self._messages: dict[str, list[Message]] = {}
 
     def create_session(self, request: CreateSessionRequest) -> Session:
         session = Session(
@@ -28,6 +29,7 @@ class InMemoryRepository:
         )
         with self._lock:
             self._sessions[session.id] = session
+            self._messages[session.id] = []
         return session.model_copy(deep=True)
 
     def list_sessions(self) -> list[Session]:
@@ -74,6 +76,7 @@ class InMemoryRepository:
             )
             self._sessions[session_id] = updated_session
             self._runs[run.id] = run
+            self._messages.setdefault(session_id, []).append(input_message)
             return run.model_copy(deep=True)
 
     def list_runs(self, session_id: str) -> list[Run]:
@@ -108,3 +111,39 @@ class InMemoryRepository:
             )
             self._runs[run_id] = interrupted
             return interrupted.model_copy(deep=True)
+
+    def list_messages(self, session_id: str) -> list[Message]:
+        with self._lock:
+            if session_id not in self._sessions:
+                raise SessionNotFoundError(session_id)
+            return [message.model_copy(deep=True) for message in self._messages.get(session_id, [])]
+
+    def materialize_event(self, event: Event) -> None:
+        if event.event == "session.updated":
+            session_data = event.data.get("session")
+            if isinstance(session_data, dict):
+                self.upsert_session(Session.model_validate(session_data))
+            return
+
+        if event.event == "message":
+            message_data = event.data.get("message")
+            if event.session_id and isinstance(message_data, dict):
+                self.add_message(event.session_id, Message.model_validate(message_data))
+
+    def upsert_session(self, session: Session) -> None:
+        with self._lock:
+            self._sessions[session.id] = session
+            self._messages.setdefault(session.id, [])
+
+    def add_message(self, session_id: str, message: Message) -> None:
+        with self._lock:
+            if session_id not in self._sessions:
+                raise SessionNotFoundError(session_id)
+            self._messages.setdefault(session_id, []).append(message)
+            session = self._sessions[session_id]
+            self._sessions[session_id] = session.model_copy(
+                update={
+                    "updated_at": utc_now(),
+                    "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
+                }
+            )

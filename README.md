@@ -17,4 +17,10 @@ Clean-slate Python scaffold for an HTTP/SSE service and SDK primitives for CLI c
 uv run pytest
 ```
 
-The service entry point is `agent_harness.create_app`.
+Run the local service:
+
+```bash
+uv run agent-harness serve --host 127.0.0.1 --port 8000
+```
+
+The ASGI app import string is `agent_harness.api:app`.

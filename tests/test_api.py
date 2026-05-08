@@ -87,6 +87,27 @@ def test_run_create_list_get_interrupt_flow() -> None:
     assert interrupt_response.json()["stop_reason"] == "interrupted"
 
 
+def test_session_messages_endpoint_returns_materialized_messages() -> None:
+    client = TestClient(create_app())
+    session = client.post(
+        "/v1/sessions",
+        json={
+            "backend": "codex",
+            "model": "gpt-5.4",
+            "project": {"path": "/tmp/proj", "name": "proj"},
+        },
+    ).json()
+    client.post(f"/v1/sessions/{session['id']}/runs", json={"message": "hello"})
+
+    response = client.get(f"/v1/sessions/{session['id']}/messages")
+
+    assert response.status_code == 200
+    messages = response.json()["data"]
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["blocks"][0] == {"type": "text", "text": "hello"}
+
+
 def test_missing_session_returns_404() -> None:
     client = TestClient(create_app())
 

@@ -8,7 +8,11 @@ dependencies = [
     "fastapi>=0.128.0",
     "pydantic>=2.12.0",
     "uvicorn[standard]>=0.38.0",
+    "watchfiles>=1.1.1",
 ]
+
+[project.scripts]
+agent-harness = "agent_harness.cli:main"
 
 [dependency-groups]
 dev = [

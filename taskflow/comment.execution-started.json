@@ -1,0 +1,16 @@
+{
+  "type": "POST",
+  "id": "cec5ab38-8481-4d34-9b88-e9ebe88a0b32",
+  "name": "Echo execution started",
+  "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
+  "content": {
+    "body": "Moved the task to Execution. Created two isolated worktrees: echo/spec-openapi for API contract and hybrid behavior docs, and echo/scaffold-core for the Python package scaffold, models, event bus, backend registry, app factory, and tests. Spawned Codex sub-agents Delta and Forge with bounded ownership and agentcom reporting."
+  },
+  "relations": {
+    "replies_to": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ]
+  }
+}

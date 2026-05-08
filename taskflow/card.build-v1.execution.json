@@ -1,0 +1,31 @@
+{
+  "type": "BOARD_CARD",
+  "id": "60bd7d2a-653a-4453-ba98-06c883ef8908",
+  "name": "Build agent-harness Echo v1 in Execution",
+  "instruction": "A TaskFlow board card placing the Echo v1 build task in the Execution column.",
+  "content": {
+    "position": 0
+  },
+  "relations": {
+    "task": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ],
+    "board": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.1bc48d06-17dc-4886-a378-be5ac8d4eb2e"
+      }
+    ],
+    "board_state": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.879f8890-9cd2-42bf-97ce-7260026a4ae9"
+      }
+    ],
+    "type_def": [
+      {
+        "ref": "AxyU5_5vWmP2tO_klN4UpbZzRsuJEvJTrdwdg_gODxZJ.d3e9b505-1122-4d8f-96c1-ff3715b063da"
+      }
+    ]
+  }
+}

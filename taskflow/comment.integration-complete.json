@@ -1,0 +1,16 @@
+{
+  "type": "POST",
+  "id": "e921a5ba-86ad-4c18-9a86-cb200b98c176",
+  "name": "Echo spec and scaffold integrated",
+  "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
+  "content": {
+    "body": "Integrated the first two workstreams into main. Delta produced the OpenAPI and hybrid semantics docs; I corrected route drift so the spec uses the locked /v1/sessions/{id}/runs shape and DELETE lifecycle operations. Forge produced the Python scaffold; I corrected model and route naming to match the agreed Session/Run/Message/Backend contract. Verification on main: uv run pytest -> 13 passed; specs/openapi.yaml parses as YAML. Latest main commit: 5e5e399."
+  },
+  "relations": {
+    "replies_to": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ]
+  }
+}

@@ -41,22 +41,22 @@ session, the session remains `origin: external`; only the new run is
 
 ## Resume And Adoption
 
-`POST /v1/runs` is the only v1 API for starting work.
+`POST /v1/sessions/{id}/runs` is the only v1 API for starting work inside an
+existing session. Clients that need a new conversation first create a session
+with `POST /v1/sessions`, then start its first run.
 
-When `session_id` is omitted, the harness creates a new harness-origin session
-and a harness-origin run.
+When `{id}` points at a harness-origin session, the harness starts a new run in
+that session.
 
-When `session_id` points at a harness-origin session, the harness starts a new
-run in that session.
-
-When `session_id` points at an external session, the harness adopts that
+When `{id}` points at an external session, the harness adopts that
 conversation only if the backend supports resume for the external id. Adoption
 means the harness launches a new backend process with the backend's resume flag
 or equivalent and associates the resulting work with a new harness-origin run.
 The previously observed external messages remain part of the session history.
 
-If the backend cannot resume the external conversation, `POST /v1/runs` returns
-`409 Conflict` with an error code such as `resume_unsupported`.
+If the backend cannot resume the external conversation,
+`POST /v1/sessions/{id}/runs` returns `409 Conflict` with an error code such as
+`resume_unsupported`.
 
 ## Catch-Up Semantics
 
@@ -65,7 +65,7 @@ SSE streams follow new events by default:
 ```text
 GET /v1/events
 GET /v1/sessions/{session_id}/events
-GET /v1/runs/{run_id}/events
+GET /v1/sessions/{id}/runs/{run_id}/events
 ```
 
 `?from=beginning` replays retained events for the selected scope before
@@ -126,9 +126,9 @@ sequence.
 
 In v1, interrupt support is lifecycle ownership based.
 
-The harness may accept `POST /v1/runs/{run_id}/interrupt` only for harness-origin
-runs where it owns the launched process and the backend adapter supports
-interruption.
+The harness accepts `DELETE /v1/sessions/{id}/runs/{run_id}` only for
+harness-origin runs where it owns the launched process and the backend adapter
+supports interruption.
 
 Interrupting an external run or externally owned activity returns `409 Conflict`
 with a clear error:

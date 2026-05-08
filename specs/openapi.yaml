@@ -1,72 +1,25 @@
 openapi: 3.1.0
 info:
   title: agent-harness API
-  version: 1.0.0
-  summary: HTTP and SSE API for harnessed and externally observed CLI agent sessions.
+  version: 0.1.0-beta
+  summary: HTTP and SSE API for CLI-agent sessions and runs.
   description: |
-    v1 is a single-user API with no authentication endpoints. The core resources
-    are Sessions, Runs, normalized Messages, and ordered Events.
-externalDocs:
-  description: Hybrid behavior semantics
-  url: ../docs/hybrid-semantics.md
+    v1 is a local/trusted single-user API. Identity and auth are deliberately
+    outside the wire contract. The primary nouns are Session, the persistent
+    conversation, and Run, one addressable invocation inside a session.
 servers:
   - url: http://localhost:8000
-    description: Local development server
 tags:
-  - name: Backends
   - name: Sessions
   - name: Runs
   - name: Events
+  - name: Backends
 paths:
-  /v1/backends:
-    get:
-      tags: [Backends]
-      operationId: listBackends
-      summary: List supported agent backends.
-      responses:
-        "200":
-          description: Supported backend descriptors.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Backend"
-
   /v1/sessions:
-    get:
-      tags: [Sessions]
-      operationId: listSessions
-      summary: List known harness and external sessions.
-      parameters:
-        - $ref: "#/components/parameters/Origin"
-        - $ref: "#/components/parameters/BackendQuery"
-        - $ref: "#/components/parameters/Limit"
-      responses:
-        "200":
-          description: Sessions ordered by most recent activity.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Session"
     post:
       tags: [Sessions]
       operationId: createSession
-      summary: Create a harness-origin session record.
-      description: |
-        Creates a harness-owned session shell. Use POST /v1/runs to start work
-        in the session. Externally discovered sessions are created by observers,
-        not by this endpoint.
+      summary: Create a harness-origin session.
       requestBody:
         required: true
         content:
@@ -81,15 +34,33 @@ paths:
               schema:
                 $ref: "#/components/schemas/Session"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List the caller's sessions.
+      description: In v1 this returns all known sessions for the single local caller.
+      responses:
+        "200":
+          description: Sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Session"
 
-  /v1/sessions/{session_id}:
+  /v1/sessions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
     get:
       tags: [Sessions]
       operationId: getSession
-      summary: Get one session.
-      parameters:
-        - $ref: "#/components/parameters/SessionId"
+      summary: Get a session.
       responses:
         "200":
           description: Session.
@@ -98,18 +69,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/Session"
         "404":
-          $ref: "#/components/responses/NotFound"
-
-  /v1/sessions/{session_id}/archive:
-    post:
+          $ref: "#/components/responses/Error"
+    delete:
       tags: [Sessions]
       operationId: archiveSession
-      summary: Archive a session from normal listings.
-      description: |
-        Archiving hides the session from default list views. It does not kill or
-        control any external process.
-      parameters:
-        - $ref: "#/components/parameters/SessionId"
+      summary: Archive a session.
+      description: Soft-archives the session. It does not stop external CLI processes.
       responses:
         "200":
           description: Archived session.
@@ -118,20 +83,18 @@ paths:
               schema:
                 $ref: "#/components/schemas/Session"
         "404":
-          $ref: "#/components/responses/NotFound"
+          $ref: "#/components/responses/Error"
 
-  /v1/sessions/{session_id}/messages:
+  /v1/sessions/{id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
     get:
       tags: [Sessions]
       operationId: listSessionMessages
-      summary: List normalized messages for a session.
-      parameters:
-        - $ref: "#/components/parameters/SessionId"
-        - $ref: "#/components/parameters/AfterSequence"
-        - $ref: "#/components/parameters/Limit"
+      summary: List normalized session messages.
       responses:
         "200":
-          description: Messages ordered by event sequence.
+          description: Messages.
           content:
             application/json:
               schema:
@@ -143,40 +106,43 @@ paths:
                     items:
                       $ref: "#/components/schemas/Message"
         "404":
-          $ref: "#/components/responses/NotFound"
+          $ref: "#/components/responses/Error"
 
-  /v1/sessions/{session_id}/events:
-    get:
-      tags: [Events, Sessions]
-      operationId: streamSessionEvents
-      summary: Stream events for one session.
+  /v1/sessions/{id}/runs:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      tags: [Runs]
+      operationId: createRun
+      summary: Start a run in a session.
       description: |
-        Server-Sent Events stream new events by default. Pass from=beginning to
-        replay retained events before following new events, or after=<sequence>
-        to replay events after a known sequence.
-      parameters:
-        - $ref: "#/components/parameters/SessionId"
-        - $ref: "#/components/parameters/EventFrom"
-        - $ref: "#/components/parameters/AfterSequence"
+        Starts a harness-origin run and returns immediately with session_id and
+        run_id. If the session is external, the harness attempts backend resume;
+        unsupported resume returns 409 Conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRunRequest"
       responses:
-        "200":
-          $ref: "#/components/responses/EventStream"
+        "202":
+          description: Run accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateRunResponse"
         "404":
-          $ref: "#/components/responses/NotFound"
-
-  /v1/runs:
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
     get:
       tags: [Runs]
-      operationId: listRuns
-      summary: List runs.
-      parameters:
-        - $ref: "#/components/parameters/SessionIdQuery"
-        - $ref: "#/components/parameters/Origin"
-        - $ref: "#/components/parameters/BackendQuery"
-        - $ref: "#/components/parameters/Limit"
+      operationId: listSessionRuns
+      summary: List runs in a session.
       responses:
         "200":
-          description: Runs ordered by creation time.
+          description: Runs.
           content:
             application/json:
               schema:
@@ -187,42 +153,17 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Run"
-    post:
-      tags: [Runs]
-      operationId: createRun
-      summary: Start a new harness-origin run.
-      description: |
-        If session_id names an external session and the backend supports resume,
-        the harness adopts that conversation for a new harness-origin run. The
-        session origin remains external. If resume is unsupported, the response
-        is 409 Conflict.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateRunRequest"
-      responses:
-        "201":
-          description: Created run.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Run"
-        "400":
-          $ref: "#/components/responses/BadRequest"
         "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/Error"
 
-  /v1/runs/{run_id}:
+  /v1/sessions/{id}/runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/RunId"
     get:
       tags: [Runs]
       operationId: getRun
-      summary: Get one run.
-      parameters:
-        - $ref: "#/components/parameters/RunId"
+      summary: Get a run.
       responses:
         "200":
           description: Run.
@@ -231,105 +172,154 @@ paths:
               schema:
                 $ref: "#/components/schemas/Run"
         "404":
-          $ref: "#/components/responses/NotFound"
-
-  /v1/runs/{run_id}/interrupt:
-    post:
+          $ref: "#/components/responses/Error"
+    delete:
       tags: [Runs]
       operationId: interruptRun
-      summary: Request interruption of a harness-origin run.
+      summary: Interrupt a run.
       description: |
-        v1 can interrupt only harness-origin runs whose process was launched by
-        the harness. Interrupting an external run returns 409 Conflict.
-      parameters:
-        - $ref: "#/components/parameters/RunId"
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/InterruptRunRequest"
+        Interrupts a harness-origin run when the harness owns the process.
+        External-origin runs return 409 Conflict in v1.
       responses:
-        "202":
-          description: Interrupt accepted.
+        "200":
+          description: Interrupted run.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Run"
         "404":
-          $ref: "#/components/responses/NotFound"
+          $ref: "#/components/responses/Error"
         "409":
-          $ref: "#/components/responses/Conflict"
+          $ref: "#/components/responses/Error"
 
-  /v1/runs/{run_id}/events:
+  /v1/sessions/{id}/forks:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      tags: [Sessions]
+      operationId: forkSession
+      summary: Fork a session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkSessionRequest"
+      responses:
+        "201":
+          description: Forked session, with optional first run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForkSessionResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/runs/{run_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/RunId"
+      - $ref: "#/components/parameters/EventFrom"
     get:
       tags: [Events, Runs]
       operationId: streamRunEvents
       summary: Stream events for one run.
-      parameters:
-        - $ref: "#/components/parameters/RunId"
-        - $ref: "#/components/parameters/EventFrom"
-        - $ref: "#/components/parameters/AfterSequence"
       responses:
         "200":
           $ref: "#/components/responses/EventStream"
         "404":
-          $ref: "#/components/responses/NotFound"
+          $ref: "#/components/responses/Error"
+
+  /v1/sessions/{id}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+      - $ref: "#/components/parameters/EventFrom"
+    get:
+      tags: [Events, Sessions]
+      operationId: streamSessionEvents
+      summary: Stream events for a whole session.
+      responses:
+        "200":
+          $ref: "#/components/responses/EventStream"
+        "404":
+          $ref: "#/components/responses/Error"
 
   /v1/events:
     get:
       tags: [Events]
-      operationId: streamEvents
-      summary: Stream all retained and new events.
+      operationId: streamFirehoseEvents
+      summary: Stream events for all sessions and runs.
       parameters:
         - $ref: "#/components/parameters/EventFrom"
-        - $ref: "#/components/parameters/AfterSequence"
       responses:
         "200":
           $ref: "#/components/responses/EventStream"
 
+  /v1/backends:
+    get:
+      tags: [Backends]
+      operationId: listBackends
+      summary: List supported backends.
+      responses:
+        "200":
+          description: Backend descriptors.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Backend"
+
+  /v1/backends/{name}/models:
+    parameters:
+      - $ref: "#/components/parameters/BackendName"
+    get:
+      tags: [Backends]
+      operationId: listBackendModels
+      summary: List models for a backend.
+      responses:
+        "200":
+          description: Model names.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/Error"
+
 components:
   parameters:
     SessionId:
-      name: session_id
+      name: id
       in: path
       required: true
       schema:
         type: string
-      description: Harness id, or backend-prefixed external id such as claude_<session_uuid>.
+      description: Harness id, or stable external id such as claude_<uuid> or codex_<uuid>.
     RunId:
       name: run_id
       in: path
       required: true
       schema:
         type: string
-    SessionIdQuery:
-      name: session_id
-      in: query
-      required: false
+    BackendName:
+      name: name
+      in: path
+      required: true
       schema:
         type: string
-    BackendQuery:
-      name: backend
-      in: query
-      required: false
-      schema:
-        $ref: "#/components/schemas/BackendName"
-    Origin:
-      name: origin
-      in: query
-      required: false
-      schema:
-        $ref: "#/components/schemas/Origin"
-    Limit:
-      name: limit
-      in: query
-      required: false
-      schema:
-        type: integer
-        minimum: 1
-        maximum: 500
-        default: 100
     EventFrom:
       name: from
       in: query
@@ -338,31 +328,11 @@ components:
         type: string
         enum: [now, beginning]
         default: now
-      description: beginning replays retained events before following new events.
-    AfterSequence:
-      name: after
-      in: query
-      required: false
-      schema:
-        type: integer
-        minimum: 0
-      description: Replay retained events with sequence greater than this value.
+      description: Unknown query parameters must be ignored for wrapper compatibility.
 
   responses:
-    BadRequest:
-      description: Invalid request.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    NotFound:
-      description: Resource not found.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    Conflict:
-      description: Request conflicts with current resource capabilities or state.
+    Error:
+      description: Error response.
       content:
         application/json:
           schema:
@@ -373,75 +343,27 @@ components:
         text/event-stream:
           schema:
             type: string
-            description: |
-              Each SSE frame carries an AgentEvent JSON object in data. The SSE
-              id is the event sequence and the SSE event name is the event type.
           examples:
-            messageDelta:
-              summary: Message delta event
+            runStarted:
               value: |
                 id: 42
-                event: message.delta
-                data: {"sequence":42,"type":"message.delta","session_id":"claude_018f1a3e-7a4b-7b2a-8b8c-93479b8ed111","run_id":"run_018f1a3e-7a4b-7b2a-8b8c-93479b8ed222","created_at":"2026-05-08T13:30:00Z","payload":{"message_id":"msg_018f1a3e-7a4b-7b2a-8b8c-93479b8ed333","delta":"hello"}}
+                event: run.started
+                data: {"sequence":42,"run_id":"run_abc123","session_id":"ses_abc123"}
 
   schemas:
-    BackendName:
-      type: string
-      enum: [claude-code, codex]
-
-    Origin:
-      type: string
-      enum: [harness, external]
-
-    Backend:
-      type: object
-      required: [name, display_name, capabilities]
-      properties:
-        name:
-          $ref: "#/components/schemas/BackendName"
-        display_name:
-          type: string
-        capabilities:
-          $ref: "#/components/schemas/BackendCapabilities"
-
-    BackendCapabilities:
-      type: object
-      required: [launch, observe, resume, interrupt]
-      properties:
-        launch:
-          type: boolean
-        observe:
-          type: boolean
-        resume:
-          type: boolean
-        interrupt:
-          type: boolean
-
     Session:
       type: object
-      required:
-        - id
-        - backend
-        - origin
-        - status
-        - title
-        - created_at
-        - updated_at
-        - last_activity_at
-        - metadata
+      required: [id, backend, model, project, title, created_at, updated_at, status, origin, stats]
       properties:
         id:
           type: string
-          examples: [claude_018f1a3e-7a4b-7b2a-8b8c-93479b8ed111]
         backend:
-          $ref: "#/components/schemas/BackendName"
-        origin:
-          $ref: "#/components/schemas/Origin"
-        status:
-          $ref: "#/components/schemas/SessionStatus"
-        title:
           type: string
-        working_directory:
+        model:
+          type: string
+        project:
+          $ref: "#/components/schemas/Project"
+        title:
           type: [string, "null"]
         created_at:
           type: string
@@ -449,239 +371,320 @@ components:
         updated_at:
           type: string
           format: date-time
-        last_activity_at:
-          type: [string, "null"]
-          format: date-time
-        archived_at:
-          type: [string, "null"]
-          format: date-time
-        metadata:
-          type: object
-          additionalProperties: true
-
-    SessionStatus:
-      type: string
-      enum: [running, idle, archived]
+        status:
+          type: string
+          enum: [idle, running, waiting_for_input, archived]
+        origin:
+          $ref: "#/components/schemas/Origin"
+        stats:
+          $ref: "#/components/schemas/SessionStats"
 
     Run:
       type: object
-      required:
-        - id
-        - session_id
-        - backend
-        - origin
-        - status
-        - created_at
-        - updated_at
-        - metadata
+      required: [id, session_id, status, started_at, completed_at, input_message_id, stop_reason, origin, usage]
       properties:
         id:
           type: string
-          examples: [run_018f1a3e-7a4b-7b2a-8b8c-93479b8ed222]
         session_id:
           type: string
-        backend:
-          $ref: "#/components/schemas/BackendName"
-        origin:
-          $ref: "#/components/schemas/Origin"
         status:
-          $ref: "#/components/schemas/RunStatus"
-        prompt:
-          type: [string, "null"]
+          type: string
+          enum: [queued, running, completed, failed, interrupted]
         started_at:
           type: [string, "null"]
           format: date-time
         completed_at:
           type: [string, "null"]
           format: date-time
-        exit_code:
-          type: [integer, "null"]
-        error:
+        input_message_id:
           type: [string, "null"]
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-        metadata:
-          type: object
-          additionalProperties: true
-
-    RunStatus:
-      type: string
-      enum: [queued, running, succeeded, failed, canceled, interrupted]
+        stop_reason:
+          type: [string, "null"]
+          enum: [end_turn, tool_use, max_tokens, interrupted, null]
+        origin:
+          $ref: "#/components/schemas/Origin"
+        usage:
+          $ref: "#/components/schemas/Usage"
 
     Message:
       type: object
-      required: [id, session_id, role, blocks, sequence, created_at]
+      required: [id, role, timestamp, blocks, run_id]
       properties:
         id:
           type: string
-        session_id:
-          type: string
-        run_id:
-          type: [string, "null"]
         role:
           type: string
-          enum: [user, assistant, tool, system]
+          enum: [user, assistant]
+        timestamp:
+          type: string
+          format: date-time
         blocks:
           type: array
           items:
             $ref: "#/components/schemas/MessageBlock"
-        sequence:
-          type: integer
-          minimum: 1
-        created_at:
-          type: string
-          format: date-time
-        metadata:
-          type: object
-          additionalProperties: true
+        model:
+          type: [string, "null"]
+        run_id:
+          type: [string, "null"]
 
     MessageBlock:
       oneOf:
         - $ref: "#/components/schemas/TextBlock"
-        - $ref: "#/components/schemas/ToolCallBlock"
+        - $ref: "#/components/schemas/ThinkingBlock"
+        - $ref: "#/components/schemas/ToolUseBlock"
         - $ref: "#/components/schemas/ToolResultBlock"
+        - $ref: "#/components/schemas/ImageBlock"
+      discriminator:
+        propertyName: type
 
     TextBlock:
       type: object
       required: [type, text]
       properties:
         type:
-          type: string
           const: text
         text:
           type: string
-
-    ToolCallBlock:
+    ThinkingBlock:
       type: object
-      required: [type, id, name, input]
+      required: [type, text]
       properties:
         type:
+          const: thinking
+        text:
           type: string
-          const: tool_call
-        id:
-          type: string
+    ToolUseBlock:
+      type: object
+      required: [type, name, input, id]
+      properties:
+        type:
+          const: tool_use
         name:
           type: string
         input:
           type: object
           additionalProperties: true
-
+        id:
+          type: string
     ToolResultBlock:
       type: object
-      required: [type, tool_call_id, output, is_error]
+      required: [type, tool_use_id, content, is_error]
       properties:
         type:
-          type: string
           const: tool_result
-        tool_call_id:
+        tool_use_id:
           type: string
-        output:
+        content:
           type: string
         is_error:
           type: boolean
-
-    AgentEvent:
+    ImageBlock:
       type: object
-      required: [sequence, type, session_id, created_at, payload]
+      required: [type, media_type, data]
+      properties:
+        type:
+          const: image
+        media_type:
+          type: string
+        data:
+          type: string
+
+    Backend:
+      type: object
+      required: [name, display_name, available, capabilities]
+      properties:
+        name:
+          type: string
+        display_name:
+          type: string
+        available:
+          type: boolean
+        capabilities:
+          $ref: "#/components/schemas/BackendCapabilities"
+
+    BackendCapabilities:
+      type: object
+      required:
+        - fork
+        - subagents
+        - permission_detection
+        - interactive_pty
+        - stream_json
+        - structured_output
+        - session_id_choice
+        - max_budget
+        - mcp
+        - sandbox
+        - tools
+      properties:
+        fork:
+          type: boolean
+        subagents:
+          type: boolean
+        permission_detection:
+          type: boolean
+        interactive_pty:
+          type: boolean
+        stream_json:
+          type: boolean
+        structured_output:
+          type: boolean
+        session_id_choice:
+          type: boolean
+        max_budget:
+          type: boolean
+        mcp:
+          type: boolean
+        sandbox:
+          oneOf:
+            - type: "null"
+            - type: array
+              items:
+                type: string
+                enum: [read-only, workspace-write, danger]
+        tools:
+          type: string
+          enum: [granular, name-list, none]
+        interrupt_external_runs:
+          type: boolean
+          default: false
+
+    Event:
+      type: object
+      required: [sequence, event, data]
       properties:
         sequence:
           type: integer
           minimum: 1
-        type:
-          $ref: "#/components/schemas/EventType"
-        session_id:
+        event:
           type: string
-        run_id:
-          type: [string, "null"]
-        message_id:
-          type: [string, "null"]
-        created_at:
-          type: string
-          format: date-time
-        payload:
+          enum:
+            - run.started
+            - message.delta
+            - message
+            - tool.call
+            - tool.result
+            - permission.denied
+            - run.completed
+            - run.failed
+            - run.interrupted
+            - session.updated
+            - ping
+        data:
           type: object
           additionalProperties: true
-
-    EventType:
-      type: string
-      enum:
-        - session.discovered
-        - session.created
-        - session.updated
-        - session.archived
-        - run.created
-        - run.started
-        - run.completed
-        - run.failed
-        - run.interrupted
-        - message.created
-        - message.delta
-        - tool_call.created
-        - tool_result.created
-        - observer.heartbeat
-        - observer.error
 
     CreateSessionRequest:
       type: object
-      required: [backend]
+      required: [backend, model, project]
       properties:
         backend:
-          $ref: "#/components/schemas/BackendName"
+          type: string
+        model:
+          type: string
+        project:
+          $ref: "#/components/schemas/Project"
         title:
           type: [string, "null"]
-        working_directory:
-          type: [string, "null"]
-        metadata:
-          type: object
-          additionalProperties: true
-          default: {}
 
     CreateRunRequest:
       type: object
-      required: [backend, prompt]
+      required: [message]
       properties:
-        backend:
-          $ref: "#/components/schemas/BackendName"
-        prompt:
+        message:
           type: string
           minLength: 1
-        session_id:
+        model:
           type: [string, "null"]
-          description: Existing session to continue. If omitted, a new harness session is created.
-        working_directory:
-          type: [string, "null"]
-        metadata:
-          type: object
-          additionalProperties: true
-          default: {}
 
-    InterruptRunRequest:
+    CreateRunResponse:
+      type: object
+      required: [session_id, run_id]
+      properties:
+        session_id:
+          type: string
+        run_id:
+          type: string
+
+    ForkSessionRequest:
       type: object
       properties:
-        reason:
+        title:
           type: [string, "null"]
+        message:
+          type: [string, "null"]
+          description: Optional first user message to start a run in the fork.
+
+    ForkSessionResponse:
+      type: object
+      required: [session]
+      properties:
+        session:
+          $ref: "#/components/schemas/Session"
+        run:
+          oneOf:
+            - $ref: "#/components/schemas/Run"
+            - type: "null"
+
+    Project:
+      type: object
+      required: [path, name]
+      properties:
+        path:
+          type: string
+        name:
+          type: string
+
+    SessionStats:
+      type: object
+      required: [messages, tokens, cost_usd]
+      properties:
+        messages:
+          type: integer
+          minimum: 0
+        tokens:
+          type: object
+          additionalProperties: true
+        cost_usd:
+          type: number
+          minimum: 0
+
+    Usage:
+      type: object
+      required: [input, output, cache_read, cache_creation, cost_usd]
+      properties:
+        input:
+          type: integer
+          minimum: 0
+        output:
+          type: integer
+          minimum: 0
+        cache_read:
+          type: integer
+          minimum: 0
+        cache_creation:
+          type: integer
+          minimum: 0
+        cost_usd:
+          type: number
+          minimum: 0
+
+    Origin:
+      type: string
+      enum: [harness, external]
 
     ErrorResponse:
       type: object
       required: [error]
       properties:
         error:
-          $ref: "#/components/schemas/ErrorObject"
-
-    ErrorObject:
-      type: object
-      required: [code, message]
-      properties:
-        code:
-          type: string
-          examples: [external_interrupt_unsupported]
-        message:
-          type: string
-        details:
           type: object
-          additionalProperties: true
-          default: {}
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: object
+              additionalProperties: true

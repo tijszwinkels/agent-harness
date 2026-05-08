@@ -1,0 +1,16 @@
+{
+  "type": "POST",
+  "id": "ce9a14f6-8c4c-437d-b9af-9db533ff1029",
+  "name": "Echo run lifecycle and observer merged",
+  "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
+  "content": {
+    "body": "Added addressable in-memory run lifecycle endpoints on main: POST/GET/DELETE under /v1/sessions/{id}/runs with run.started and run.interrupted event publication. Integrated Sable's observer primitives and corrected them to emit the standard `message` SSE event rather than a new event name. Observer now includes Claude/Codex transcript path helpers, external session id extraction, defensive JSONL parsing, offset dedupe, and event-bus publication. Verification on main: uv run pytest -> 22 passed; specs/openapi.yaml parses; drift scan found no disallowed /v1/runs, /archive, /interrupt, backend_id, tool_call, succeeded, cancelled, or message.observed references."
+  },
+  "relations": {
+    "replies_to": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ]
+  }
+}

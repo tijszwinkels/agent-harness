@@ -170,6 +170,79 @@ async def test_observer_materializes_external_session_and_message(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_observer_buffers_messages_until_external_session_exists(tmp_path) -> None:
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}',
+                '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    repository = InMemoryRepository()
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+
+    await observer.tail_file(transcript)
+
+    messages = repository.list_messages("codex_123e4567-e89b-12d3-a456-426614174000")
+    assert [message.role for message in messages] == ["user"]
+
+
+def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogCaptureFixture) -> None:
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=8,
+            timestamp="2026-05-08T10-30-00",
+            rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+            home="/tmp/home",
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        events = [
+            *parse_transcript_record({"type": "session_meta", "payload": {"cwd": "/repo"}}, identity=identity),
+            *parse_transcript_record(
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn_1"}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec"}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "response_item", "payload": {"type": "custom_tool_call_output", "output": "..."}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "compacted", "payload": {"message": "summary"}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "event_msg", "payload": {"type": "context_compacted"}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "event_msg", "payload": {"type": "task_complete"}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": []}},
+                identity=identity,
+            ),
+        ]
+
+    assert events == []
+    assert caplog.text == ""
+
+
+@pytest.mark.asyncio
 async def test_watch_service_uses_changed_jsonl_paths(tmp_path) -> None:
     path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
     transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"

@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import BackendName, Event, Message, MessageRole, Project, Session, TextBlock
-from agent_harness.repository import InMemoryRepository
+from agent_harness.repository import InMemoryRepository, SessionNotFoundError
 
 try:
     from watchfiles import awatch
@@ -23,6 +23,18 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
+_IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
+_IGNORED_CODEX_PAYLOAD_TYPES = {
+    "context_compacted",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "function_call",
+    "function_call_output",
+    "reasoning",
+    "task_complete",
+    "task_started",
+    "token_count",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +74,7 @@ class ExternalTranscriptObserver:
         self._event_bus = event_bus
         self._repository = repository
         self._state = state or ObserverState()
+        self._pending_materialization: dict[str, list[Event]] = {}
 
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)
@@ -109,9 +122,44 @@ class ExternalTranscriptObserver:
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
             published_event = await self._event_bus.publish(event)
             if self._repository is not None:
-                self._repository.materialize_event(published_event)
+                self._materialize_or_buffer(published_event)
             published.append(published_event)
         return published
+
+    def _materialize_or_buffer(self, event: Event) -> None:
+        if self._repository is None:
+            return
+
+        try:
+            self._repository.materialize_event(event)
+        except SessionNotFoundError:
+            if event.event == "message" and event.session_id:
+                logger.debug(
+                    "Buffering observed message until session exists: session=%s event=%s",
+                    event.session_id,
+                    event.sequence,
+                )
+                self._pending_materialization.setdefault(event.session_id, []).append(event)
+                return
+            raise
+
+        if event.event == "session.updated" and event.session_id:
+            self._flush_pending_materialization(event.session_id)
+
+    def _flush_pending_materialization(self, session_id: str) -> None:
+        if self._repository is None:
+            return
+
+        pending = self._pending_materialization.pop(session_id, [])
+        still_pending: list[Event] = []
+        for event in pending:
+            try:
+                self._repository.materialize_event(event)
+            except SessionNotFoundError:
+                still_pending.append(event)
+
+        if still_pending:
+            self._pending_materialization[session_id] = still_pending
 
 
 Watcher = Callable[..., AsyncIterator[Iterable[tuple[object, str]]]]
@@ -296,7 +344,24 @@ def _parse_codex_record(
     )
 
     payload_type = _string_value(payload.get("type"))
+    if record_type in _IGNORED_CODEX_RECORD_TYPES or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES:
+        logger.debug(
+            "Ignoring Codex transcript metadata: path=%s type=%s payload_type=%s",
+            identity.path,
+            record_type,
+            payload_type,
+        )
+        return events
+
     role = _role_from_value(payload.get("role")) or _role_from_codex_payload_type(payload_type)
+    if record_type == "response_item" and payload_type == "message" and role is None:
+        logger.debug(
+            "Ignoring unsupported Codex message role: path=%s role=%s",
+            identity.path,
+            payload.get("role"),
+        )
+        return events
+
     if record_type in {"event_msg", "response_item"} and role is not None:
         events.append(
             _message_event(

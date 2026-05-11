@@ -184,4 +184,8 @@ class InMemoryRepository:
 
 
 def _messages_equivalent(left: Message, right: Message) -> bool:
-    return left.role == right.role and left.blocks == right.blocks
+    return _message_key(left) == _message_key(right)
+
+
+def _message_key(message: Message) -> tuple[str, str]:
+    return (message.role, "".join(block.model_dump_json() for block in message.blocks))

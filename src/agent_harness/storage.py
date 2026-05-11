@@ -82,6 +82,7 @@ class SQLiteRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
         self._lock = RLock()
+        self._message_keys: dict[str, set[tuple[str, str]]] = {}
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("pragma foreign_keys = on")
         self._initialize_schema()
@@ -391,13 +392,21 @@ class SQLiteRepository:
                 message.timestamp.isoformat(),
             ),
         )
+        self._message_keys.setdefault(session_id, set()).add(_message_key(message))
 
     def _insert_message_if_new(self, session_id: str, message: Message) -> bool:
-        rows = self._connection.execute(
-            "select payload from messages where session_id = ?",
-            (session_id,),
-        ).fetchall()
-        if any(_messages_equivalent(_model_from_row(row, "payload", Message), message) for row in rows):
+        keys = self._message_keys.get(session_id)
+        if keys is None:
+            keys = {
+                _message_key(_model_from_row(row, "payload", Message))
+                for row in self._connection.execute(
+                    "select payload from messages where session_id = ?",
+                    (session_id,),
+                ).fetchall()
+            }
+            self._message_keys[session_id] = keys
+
+        if _message_key(message) in keys:
             return False
         self._insert_message(session_id, message)
         return True
@@ -438,4 +447,8 @@ def _model_from_row(row: sqlite3.Row, column: str, model_type: type[TModel]) -> 
 
 
 def _messages_equivalent(left: Message, right: Message) -> bool:
-    return left.role == right.role and left.blocks == right.blocks
+    return _message_key(left) == _message_key(right)
+
+
+def _message_key(message: Message) -> tuple[str, str]:
+    return (message.role, "".join(block.model_dump_json() for block in message.blocks))

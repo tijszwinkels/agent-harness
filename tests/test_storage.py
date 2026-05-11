@@ -23,6 +23,8 @@ def test_sqlite_repository_persists_sessions_runs_and_messages_after_reopen(tmp_
 
     reopened = open_sqlite_repository(db_path)
 
+    assert reopened.has_session(session.id)
+    assert not reopened.has_session("ses_missing")
     assert reopened.get_session(session.id).status == archived.status == "archived"
     assert reopened.list_sessions()[0].id == session.id
     assert reopened.get_run(session.id, run.id).status == interrupted.status == "interrupted"

@@ -103,6 +103,10 @@ class SQLiteRepository:
             raise SessionNotFoundError(session_id)
         return session
 
+    def has_session(self, session_id: str) -> bool:
+        with self._lock:
+            return self._find_session_locked(session_id) is not None
+
     def archive_session(self, session_id: str) -> Session:
         with self._lock, self._connection:
             session = self._find_session_locked(session_id)

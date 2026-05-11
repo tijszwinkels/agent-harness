@@ -149,6 +149,9 @@ class ExternalTranscriptObserver:
     def _session_exists(self, session_id: str) -> bool:
         if self._repository is None:
             return False
+        has_session = getattr(self._repository, "has_session", None)
+        if callable(has_session):
+            return bool(has_session(session_id))
         try:
             self._repository.get_session(session_id)
         except SessionNotFoundError:

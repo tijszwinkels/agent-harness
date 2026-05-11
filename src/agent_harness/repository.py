@@ -43,6 +43,10 @@ class InMemoryRepository:
             raise SessionNotFoundError(session_id)
         return session.model_copy(deep=True)
 
+    def has_session(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._sessions
+
     def archive_session(self, session_id: str) -> Session:
         with self._lock:
             session = self._sessions.get(session_id)

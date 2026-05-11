@@ -56,7 +56,6 @@ Known metadata record types are ignored quietly:
 
 Supported records:
 
-- `event_msg` payloads with `type: "user_message"` or `type: "agent_message"`.
 - `response_item` payloads with `type: "message"` and role `user` or
   `assistant`.
 - Message content strings, `input_text`, `output_text`, and plain text list
@@ -69,12 +68,20 @@ Supported records:
   or `id` and optional `output`.
 - Inline image data URLs in message content.
 
+Codex `event_msg` payloads with `type: "user_message"`, `type: "agent_message"`,
+or `type: "assistant_message"` are treated as stream echoes and ignored. Current
+Codex transcripts also emit canonical `response_item` message records for those
+turns; normalizing both shapes would duplicate messages.
+
 Known metadata payloads are ignored quietly:
 
+- `agent_message`
+- `assistant_message`
 - `context_compacted`
 - `task_complete`
 - `task_started`
 - `token_count`
+- `user_message`
 - `web_search_call`
 
 Known record-level metadata ignored quietly:

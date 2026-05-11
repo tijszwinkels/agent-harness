@@ -39,10 +39,13 @@ _CODEX_ROLLOUT_RE = re.compile(
 _IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "pr-link", "queue-operation", "system"}
 _IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
+    "agent_message",
+    "assistant_message",
     "context_compacted",
     "task_complete",
     "task_started",
     "token_count",
+    "user_message",
     "web_search_call",
 }
 

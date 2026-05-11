@@ -1,0 +1,221 @@
+import asyncio
+
+import pytest
+
+from agent_harness.events import InMemoryEventBus
+from agent_harness.models import Message, Project, Run, Session
+from agent_harness.orchestrator import (
+    ClaudeCodeCommandBuilder,
+    CodexCommandBuilder,
+    ProcessCommand,
+    RunManager,
+    RunProcess,
+)
+
+
+class FakeStream:
+    def __init__(self, lines: list[bytes]) -> None:
+        self._lines = asyncio.Queue()
+        for line in lines:
+            self._lines.put_nowait(line)
+        self._lines.put_nowait(b"")
+
+    async def readline(self) -> bytes:
+        return await self._lines.get()
+
+
+class FakeProcess:
+    def __init__(
+        self,
+        *,
+        stdout: list[bytes] | None = None,
+        stderr: list[bytes] | None = None,
+        returncode: int = 0,
+    ) -> None:
+        self.stdout = FakeStream(stdout or [])
+        self.stderr = FakeStream(stderr or [])
+        self.returncode: int | None = None
+        self._final_returncode = returncode
+        self._done = asyncio.Event()
+        self.terminated = False
+
+    async def wait(self) -> int:
+        await self._done.wait()
+        return self.returncode if self.returncode is not None else self._final_returncode
+
+    def finish(self) -> None:
+        self.returncode = self._final_returncode
+        self._done.set()
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+        self._done.set()
+
+
+class FakeFactory:
+    def __init__(self, process: FakeProcess) -> None:
+        self.process = process
+        self.commands: list[ProcessCommand] = []
+
+    async def __call__(self, command: ProcessCommand) -> FakeProcess:
+        self.commands.append(command)
+        return self.process
+
+
+def make_session(backend: str = "codex") -> Session:
+    return Session(
+        backend=backend,
+        model="gpt-5.4",
+        project=Project(path="/workspace/project", name="project"),
+    )
+
+
+def make_run(session: Session, *, origin: str = "harness") -> Run:
+    return Run(
+        session_id=session.id,
+        status="running",
+        started_at=session.created_at,
+        input_message_id="msg_input",
+        origin=origin,
+    )
+
+
+def test_codex_command_builder_uses_exec_json_mode_and_project_cwd() -> None:
+    session = make_session("codex")
+    run = make_run(session)
+    message = Message.user("implement it")
+
+    command = CodexCommandBuilder().build(session=session, run=run, message=message)
+
+    assert command.argv == ("codex", "exec", "--json", "--model", "gpt-5.4", "implement it")
+    assert command.cwd == "/workspace/project"
+    assert command.env == {}
+
+
+def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
+    session = make_session("claude-code")
+    run = make_run(session)
+    message = Message.user("review it")
+
+    command = ClaudeCodeCommandBuilder().build(session=session, run=run, message=message)
+
+    assert command.argv == (
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--model",
+        "gpt-5.4",
+        "review it",
+    )
+    assert command.cwd == "/workspace/project"
+
+
+@pytest.mark.asyncio
+async def test_run_process_publishes_stdout_and_stderr_deltas_then_completion() -> None:
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    process = FakeProcess(stdout=[b"hello\n"], stderr=[b"warn\n"], returncode=0)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hello"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = await bus.replay(session_id=session.id, run_id=run.id)
+    assert result.status == "completed"
+    assert [event.event for event in events] == [
+        "run.started",
+        "message.delta",
+        "message.delta",
+        "run.completed",
+    ]
+    assert events[1].data == {"stream": "stdout", "text": "hello"}
+    assert events[2].data == {"stream": "stderr", "text": "warn"}
+    assert events[3].data == {"returncode": 0}
+
+
+@pytest.mark.asyncio
+async def test_run_process_publishes_failed_for_nonzero_exit() -> None:
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    process = FakeProcess(stderr=[b"boom\n"], returncode=2)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hello")),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = await bus.replay(session_id=session.id, run_id=run.id)
+    assert result.status == "failed"
+    assert [event.event for event in events] == ["run.started", "message.delta", "run.failed"]
+    assert events[-1].data == {"returncode": 2}
+
+
+@pytest.mark.asyncio
+async def test_run_manager_interrupts_owned_processes_only() -> None:
+    bus = InMemoryEventBus()
+    session = make_session()
+    owned_run = make_run(session)
+    process = FakeProcess(stdout=[b"working\n"])
+    manager = RunManager(event_bus=bus, process_factory=FakeFactory(process))
+
+    manager.start(
+        session=session,
+        run=owned_run,
+        command=ProcessCommand(argv=("codex", "exec", "hello")),
+    )
+    await asyncio.sleep(0)
+
+    assert await manager.interrupt(session.id, owned_run.id) is True
+
+    result = await asyncio.wait_for(manager.wait(owned_run.id), timeout=1)
+    events = await bus.replay(session_id=session.id, run_id=owned_run.id)
+
+    assert process.terminated is True
+    assert result.status == "interrupted"
+    assert events[-1].event == "run.interrupted"
+
+
+@pytest.mark.asyncio
+async def test_run_manager_refuses_to_interrupt_active_external_runs() -> None:
+    bus = InMemoryEventBus()
+    session = make_session()
+    external_run = make_run(session, origin="external")
+    process = FakeProcess()
+    manager = RunManager(event_bus=bus, process_factory=FakeFactory(process))
+
+    manager.start(
+        session=session,
+        run=external_run,
+        command=ProcessCommand(argv=("codex", "exec", "hello")),
+    )
+    await asyncio.sleep(0)
+
+    assert await manager.interrupt(session.id, external_run.id) is False
+    assert process.terminated is False
+
+    process.finish()
+    await asyncio.wait_for(manager.wait(external_run.id), timeout=1)

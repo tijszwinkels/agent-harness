@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from agent_harness.api import create_app
+from agent_harness.models import Project, Session
 from agent_harness.settings import ObserverSettings
 
 
@@ -86,6 +87,44 @@ def test_run_create_list_get_interrupt_flow() -> None:
     assert interrupt_response.status_code == 200
     assert interrupt_response.json()["status"] == "interrupted"
     assert interrupt_response.json()["stop_reason"] == "interrupted"
+
+
+def test_run_create_starts_run_manager_when_configured() -> None:
+    class FakeRunManager:
+        def __init__(self) -> None:
+            self.started = []
+
+        def start(self, *, session, run, command):
+            self.started.append((session, run, command))
+
+    class FakeBuilder:
+        def build(self, *, session, run, message):
+            return ("fake", session.id, run.id, message.id)
+
+    manager = FakeRunManager()
+    client = TestClient(
+        create_app(
+            run_manager=manager,
+            command_builders={"codex": FakeBuilder()},
+        )
+    )
+    session = client.post(
+        "/v1/sessions",
+        json={
+            "backend": "codex",
+            "model": "gpt-5.4",
+            "project": {"path": "/tmp/proj", "name": "proj"},
+        },
+    ).json()
+
+    response = client.post(f"/v1/sessions/{session['id']}/runs", json={"message": "hello"})
+
+    assert response.status_code == 202
+    assert len(manager.started) == 1
+    started_session, started_run, command = manager.started[0]
+    assert started_session.id == session["id"]
+    assert started_run.id == response.json()["run_id"]
+    assert command[0] == "fake"
 
 
 def test_session_messages_endpoint_returns_materialized_messages() -> None:

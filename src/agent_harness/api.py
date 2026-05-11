@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +16,7 @@ from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event
 from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchService
+from agent_harness.orchestrator import BackendCommandBuilder, RunManager, default_command_builders
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
 from agent_harness.settings import ObserverSettings
 
@@ -41,11 +42,14 @@ def create_app(
     observer_settings: ObserverSettings | None = None,
     watch_service_factory: WatchServiceFactory | None = None,
     task_factory: TaskFactory | None = None,
+    run_manager: RunManager | None = None,
+    command_builders: Mapping[str, BackendCommandBuilder] | None = None,
 ) -> FastAPI:
     repo = repository or InMemoryRepository()
     events = event_bus or InMemoryEventBus()
     backends = backend_registry or default_backend_registry()
     settings = observer_settings or ObserverSettings()
+    builders = command_builders or default_command_builders()
 
     app = FastAPI(
         title="agent-harness",
@@ -128,7 +132,20 @@ def create_app(
             logger.warning("Run create failed because session was not found: %s", session_id)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
 
-        await events.publish(Event(event="run.started", session_id=session_id, run_id=run.id, data={}))
+        if run_manager is not None:
+            try:
+                session = repo.get_session(session_id)
+                message = _input_message_for_run(repo.list_messages(session_id), run.input_message_id)
+                builder = builders[session.backend]
+                run_manager.start(session=session, run=run, command=builder.build(session=session, run=run, message=message))
+            except KeyError as exc:
+                logger.warning("No command builder configured for backend: %s", session.backend)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Backend cannot launch runs") from exc
+            except ValueError as exc:
+                logger.warning("Run command build failed: session=%s run=%s error=%s", session_id, run.id, exc)
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        else:
+            await events.publish(Event(event="run.started", session_id=session_id, run_id=run.id, data={}))
         return CreateRunResponse(session_id=session_id, run_id=run.id)
 
     @app.get("/v1/sessions/{session_id}/runs")
@@ -258,6 +275,13 @@ def _create_watch_service(
     if watch_service_factory is not None:
         return watch_service_factory(roots=roots, observer=observer)
     return TranscriptWatchService(roots=roots, observer=observer)
+
+
+def _input_message_for_run(messages, input_message_id: str | None):
+    for message in messages:
+        if message.id == input_message_id:
+            return message
+    raise ValueError("Run input message was not found")
 
 
 async def _stop_observer_task(

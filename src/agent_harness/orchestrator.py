@@ -56,6 +56,13 @@ class ClaudeCodeCommandBuilder:
         )
 
 
+def default_command_builders() -> dict[str, BackendCommandBuilder]:
+    return {
+        "claude-code": ClaudeCodeCommandBuilder(),
+        "codex": CodexCommandBuilder(),
+    }
+
+
 class AsyncLineReader(Protocol):
     async def readline(self) -> bytes:
         pass

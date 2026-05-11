@@ -19,6 +19,40 @@ def test_serve_command_runs_uvicorn_with_import_string(monkeypatch) -> None:
     ]
 
 
+def test_serve_command_builds_app_for_database(monkeypatch, tmp_path) -> None:
+    calls = []
+    opened = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    def fake_open(path):
+        opened.append(path)
+        return object()
+
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", fake_run)
+    monkeypatch.setattr("agent_harness.cli.open_sqlite_repository", fake_open)
+
+    database = tmp_path / "agent-harness.db"
+    assert main(["serve", "--database", str(database)]) == 0
+
+    assert opened == [str(database)]
+    assert calls[0][0][0] != "agent_harness.api:app"
+
+
+def test_serve_command_builds_app_for_real_run_execution(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", fake_run)
+
+    assert main(["serve", "--execute-runs"]) == 0
+
+    assert calls[0][0][0] != "agent_harness.api:app"
+
+
 def test_serve_command_configures_observer_roots(monkeypatch, tmp_path) -> None:
     calls = []
     root = tmp_path / "transcripts"

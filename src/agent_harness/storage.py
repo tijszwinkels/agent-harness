@@ -8,7 +8,17 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Run, Session, utc_now
+from agent_harness.models import (
+    CreateRunRequest,
+    CreateSessionRequest,
+    Event,
+    Message,
+    Run,
+    RunStatus,
+    Session,
+    StopReason,
+    utc_now,
+)
 from agent_harness.repository import RunNotFoundError, SessionNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -193,6 +203,39 @@ class SQLiteRepository:
             )
             self._upsert_run(interrupted)
         return interrupted.model_copy(deep=True)
+
+    def finish_run(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        status: RunStatus,
+        stop_reason: StopReason | None = None,
+    ) -> Run:
+        with self._lock, self._connection:
+            session = self._find_session_locked(session_id)
+            if session is None:
+                logger.warning("SQLite run finish failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            row = self._connection.execute(
+                "select payload from runs where id = ? and session_id = ?",
+                (run_id, session_id),
+            ).fetchone()
+            if row is None:
+                logger.warning("SQLite run finish failed: session=%s run=%s", session_id, run_id)
+                raise RunNotFoundError(run_id)
+
+            run = _model_from_row(row, "payload", Run)
+            finished = run.model_copy(
+                update={
+                    "status": status,
+                    "completed_at": utc_now(),
+                    "stop_reason": stop_reason,
+                }
+            )
+            self._upsert_run(finished)
+            self._upsert_session(session.model_copy(update={"status": "idle", "updated_at": utc_now()}))
+        return finished.model_copy(deep=True)
 
     def list_messages(self, session_id: str) -> list[Message]:
         with self._lock:

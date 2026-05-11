@@ -14,12 +14,13 @@ from starlette.responses import StreamingResponse
 
 from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event
+from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event, StopReason
 from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchService
 from agent_harness.orchestrator import (
     BackendCommandBuilder,
     CommandBuildError,
     RunManager,
+    RunProcessResult,
     default_command_builders,
     validate_session_resume_target,
 )
@@ -160,6 +161,7 @@ def create_app(
                 message = _input_message_for_run(repo.list_messages(session_id), run.input_message_id)
                 builder = builders[session.backend]
                 run_manager.start(session=session, run=run, command=builder.build(session=session, run=run, message=message))
+                _schedule_run_result_materialization(run_manager, repo, session_id=session_id, run_id=run.id)
             except KeyError as exc:
                 logger.warning("No command builder configured for backend: %s", session.backend)
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Backend cannot launch runs") from exc
@@ -307,6 +309,45 @@ def _input_message_for_run(messages, input_message_id: str | None):
         if message.id == input_message_id:
             return message
     raise ValueError("Run input message was not found")
+
+
+def _schedule_run_result_materialization(
+    run_manager: object,
+    repository: object,
+    *,
+    session_id: str,
+    run_id: str,
+) -> None:
+    wait = getattr(run_manager, "wait", None)
+    finish_run = getattr(repository, "finish_run", None)
+    if not callable(wait) or not callable(finish_run):
+        return
+
+    asyncio.create_task(
+        _materialize_run_result(
+            wait,
+            finish_run,
+            session_id=session_id,
+            run_id=run_id,
+        )
+    )
+
+
+async def _materialize_run_result(
+    wait,
+    finish_run,
+    *,
+    session_id: str,
+    run_id: str,
+) -> None:
+    try:
+        result: RunProcessResult = await wait(run_id)
+        stop_reason: StopReason | None = "interrupted" if result.status == "interrupted" else None
+        if result.status == "completed":
+            stop_reason = "end_turn"
+        finish_run(session_id, run_id, status=result.status, stop_reason=stop_reason)
+    except Exception:
+        logger.exception("Failed to materialize run result: session=%s run=%s", session_id, run_id)
 
 
 async def _stop_observer_task(

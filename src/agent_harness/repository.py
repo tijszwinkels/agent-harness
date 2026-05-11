@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from threading import RLock
 
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Run, Session, utc_now
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Run, RunStatus, Session, StopReason, utc_now
 
 
 class SessionNotFoundError(KeyError):
@@ -115,6 +115,33 @@ class InMemoryRepository:
             )
             self._runs[run_id] = interrupted
             return interrupted.model_copy(deep=True)
+
+    def finish_run(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        status: RunStatus,
+        stop_reason: StopReason | None = None,
+    ) -> Run:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            run = self._runs.get(run_id)
+            if run is None or run.session_id != session_id:
+                raise RunNotFoundError(run_id)
+
+            finished = run.model_copy(
+                update={
+                    "status": status,
+                    "completed_at": utc_now(),
+                    "stop_reason": stop_reason,
+                }
+            )
+            self._runs[run_id] = finished
+            self._sessions[session_id] = session.model_copy(update={"status": "idle", "updated_at": utc_now()})
+            return finished.model_copy(deep=True)
 
     def list_messages(self, session_id: str) -> list[Message]:
         with self._lock:

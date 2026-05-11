@@ -1,7 +1,9 @@
+import pytest
 from fastapi.testclient import TestClient
 
-from agent_harness.api import create_app
-from agent_harness.models import Project, Session
+from agent_harness.api import _materialize_run_result, create_app
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Project, Session
+from agent_harness.orchestrator import RunProcessResult
 from agent_harness.repository import InMemoryRepository
 from agent_harness.settings import ObserverSettings
 
@@ -151,6 +153,30 @@ def test_run_create_returns_409_when_external_session_cannot_be_resumed() -> Non
     assert response.json()["detail"] == "Cannot resume external codex session from id external_without_backend_prefix"
     assert repo.list_runs("external_without_backend_prefix") == []
     assert repo.list_messages("external_without_backend_prefix") == []
+
+
+@pytest.mark.asyncio
+async def test_run_result_materialization_updates_repository_status() -> None:
+    repo = InMemoryRepository()
+    session = repo.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4-mini",
+            project=Project(path="/tmp/proj", name="proj"),
+        )
+    )
+    run = repo.create_run(session.id, CreateRunRequest(message="hello"))
+
+    async def wait(run_id):
+        return RunProcessResult(run_id=run_id, status="completed", returncode=0)
+
+    await _materialize_run_result(wait, repo.finish_run, session_id=session.id, run_id=run.id)
+
+    stored = repo.get_run(session.id, run.id)
+    assert stored.status == "completed"
+    assert stored.stop_reason == "end_turn"
+    assert stored.completed_at is not None
+    assert repo.get_session(session.id).status == "idle"
 
 
 def test_session_messages_endpoint_returns_materialized_messages() -> None:

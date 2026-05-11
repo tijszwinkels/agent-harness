@@ -17,7 +17,7 @@ def test_sqlite_repository_persists_sessions_runs_and_messages_after_reopen(tmp_
         )
     )
     run = repository.create_run(session.id, CreateRunRequest(message="persist me"))
-    interrupted = repository.interrupt_run(session.id, run.id)
+    completed = repository.finish_run(session.id, run.id, status="completed", stop_reason="end_turn")
     archived = repository.archive_session(session.id)
     repository.close()
 
@@ -27,7 +27,10 @@ def test_sqlite_repository_persists_sessions_runs_and_messages_after_reopen(tmp_
     assert not reopened.has_session("ses_missing")
     assert reopened.get_session(session.id).status == archived.status == "archived"
     assert reopened.list_sessions()[0].id == session.id
-    assert reopened.get_run(session.id, run.id).status == interrupted.status == "interrupted"
+    reopened_run = reopened.get_run(session.id, run.id)
+    assert reopened_run.status == completed.status == "completed"
+    assert reopened_run.stop_reason == "end_turn"
+    assert reopened_run.completed_at is not None
     assert [item.id for item in reopened.list_runs(session.id)] == [run.id]
     messages = reopened.list_messages(session.id)
     assert [message.role for message in messages] == ["user"]

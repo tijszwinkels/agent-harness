@@ -6,8 +6,9 @@ from agent_harness.models import Backend, BackendCapabilities, BackendName
 
 
 class BackendRegistry:
-    def __init__(self, backends: Iterable[Backend]) -> None:
+    def __init__(self, backends: Iterable[Backend], models: dict[str, list[str]] | None = None) -> None:
         self._backends = {backend.name: backend for backend in backends}
+        self._models = models or {}
 
     def list(self) -> list[Backend]:
         return list(self._backends.values())
@@ -17,6 +18,11 @@ class BackendRegistry:
 
     def has(self, name: str) -> bool:
         return name in self._backends
+
+    def models(self, name: str) -> list[str]:
+        if name not in self._backends:
+            raise KeyError(name)
+        return list(self._models.get(name, []))
 
 
 def default_backend_registry() -> BackendRegistry:

@@ -74,9 +74,21 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/v1/health")
+    async def versioned_health() -> dict[str, str]:
+        return {"status": "ok"}
+
     @app.get("/v1/backends")
     async def list_backends() -> dict[str, object]:
         return {"data": backends.list()}
+
+    @app.get("/v1/backends/{backend_name}/models")
+    async def list_backend_models(backend_name: str) -> dict[str, object]:
+        try:
+            return {"data": backends.models(backend_name)}
+        except KeyError as exc:
+            logger.warning("Model list failed for unknown backend: %s", backend_name)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Backend not found") from exc
 
     @app.post("/v1/sessions", status_code=status.HTTP_201_CREATED)
     async def create_session(request: CreateSessionRequest) -> object:

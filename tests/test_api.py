@@ -12,10 +12,15 @@ def test_health_and_backend_listing() -> None:
     client = TestClient(create_app())
 
     assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/v1/health").json() == {"status": "ok"}
 
     response = client.get("/v1/backends")
     assert response.status_code == 200
     assert {item["name"] for item in response.json()["data"]} == {"claude-code", "codex"}
+
+    assert client.get("/v1/backends/codex/models").json() == {"data": []}
+    assert client.get("/v1/backends/claude-code/models").json() == {"data": []}
+    assert client.get("/v1/backends/unknown/models").status_code == 404
 
 
 def test_session_create_list_get_archive_flow() -> None:

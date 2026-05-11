@@ -29,6 +29,11 @@ uv run agent-harness serve \
 
 The ASGI app import string is `agent_harness.api:app`.
 
+Health checks can use either `/health` or `/v1/health`. Backend model discovery
+is exposed at `/v1/backends/{name}/models`; it currently returns an empty list
+when the harness does not have an authoritative model catalog, and callers may
+still pass backend-supported model names directly when creating sessions.
+
 Add `--execute-runs` when the service should launch real backend CLI
 processes for `POST /v1/sessions/{id}/runs`. Without that flag, run creation
 records the input message and publishes API events, but does not invoke Codex or

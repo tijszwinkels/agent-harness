@@ -1,0 +1,3 @@
+{"type":"turn_context","payload":{"cwd":"/workspace/observer-demo","model":"gpt-5.4-mini"}}
+{"type":"event_msg","payload":{"type":"user_message","role":"user","content":"Observe this external user message"}}
+{"type":"event_msg","payload":{"type":"assistant_message","role":"assistant","content":"Observed external assistant response"}}

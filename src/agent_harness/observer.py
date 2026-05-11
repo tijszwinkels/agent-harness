@@ -335,16 +335,16 @@ def _parse_claude_record(
         return events
 
     if record_type in {"user", "assistant"} and role is not None:
-        events.append(
-            _message_event(
-                identity=identity,
-                role=role,
-                source_type=record_type,
-                model=_string_value(message.get("model")),
-                text=_text_from_claude_message(message),
-                offset=offset,
-            )
+        message_event = _message_event(
+            identity=identity,
+            role=role,
+            source_type=record_type,
+            model=_string_value(message.get("model")),
+            text=_text_from_claude_message(message),
+            offset=offset,
         )
+        if message_event is not None:
+            events.append(message_event)
         return events
 
     logger.warning(
@@ -391,16 +391,16 @@ def _parse_codex_record(
         return events
 
     if record_type in {"event_msg", "response_item"} and role is not None:
-        events.append(
-            _message_event(
-                identity=identity,
-                role=role,
-                source_type=payload_type or record_type or "unknown",
-                model=_string_value(payload.get("model")),
-                text=_text_from_codex_payload(payload),
-                offset=offset,
-            )
+        message_event = _message_event(
+            identity=identity,
+            role=role,
+            source_type=payload_type or record_type or "unknown",
+            model=_string_value(payload.get("model")),
+            text=_text_from_codex_payload(payload),
+            offset=offset,
         )
+        if message_event is not None:
+            events.append(message_event)
         return events
 
     if events:
@@ -454,11 +454,19 @@ def _message_event(
     model: str | None,
     text: str | None,
     offset: int | None,
-) -> Event:
-    message_text = text or f"Observed external {role} message"
+) -> Event | None:
+    if not text:
+        logger.debug(
+            "Skipping observed message without extractable text: path=%s role=%s source_type=%s",
+            identity.path,
+            role,
+            source_type,
+        )
+        return None
+
     message = Message(
         role=role,
-        blocks=[TextBlock(text=message_text)],
+        blocks=[TextBlock(text=text)],
         model=model,
     )
     data: dict[str, Any] = {

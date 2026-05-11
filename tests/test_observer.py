@@ -212,7 +212,7 @@ async def test_observer_buffers_messages_until_external_session_exists(tmp_path)
     transcript.write_text(
         "\n".join(
             [
-                '{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}',
+                '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}',
                 '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
             ]
         )
@@ -226,6 +226,27 @@ async def test_observer_buffers_messages_until_external_session_exists(tmp_path)
 
     messages = repository.list_messages("codex_123e4567-e89b-12d3-a456-426614174000")
     assert [message.role for message in messages] == ["user"]
+    assert messages[0].blocks[0].text == "hello"
+
+
+def test_parser_skips_message_records_without_text() -> None:
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=8,
+            timestamp="2026-05-08T10-30-00",
+            rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+            home="/tmp/home",
+        )
+    )
+
+    events = parse_transcript_record(
+        {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": []}},
+        identity=identity,
+    )
+
+    assert events == []
 
 
 def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogCaptureFixture) -> None:

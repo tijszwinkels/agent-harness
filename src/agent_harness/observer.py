@@ -45,7 +45,6 @@ _IGNORED_CODEX_PAYLOAD_TYPES = {
     "task_complete",
     "task_started",
     "token_count",
-    "user_message",
     "web_search_call",
 }
 
@@ -397,6 +396,13 @@ def _parse_codex_record(
         return events
 
     role = _role_from_value(payload.get("role")) or _role_from_codex_payload_type(payload_type)
+    if record_type == "response_item" and payload_type == "message" and role == "user":
+        logger.debug(
+            "Ignoring Codex response_item user context: path=%s",
+            identity.path,
+        )
+        return events
+
     if record_type == "response_item" and payload_type == "message" and role is None:
         logger.debug(
             "Ignoring unsupported Codex message role: path=%s role=%s",

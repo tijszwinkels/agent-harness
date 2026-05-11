@@ -199,7 +199,7 @@ async def test_observer_deduplicates_by_file_offset(tmp_path) -> None:
     transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text(
-        '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}\n',
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n',
         encoding="utf-8",
     )
     observer = ExternalTranscriptObserver(InMemoryEventBus())
@@ -220,7 +220,7 @@ async def test_observer_publishes_event_sequence_through_bus(tmp_path) -> None:
         "\n".join(
             [
                 '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
-                '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}',
+                '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}',
             ]
         )
         + "\n",
@@ -246,7 +246,7 @@ async def test_observer_materializes_external_session_and_message(tmp_path) -> N
         "\n".join(
             [
                 '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
-                '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}',
+                '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}',
             ]
         )
         + "\n",
@@ -274,7 +274,6 @@ async def test_observer_deduplicates_codex_event_echoes_and_repository_echoes(tm
         "\n".join(
             [
                 '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
-                '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}',
                 '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}',
                 '{"type":"event_msg","payload":{"type":"agent_message","message":"hi"}}',
                 '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}',
@@ -315,6 +314,7 @@ async def test_observer_buffers_messages_until_external_session_exists(tmp_path)
         "\n".join(
             [
                 '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}',
+                '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}',
                 '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
             ]
         )
@@ -395,10 +395,6 @@ def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogC
         events = [
             *parse_transcript_record({"type": "session_meta", "payload": {"cwd": "/repo"}}, identity=identity),
             *parse_transcript_record(
-                {"type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
-                identity=identity,
-            ),
-            *parse_transcript_record(
                 {"type": "event_msg", "payload": {"type": "agent_message", "message": "hello"}},
                 identity=identity,
             ),
@@ -452,11 +448,11 @@ def test_parser_extracts_text_from_supported_codex_payloads() -> None:
         )
     )
 
-    ignored_echo_events = parse_transcript_record(
+    user_events = parse_transcript_record(
         {"type": "event_msg", "payload": {"type": "user_message", "message": "hello from codex"}},
         identity=identity,
     )
-    user_events = parse_transcript_record(
+    ignored_context_events = parse_transcript_record(
         {
             "type": "response_item",
             "payload": {
@@ -479,12 +475,12 @@ def test_parser_extracts_text_from_supported_codex_payloads() -> None:
         identity=identity,
     )
 
-    assert ignored_echo_events == []
+    assert ignored_context_events == []
     assert user_events[0].data["message"]["blocks"][0]["text"] == "hello from codex"
     assert assistant_events[0].data["message"]["blocks"][0]["text"] == "assistant reply"
 
 
-def test_parser_uses_response_items_for_codex_messages_and_ignores_event_echoes() -> None:
+def test_parser_uses_codex_event_user_messages_and_response_item_assistant_messages() -> None:
     identity = transcript_identity_from_path(
         codex_transcript_path(
             year=2026,

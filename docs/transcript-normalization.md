@@ -56,8 +56,9 @@ Known metadata record types are ignored quietly:
 
 Supported records:
 
-- `response_item` payloads with `type: "message"` and role `user` or
-  `assistant`.
+- `event_msg` payloads with `type: "user_message"` become user messages.
+- `response_item` payloads with `type: "message"` and role `assistant` become
+  assistant messages.
 - Message content strings, `input_text`, `output_text`, and plain text list
   entries.
 - `response_item` payloads with `type: "reasoning"` when `summary`, `content`,
@@ -68,10 +69,15 @@ Supported records:
   or `id` and optional `output`.
 - Inline image data URLs in message content.
 
-Codex `event_msg` payloads with `type: "user_message"`, `type: "agent_message"`,
-or `type: "assistant_message"` are treated as stream echoes and ignored. Current
-Codex transcripts also emit canonical `response_item` message records for those
-turns; normalizing both shapes would duplicate messages.
+Codex `response_item` payloads with `role: "user"` are treated as context
+snapshots and ignored. Current Codex transcripts include injected project
+context in that shape; the actual user prompt is emitted as `event_msg` /
+`user_message`.
+
+Codex `event_msg` payloads with `type: "agent_message"` or
+`type: "assistant_message"` are treated as stream echoes and ignored. Current
+Codex transcripts also emit canonical assistant `response_item` message records
+for those turns; normalizing both shapes would duplicate assistant messages.
 
 Known metadata payloads are ignored quietly:
 
@@ -81,7 +87,6 @@ Known metadata payloads are ignored quietly:
 - `task_complete`
 - `task_started`
 - `token_count`
-- `user_message`
 - `web_search_call`
 
 Known record-level metadata ignored quietly:

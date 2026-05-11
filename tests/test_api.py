@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from agent_harness.api import create_app
+from agent_harness.settings import ObserverSettings
 
 
 def test_health_and_backend_listing() -> None:
@@ -114,3 +115,71 @@ def test_missing_session_returns_404() -> None:
     response = client.get("/v1/sessions/ses_missing")
 
     assert response.status_code == 404
+
+
+def test_observer_service_starts_and_stops_with_lifespan(tmp_path) -> None:
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    service = FakeWatchService()
+    created_tasks = []
+
+    def watch_service_factory(**kwargs):
+        service.roots = kwargs["roots"]
+        return service
+
+    def task_factory(coro):
+        import asyncio
+
+        task = asyncio.create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    app = create_app(
+        observer_settings=ObserverSettings.from_roots([root]),
+        watch_service_factory=watch_service_factory,
+        task_factory=task_factory,
+    )
+
+    with TestClient(app):
+        assert service.started
+        assert service.stop_event is not None
+        assert created_tasks and not created_tasks[0].done()
+
+    assert service.stopped
+    assert created_tasks[0].done()
+    assert service.roots == (root,)
+
+
+def test_observer_startup_configuration_errors_are_logged_and_raised(tmp_path, caplog) -> None:
+    missing = tmp_path / "missing"
+    app = create_app(observer_settings=ObserverSettings.from_roots([missing]))
+
+    with caplog.at_level("ERROR"):
+        try:
+            with TestClient(app):
+                pass
+        except Exception as exc:
+            raised = exc
+        else:
+            raised = None
+
+    assert raised is not None
+    assert "Failed to start transcript observer service" in caplog.text
+    assert "Observer root does not exist" in str(raised)
+
+
+class FakeWatchService:
+    def __init__(self) -> None:
+        self.roots = ()
+        self.started = False
+        self.stopped = False
+        self.stop_event = None
+
+    async def watch_forever(self, *, stop_event=None) -> None:
+        import asyncio
+
+        self.started = True
+        self.stop_event = stop_event
+        while stop_event is not None and not stop_event.is_set():
+            await asyncio.sleep(0)
+        self.stopped = True

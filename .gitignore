@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 .agent-harness.log
 .agent-harness.pid
+.agent-harness.db*

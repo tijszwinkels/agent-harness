@@ -16,7 +16,13 @@ from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event
 from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchService
-from agent_harness.orchestrator import BackendCommandBuilder, RunManager, default_command_builders
+from agent_harness.orchestrator import (
+    BackendCommandBuilder,
+    CommandBuildError,
+    RunManager,
+    default_command_builders,
+    validate_session_resume_target,
+)
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
 from agent_harness.settings import ObserverSettings
 
@@ -126,6 +132,22 @@ def create_app(
 
     @app.post("/v1/sessions/{session_id}/runs", status_code=status.HTTP_202_ACCEPTED)
     async def create_run(session_id: str, request: CreateRunRequest) -> CreateRunResponse:
+        preflight_session = None
+        if run_manager is not None:
+            try:
+                preflight_session = repo.get_session(session_id)
+                builders[preflight_session.backend]
+                validate_session_resume_target(preflight_session)
+            except SessionNotFoundError as exc:
+                logger.warning("Run create failed because session was not found: %s", session_id)
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+            except KeyError as exc:
+                logger.warning("No command builder configured for backend: %s", preflight_session.backend)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Backend cannot launch runs") from exc
+            except CommandBuildError as exc:
+                logger.warning("Run command build failed before run create: session=%s error=%s", session_id, exc)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
         try:
             run = repo.create_run(session_id, request)
         except SessionNotFoundError as exc:
@@ -134,13 +156,16 @@ def create_app(
 
         if run_manager is not None:
             try:
-                session = repo.get_session(session_id)
+                session = preflight_session or repo.get_session(session_id)
                 message = _input_message_for_run(repo.list_messages(session_id), run.input_message_id)
                 builder = builders[session.backend]
                 run_manager.start(session=session, run=run, command=builder.build(session=session, run=run, message=message))
             except KeyError as exc:
                 logger.warning("No command builder configured for backend: %s", session.backend)
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Backend cannot launch runs") from exc
+            except CommandBuildError as exc:
+                logger.warning("Run command build failed: session=%s run=%s error=%s", session_id, run.id, exc)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
             except ValueError as exc:
                 logger.warning("Run command build failed: session=%s run=%s error=%s", session_id, run.id, exc)
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

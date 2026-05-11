@@ -114,6 +114,66 @@ def test_parser_extracts_text_from_supported_claude_user_line() -> None:
     assert observations[0].data["message"]["blocks"][0]["text"] == "hello from claude"
 
 
+def test_parser_normalizes_claude_content_blocks() -> None:
+    identity = transcript_identity_from_path(
+        claude_transcript_path("/home/me/project", "123e4567-e89b-12d3-a456-426614174000", home="/tmp/home")
+    )
+
+    events = parse_transcript_record(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "checking constraints"},
+                    {"type": "text", "text": "running tests"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pytest"}},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "aW1n"},
+                    },
+                ],
+            },
+        },
+        identity=identity,
+    )
+
+    blocks = events[0].data["message"]["blocks"]
+    assert [block["type"] for block in blocks] == ["thinking", "text", "tool_use", "image"]
+    assert blocks[0]["text"] == "checking constraints"
+    assert blocks[2]["id"] == "toolu_1"
+    assert blocks[2]["input"] == {"command": "pytest"}
+    assert blocks[3]["media_type"] == "image/png"
+    assert blocks[3]["data"] == "aW1n"
+
+
+def test_parser_normalizes_claude_tool_result_blocks() -> None:
+    identity = transcript_identity_from_path(
+        claude_transcript_path("/home/me/project", "123e4567-e89b-12d3-a456-426614174000", home="/tmp/home")
+    )
+
+    events = parse_transcript_record(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "is_error": False,
+                    }
+                ],
+            },
+        },
+        identity=identity,
+    )
+
+    blocks = events[0].data["message"]["blocks"]
+    assert blocks == [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok", "is_error": False}]
+
+
 def test_parser_ignores_known_claude_metadata_without_warning(caplog: pytest.LogCaptureFixture) -> None:
     identity = transcript_identity_from_path(
         claude_transcript_path("/home/me/project", "123e4567-e89b-12d3-a456-426614174000", home="/tmp/home")
@@ -249,6 +309,34 @@ def test_parser_skips_message_records_without_text() -> None:
     assert events == []
 
 
+def test_parser_does_not_emit_observed_external_placeholder_for_no_text_records() -> None:
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=8,
+            timestamp="2026-05-08T10-30-00",
+            rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+            home="/tmp/home",
+        )
+    )
+
+    events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "input_image", "image_url": "/tmp/not-read.png"}],
+            },
+        },
+        identity=identity,
+    )
+
+    assert events == []
+    assert "Observed external" not in repr(events)
+
+
 def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogCaptureFixture) -> None:
     identity = transcript_identity_from_path(
         codex_transcript_path(
@@ -286,6 +374,10 @@ def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogC
             ),
             *parse_transcript_record(
                 {"type": "event_msg", "payload": {"type": "task_complete"}},
+                identity=identity,
+            ),
+            *parse_transcript_record(
+                {"type": "response_item", "payload": {"type": "web_search_call", "id": "ws_1"}},
                 identity=identity,
             ),
             *parse_transcript_record(
@@ -328,6 +420,103 @@ def test_parser_extracts_text_from_supported_codex_payloads() -> None:
 
     assert user_events[0].data["message"]["blocks"][0]["text"] == "hello from codex"
     assert assistant_events[0].data["message"]["blocks"][0]["text"] == "assistant reply"
+
+
+def test_parser_normalizes_codex_reasoning_and_tool_items() -> None:
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=8,
+            timestamp="2026-05-08T10-30-00",
+            rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+            home="/tmp/home",
+        )
+    )
+
+    reasoning_events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "considered repo state"}],
+            },
+        },
+        identity=identity,
+    )
+    call_events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"pytest\"}",
+            },
+        },
+        identity=identity,
+    )
+    result_events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": "call_1", "output": "passed"},
+        },
+        identity=identity,
+    )
+
+    assert reasoning_events[0].data["message"]["blocks"] == [
+        {"type": "thinking", "text": "considered repo state"}
+    ]
+    assert call_events[0].data["message"]["blocks"] == [
+        {"type": "tool_use", "name": "shell", "input": {"cmd": "pytest"}, "id": "call_1"}
+    ]
+    assert result_events[0].data["message"]["blocks"] == [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "passed", "is_error": False}
+    ]
+
+
+def test_parser_normalizes_codex_custom_tool_items() -> None:
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=8,
+            timestamp="2026-05-08T10-30-00",
+            rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+            home="/tmp/home",
+        )
+    )
+
+    call_events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call_custom",
+                "name": "apply_patch",
+                "input": "*** Begin Patch",
+            },
+        },
+        identity=identity,
+    )
+    result_events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_custom",
+                "output": [{"type": "output_text", "text": "patched"}],
+            },
+        },
+        identity=identity,
+    )
+
+    assert call_events[0].data["message"]["blocks"] == [
+        {"type": "tool_use", "name": "apply_patch", "input": {"input": "*** Begin Patch"}, "id": "call_custom"}
+    ]
+    assert result_events[0].data["message"]["blocks"] == [
+        {"type": "tool_result", "tool_use_id": "call_custom", "content": "patched", "is_error": False}
+    ]
 
 
 @pytest.mark.asyncio

@@ -35,7 +35,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     serve.add_argument(
         "--observe-default-roots",
         action="store_true",
-        help="Observe Claude Code and Codex transcript roots under HOME.",
+        help="Observe Claude Code and Codex transcript roots under HOME. This is the default when those roots exist.",
+    )
+    serve.add_argument(
+        "--no-observer",
+        action="store_true",
+        help="Disable automatic transcript observation.",
     )
 
     args = parser.parse_args(argv)
@@ -56,8 +61,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _observer_settings_from_args(args: argparse.Namespace) -> ObserverSettings:
     settings = ObserverSettings.from_roots(args.observe_root)
+    if args.no_observer:
+        return settings
     if args.observe_default_roots:
         default_settings = ObserverSettings.default_transcript_roots()
+        settings = ObserverSettings.from_roots([*settings.roots, *default_settings.roots])
+    else:
+        default_settings = ObserverSettings.existing_default_transcript_roots()
         settings = ObserverSettings.from_roots([*settings.roots, *default_settings.roots])
     return settings
 

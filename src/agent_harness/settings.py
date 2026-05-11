@@ -39,6 +39,11 @@ class ObserverSettings:
             ]
         )
 
+    @classmethod
+    def existing_default_transcript_roots(cls, *, home: str | Path | None = None) -> ObserverSettings:
+        settings = cls.default_transcript_roots(home=home)
+        return cls.from_roots(root for root in settings.roots if root.exists())
+
     def validate(self) -> None:
         missing_roots = [root for root in self.roots if not root.exists()]
         if missing_roots:

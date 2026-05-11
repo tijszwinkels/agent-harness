@@ -1,12 +1,13 @@
 from agent_harness.cli import main
 
 
-def test_serve_command_runs_uvicorn_with_import_string(monkeypatch) -> None:
+def test_serve_command_runs_uvicorn_with_import_string_when_no_observer_roots_exist(monkeypatch, tmp_path) -> None:
     calls = []
 
     def fake_run(*args, **kwargs):
         calls.append((args, kwargs))
 
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("agent_harness.cli.uvicorn.run", fake_run)
 
     assert main(["serve", "--host", "0.0.0.0", "--port", "8765", "--reload"]) == 0
@@ -57,6 +58,8 @@ def test_serve_command_configures_observer_roots(monkeypatch, tmp_path) -> None:
     calls = []
     root = tmp_path / "transcripts"
     root.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
     app = object()
 
     def fake_create_app(**kwargs):
@@ -66,6 +69,7 @@ def test_serve_command_configures_observer_roots(monkeypatch, tmp_path) -> None:
     def fake_run(*args, **kwargs):
         calls.append(("run", args, kwargs))
 
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr("agent_harness.cli.create_app", fake_create_app)
     monkeypatch.setattr("agent_harness.cli.uvicorn.run", fake_run)
 
@@ -78,7 +82,7 @@ def test_serve_command_configures_observer_roots(monkeypatch, tmp_path) -> None:
     assert calls[0][1]["observer_settings"].roots == (root,)
 
 
-def test_serve_command_can_observe_default_transcript_roots(monkeypatch, tmp_path) -> None:
+def test_serve_command_auto_observes_existing_default_transcript_roots(monkeypatch, tmp_path) -> None:
     calls = []
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     (tmp_path / ".codex" / "sessions").mkdir(parents=True)
@@ -97,3 +101,19 @@ def test_serve_command_can_observe_default_transcript_roots(monkeypatch, tmp_pat
         tmp_path / ".claude" / "projects",
         tmp_path / ".codex" / "sessions",
     )
+
+
+def test_serve_command_can_disable_auto_observer(monkeypatch, tmp_path) -> None:
+    calls = []
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    (tmp_path / ".codex" / "sessions").mkdir(parents=True)
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", fake_run)
+
+    assert main(["serve", "--no-observer"]) == 0
+
+    assert calls[0][0] == ("agent_harness.api:app",)

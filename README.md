@@ -29,7 +29,9 @@ uv run agent-harness serve \
 
 The ASGI app import string is `agent_harness.api:app`.
 
-Run with transcript observation enabled:
+By default, the server observes the known Claude Code and Codex transcript roots under `HOME` when those directories exist. Use `--no-observer` to disable that automatic observation.
+
+For a fake transcript demo, run with an explicit observed root:
 
 ```bash
 mkdir -p /tmp/agent-harness-observer-demo

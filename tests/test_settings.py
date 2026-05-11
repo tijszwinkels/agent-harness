@@ -22,6 +22,15 @@ def test_observer_settings_builds_default_transcript_roots(tmp_path) -> None:
     assert settings.enabled
 
 
+def test_observer_settings_builds_existing_default_transcript_roots(tmp_path) -> None:
+    (tmp_path / ".codex" / "sessions").mkdir(parents=True)
+
+    settings = ObserverSettings.existing_default_transcript_roots(home=tmp_path)
+
+    assert settings.roots == (tmp_path / ".codex" / "sessions",)
+    assert settings.enabled
+
+
 def test_observer_settings_normalize_and_deduplicate_roots(tmp_path) -> None:
     root = tmp_path / "transcripts"
 

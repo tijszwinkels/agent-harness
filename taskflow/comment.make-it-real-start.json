@@ -1,0 +1,16 @@
+{
+  "type": "POST",
+  "id": "31968313-57a6-4997-a155-316b47a177d9",
+  "name": "Echo make it real execution started",
+  "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
+  "content": {
+    "body": "User asked to make the prototype real and to coordinate sub-sessions via agentcom. Moving the task back to Execution. Planned parallel tracks: real subprocess backend adapters/lifecycle, durable persistence, and live observer startup/configuration. Echo remains PM/integrator and will use Codex sub-sessions only."
+  },
+  "relations": {
+    "replies_to": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ]
+  }
+}

@@ -393,11 +393,11 @@ class SQLiteRepository:
         )
 
     def _insert_message_if_new(self, session_id: str, message: Message) -> bool:
-        row = self._connection.execute(
-            "select payload from messages where session_id = ? order by row_id desc limit 1",
+        rows = self._connection.execute(
+            "select payload from messages where session_id = ?",
             (session_id,),
-        ).fetchone()
-        if row is not None and _messages_equivalent(_model_from_row(row, "payload", Message), message):
+        ).fetchall()
+        if any(_messages_equivalent(_model_from_row(row, "payload", Message), message) for row in rows):
             return False
         self._insert_message(session_id, message)
         return True

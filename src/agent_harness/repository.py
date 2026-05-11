@@ -171,7 +171,7 @@ class InMemoryRepository:
             if session_id not in self._sessions:
                 raise SessionNotFoundError(session_id)
             messages = self._messages.setdefault(session_id, [])
-            if messages and _messages_equivalent(messages[-1], message):
+            if any(_messages_equivalent(existing, message) for existing in messages):
                 return
             messages.append(message)
             session = self._sessions[session_id]

@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from agent_harness.api import create_app
 from agent_harness.models import Project, Session
+from agent_harness.repository import InMemoryRepository
 from agent_harness.settings import ObserverSettings
 
 
@@ -125,6 +126,31 @@ def test_run_create_starts_run_manager_when_configured() -> None:
     assert started_session.id == session["id"]
     assert started_run.id == response.json()["run_id"]
     assert command[0] == "fake"
+
+
+def test_run_create_returns_409_when_external_session_cannot_be_resumed() -> None:
+    class FakeRunManager:
+        def start(self, *, session, run, command):  # pragma: no cover - should not be reached
+            raise AssertionError("run manager should not start when command build fails")
+
+    repo = InMemoryRepository()
+    repo.upsert_session(
+        Session(
+            id="external_without_backend_prefix",
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/tmp/proj", name="proj"),
+            origin="external",
+        )
+    )
+    client = TestClient(create_app(repository=repo, run_manager=FakeRunManager()))
+
+    response = client.post("/v1/sessions/external_without_backend_prefix/runs", json={"message": "hello"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Cannot resume external codex session from id external_without_backend_prefix"
+    assert repo.list_runs("external_without_backend_prefix") == []
+    assert repo.list_messages("external_without_backend_prefix") == []
 
 
 def test_session_messages_endpoint_returns_materialized_messages() -> None:

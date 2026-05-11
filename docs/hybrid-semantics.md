@@ -54,9 +54,20 @@ means the harness launches a new backend process with the backend's resume flag
 or equivalent and associates the resulting work with a new harness-origin run.
 The previously observed external messages remain part of the session history.
 
+Current v1 command mappings:
+
+- Codex external sessions must use the `codex_<uuid>` id shape. The harness
+  launches `codex exec resume --json --model <model> <uuid> <message>`.
+- Claude Code external sessions must use the `claude_<uuid>` id shape. The
+  harness launches
+  `claude --print --output-format stream-json --include-partial-messages --model <model> --resume <uuid> <message>`.
+
+Harness-origin sessions currently start a fresh non-interactive backend process.
+They do not yet resume the backend's underlying conversation, because v1 does
+not persist the backend-generated session id emitted by a launched process.
+
 If the backend cannot resume the external conversation,
-`POST /v1/sessions/{id}/runs` returns `409 Conflict` with an error code such as
-`resume_unsupported`.
+`POST /v1/sessions/{id}/runs` returns `409 Conflict` with a clear message.
 
 ## Catch-Up Semantics
 

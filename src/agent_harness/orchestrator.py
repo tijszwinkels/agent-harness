@@ -13,6 +13,10 @@ from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBl
 logger = logging.getLogger(__name__)
 
 
+class CommandBuildError(ValueError):
+    """Raised when a session cannot be mapped to a runnable backend command."""
+
+
 @dataclass(frozen=True)
 class ProcessCommand:
     argv: tuple[str, ...]
@@ -32,8 +36,24 @@ class BackendCommandBuilder(Protocol):
 class CodexCommandBuilder:
     def build(self, *, session: Session, run: Run, message: Message) -> ProcessCommand:
         del run
+        text = _message_text(message)
+        if session.origin == "external":
+            return ProcessCommand(
+                argv=(
+                    "codex",
+                    "exec",
+                    "resume",
+                    "--json",
+                    "--model",
+                    session.model,
+                    _external_resume_id(session, prefix="codex_"),
+                    text,
+                ),
+                cwd=session.project.path,
+            )
+
         return ProcessCommand(
-            argv=("codex", "exec", "--json", "--model", session.model, _message_text(message)),
+            argv=("codex", "exec", "--json", "--model", session.model, text),
             cwd=session.project.path,
         )
 
@@ -41,17 +61,21 @@ class CodexCommandBuilder:
 class ClaudeCodeCommandBuilder:
     def build(self, *, session: Session, run: Run, message: Message) -> ProcessCommand:
         del run
+        text = _message_text(message)
+        argv = (
+            "claude",
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--model",
+            session.model,
+        )
+        if session.origin == "external":
+            argv = (*argv, "--resume", _external_resume_id(session, prefix="claude_"))
+
         return ProcessCommand(
-            argv=(
-                "claude",
-                "--print",
-                "--output-format",
-                "stream-json",
-                "--include-partial-messages",
-                "--model",
-                session.model,
-                _message_text(message),
-            ),
+            argv=(*argv, text),
             cwd=session.project.path,
         )
 
@@ -61,6 +85,18 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
         "claude-code": ClaudeCodeCommandBuilder(),
         "codex": CodexCommandBuilder(),
     }
+
+
+def validate_session_resume_target(session: Session) -> None:
+    if session.origin != "external":
+        return
+    if session.backend == "codex":
+        _external_resume_id(session, prefix="codex_")
+        return
+    if session.backend == "claude-code":
+        _external_resume_id(session, prefix="claude_")
+        return
+    raise CommandBuildError(f"Cannot resume external session for backend {session.backend}")
 
 
 class AsyncLineReader(Protocol):
@@ -255,3 +291,13 @@ def _message_text(message: Message) -> str:
     if not text:
         raise ValueError("Message must include at least one text block for CLI launch")
     return text
+
+
+def _external_resume_id(session: Session, *, prefix: str) -> str:
+    if session.id.startswith(prefix):
+        resume_id = session.id.removeprefix(prefix)
+        if resume_id:
+            return resume_id
+
+    backend = "claude" if prefix == "claude_" else prefix.rstrip("_")
+    raise CommandBuildError(f"Cannot resume external {backend} session from id {session.id}")

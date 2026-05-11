@@ -6,6 +6,7 @@ from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Message, Project, Run, Session
 from agent_harness.orchestrator import (
     ClaudeCodeCommandBuilder,
+    CommandBuildError,
     CodexCommandBuilder,
     ProcessCommand,
     RunManager,
@@ -93,6 +94,28 @@ def test_codex_command_builder_uses_exec_json_mode_and_project_cwd() -> None:
     assert command.env == {}
 
 
+def test_codex_command_builder_resumes_external_codex_session() -> None:
+    session = make_session("codex").model_copy(
+        update={"id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4", "origin": "external"}
+    )
+    run = make_run(session)
+    message = Message.user("append this")
+
+    command = CodexCommandBuilder().build(session=session, run=run, message=message)
+
+    assert command.argv == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "019e07c3-4682-7ff1-99e8-948e64bb70c4",
+        "append this",
+    )
+    assert command.cwd == "/workspace/project"
+
+
 def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
     session = make_session("claude-code")
     run = make_run(session)
@@ -111,6 +134,38 @@ def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
         "review it",
     )
     assert command.cwd == "/workspace/project"
+
+
+def test_claude_code_command_builder_resumes_external_claude_session() -> None:
+    session = make_session("claude-code").model_copy(
+        update={"id": "claude_2a9857de-2f9d-4190-aa76-e433619602fb", "origin": "external"}
+    )
+    run = make_run(session)
+    message = Message.user("continue this")
+
+    command = ClaudeCodeCommandBuilder().build(session=session, run=run, message=message)
+
+    assert command.argv == (
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--model",
+        "gpt-5.4",
+        "--resume",
+        "2a9857de-2f9d-4190-aa76-e433619602fb",
+        "continue this",
+    )
+    assert command.cwd == "/workspace/project"
+
+
+def test_external_resume_requires_expected_session_id_prefix() -> None:
+    session = make_session("codex").model_copy(update={"id": "external_without_backend_prefix", "origin": "external"})
+    run = make_run(session)
+
+    with pytest.raises(CommandBuildError, match="Cannot resume external codex session"):
+        CodexCommandBuilder().build(session=session, run=run, message=Message.user("hello"))
 
 
 @pytest.mark.asyncio

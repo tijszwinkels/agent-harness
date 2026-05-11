@@ -29,8 +29,25 @@ uv run agent-harness serve \
 
 The ASGI app import string is `agent_harness.api:app`.
 
+Add `--execute-runs` when the service should launch real backend CLI
+processes for `POST /v1/sessions/{id}/runs`. Without that flag, run creation
+records the input message and publishes API events, but does not invoke Codex or
+Claude Code.
+
 By default, the server observes the known Claude Code and Codex transcript roots under `HOME` when those directories exist. Use `--no-observer` to disable that automatic observation.
 Transcript records are normalized into the existing message block models where possible; see `docs/transcript-normalization.md` for coverage and limits.
+
+Appending to an observed external session uses the same run endpoint. When
+`--execute-runs` is enabled:
+
+- `codex_<uuid>` sessions launch
+  `codex exec resume --json --model <model> <uuid> <message>`.
+- `claude_<uuid>` sessions launch
+  `claude --print --output-format stream-json --include-partial-messages --model <model> --resume <uuid> <message>`.
+
+Harness-created sessions still launch a fresh non-interactive backend process in
+v1. True resume for those sessions requires capturing and storing the backend's
+own session id from process output.
 
 For a fake transcript demo, run with an explicit observed root:
 

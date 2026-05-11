@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path
+from typing import Protocol
 
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
@@ -11,9 +15,22 @@ from starlette.responses import StreamingResponse
 from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event
+from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchService
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
+from agent_harness.settings import ObserverSettings
 
 logger = logging.getLogger(__name__)
+
+OBSERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
+class WatchService(Protocol):
+    async def watch_forever(self, *, stop_event: object | None = None) -> None:
+        pass
+
+
+WatchServiceFactory = Callable[..., WatchService]
+TaskFactory = Callable[[Awaitable[None]], asyncio.Task[None]]
 
 
 def create_app(
@@ -21,12 +38,26 @@ def create_app(
     repository: InMemoryRepository | None = None,
     event_bus: InMemoryEventBus | None = None,
     backend_registry: BackendRegistry | None = None,
+    observer_settings: ObserverSettings | None = None,
+    watch_service_factory: WatchServiceFactory | None = None,
+    task_factory: TaskFactory | None = None,
 ) -> FastAPI:
     repo = repository or InMemoryRepository()
     events = event_bus or InMemoryEventBus()
     backends = backend_registry or default_backend_registry()
+    settings = observer_settings or ObserverSettings()
 
-    app = FastAPI(title="agent-harness", version="0.1.0")
+    app = FastAPI(
+        title="agent-harness",
+        version="0.1.0",
+        lifespan=_lifespan(
+            repository=repo,
+            event_bus=events,
+            observer_settings=settings,
+            watch_service_factory=watch_service_factory,
+            task_factory=task_factory,
+        ),
+    )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -167,6 +198,105 @@ def create_app(
         )
 
     return app
+
+
+def _lifespan(
+    *,
+    repository: InMemoryRepository,
+    event_bus: InMemoryEventBus,
+    observer_settings: ObserverSettings,
+    watch_service_factory: WatchServiceFactory | None,
+    task_factory: TaskFactory | None,
+):
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        observer_task: asyncio.Task[None] | None = None
+        stop_event: asyncio.Event | None = None
+
+        if observer_settings.enabled:
+            try:
+                observer_settings.validate()
+                observer = ExternalTranscriptObserver(event_bus, repository=repository)
+                service = _create_watch_service(
+                    observer_settings.roots,
+                    observer,
+                    watch_service_factory=watch_service_factory,
+                )
+                stop_event = asyncio.Event()
+                create_task = task_factory or asyncio.create_task
+                observer_task = create_task(service.watch_forever(stop_event=stop_event))
+                observer_task.add_done_callback(_log_observer_task_result)
+                app.state.transcript_watch_service = service
+                app.state.transcript_watch_task = observer_task
+
+                await asyncio.sleep(0)
+                if observer_task.done():
+                    observer_task.result()
+            except Exception:
+                logger.exception("Failed to start transcript observer service")
+                if observer_task is not None and not observer_task.done():
+                    observer_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await observer_task
+                raise
+
+        try:
+            yield
+        finally:
+            if observer_task is not None:
+                await _stop_observer_task(observer_task, stop_event)
+
+    return lifespan
+
+
+def _create_watch_service(
+    roots: tuple[Path, ...],
+    observer: ExternalTranscriptObserver,
+    *,
+    watch_service_factory: WatchServiceFactory | None,
+) -> WatchService:
+    if watch_service_factory is not None:
+        return watch_service_factory(roots=roots, observer=observer)
+    return TranscriptWatchService(roots=roots, observer=observer)
+
+
+async def _stop_observer_task(
+    observer_task: asyncio.Task[None],
+    stop_event: asyncio.Event | None,
+) -> None:
+    observer_task.remove_done_callback(_log_observer_task_result)
+    if stop_event is not None:
+        stop_event.set()
+    try:
+        await asyncio.wait_for(observer_task, timeout=OBSERVER_SHUTDOWN_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.error(
+            "Transcript observer service did not stop within %.1f seconds; cancelling task",
+            OBSERVER_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        observer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await observer_task
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Transcript observer service stopped with an error during shutdown")
+        raise
+
+
+def _log_observer_task_result(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        logger.debug("Transcript observer service task was cancelled")
+        return
+    try:
+        task.result()
+    except Exception as exc:
+        logger.error(
+            "Transcript observer service task failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    else:
+        logger.warning("Transcript observer service task exited")
 
 
 async def _sse_stream(

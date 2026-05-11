@@ -1,0 +1,16 @@
+{
+  "type": "POST",
+  "id": "dd90b071-996d-4682-8f7e-b290569d5116",
+  "name": "Echo runnable examples added",
+  "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
+  "content": {
+    "body": "Added runnable developer examples and pushed them to GitHub. Main commit e291e21 adds examples/curl/README.md, examples/python/simple_client.py, examples/python/observer_external.py, a safe fake Codex rollout fixture, README updates, and tests/test_examples.py. Verification: wrote failing tests first; uv run pytest tests/test_examples.py -> 2 passed; uv run pytest -> 49 passed; observer_external.py successfully wrote a fake Codex transcript into a watched temp root and the service observed the external session/messages through watchfiles and HTTP; simple_client.py created a session/run/message through the live API. Repo: https://github.com/tijszwinkels/agent-harness-echo"
+  },
+  "relations": {
+    "replies_to": [
+      {
+        "ref": "ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.eecf80a8-139f-41c0-83b4-a5dfbe7c3dc6"
+      }
+    ]
+  }
+}

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
+_IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "queue-operation"}
 _IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
     "context_compacted",
@@ -130,21 +131,39 @@ class ExternalTranscriptObserver:
         if self._repository is None:
             return
 
+        if event.event == "message" and event.session_id and not self._session_exists(event.session_id):
+            self._buffer_materialization(event)
+            return
+
         try:
             self._repository.materialize_event(event)
         except SessionNotFoundError:
             if event.event == "message" and event.session_id:
-                logger.debug(
-                    "Buffering observed message until session exists: session=%s event=%s",
-                    event.session_id,
-                    event.sequence,
-                )
-                self._pending_materialization.setdefault(event.session_id, []).append(event)
+                self._buffer_materialization(event)
                 return
             raise
 
         if event.event == "session.updated" and event.session_id:
             self._flush_pending_materialization(event.session_id)
+
+    def _session_exists(self, session_id: str) -> bool:
+        if self._repository is None:
+            return False
+        try:
+            self._repository.get_session(session_id)
+        except SessionNotFoundError:
+            return False
+        return True
+
+    def _buffer_materialization(self, event: Event) -> None:
+        if event.session_id is None:
+            return
+        logger.debug(
+            "Buffering observed message until session exists: session=%s event=%s",
+            event.session_id,
+            event.sequence,
+        )
+        self._pending_materialization.setdefault(event.session_id, []).append(event)
 
     def _flush_pending_materialization(self, session_id: str) -> None:
         if self._repository is None:
@@ -307,6 +326,14 @@ def _parse_claude_record(
     )
 
     role = _role_from_value(message.get("role")) or _role_from_value(record_type)
+    if record_type in _IGNORED_CLAUDE_RECORD_TYPES:
+        logger.debug(
+            "Ignoring Claude Code transcript metadata: path=%s type=%s",
+            identity.path,
+            record_type,
+        )
+        return events
+
     if record_type in {"user", "assistant"} and role is not None:
         events.append(
             _message_event(

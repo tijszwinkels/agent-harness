@@ -97,6 +97,22 @@ def test_parser_materializes_external_session_for_supported_claude_line() -> Non
     assert observations[1].data["message"]["role"] == "assistant"
 
 
+def test_parser_ignores_known_claude_metadata_without_warning(caplog: pytest.LogCaptureFixture) -> None:
+    identity = transcript_identity_from_path(
+        claude_transcript_path("/home/me/project", "123e4567-e89b-12d3-a456-426614174000", home="/tmp/home")
+    )
+
+    with caplog.at_level(logging.WARNING):
+        events = [
+            *parse_transcript_record({"type": "attachment", "cwd": "/repo"}, identity=identity),
+            *parse_transcript_record({"type": "last-prompt", "lastPrompt": "hello"}, identity=identity),
+            *parse_transcript_record({"type": "queue-operation", "operation": "push"}, identity=identity),
+        ]
+
+    assert events == []
+    assert caplog.text == ""
+
+
 @pytest.mark.asyncio
 async def test_observer_deduplicates_by_file_offset(tmp_path) -> None:
     path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"

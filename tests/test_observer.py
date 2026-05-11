@@ -15,6 +15,7 @@ from agent_harness.observer import (
     parse_transcript_line,
     transcript_identity_from_path,
 )
+from agent_harness.models import Message, Session
 from agent_harness.repository import InMemoryRepository
 
 
@@ -262,6 +263,47 @@ async def test_observer_materializes_external_session_and_message(tmp_path) -> N
     assert session.origin == "external"
     assert session.backend == "codex"
     assert messages[0].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_observer_deduplicates_codex_event_echoes_and_repository_echoes(tmp_path) -> None:
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
+                '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}',
+                '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}',
+                '{"type":"event_msg","payload":{"type":"agent_message","message":"hi"}}',
+                '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    repository = InMemoryRepository()
+    session_id = "codex_123e4567-e89b-12d3-a456-426614174000"
+    repository.upsert_session(
+        Session(
+            id=session_id,
+            backend="codex",
+            model="gpt-5.4",
+            project={"path": "/repo", "name": "repo"},
+            origin="external",
+        )
+    )
+    repository.add_message(session_id, Message.user("hello"))
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+
+    await observer.tail_file(transcript)
+
+    messages = repository.list_messages(session_id)
+    assert [(message.role, message.blocks[0].text) for message in messages] == [
+        ("user", "hello"),
+        ("assistant", "hi"),
+    ]
 
 
 @pytest.mark.asyncio

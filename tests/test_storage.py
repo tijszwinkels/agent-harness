@@ -66,6 +66,28 @@ def test_sqlite_repository_persists_materialized_external_events_after_reopen(tm
     reopened.close()
 
 
+def test_sqlite_repository_skips_consecutive_duplicate_messages(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    message = Message.user("same")
+
+    repository.add_message(session.id, message)
+    repository.materialize_event(
+        Event(sequence=1, event="message", session_id=session.id, data={"message": message.model_dump(mode="json")})
+    )
+
+    assert [item.blocks[0].text for item in repository.list_messages(session.id)] == ["same"]
+    assert repository.get_session(session.id).stats.messages == 1
+    repository.close()
+
+
 def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
 

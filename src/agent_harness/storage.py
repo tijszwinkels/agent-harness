@@ -282,13 +282,23 @@ class SQLiteRepository:
             if event.event == "message":
                 message_data = event.data.get("message")
                 if event.session_id and isinstance(message_data, dict):
-                    if self._find_session_locked(event.session_id) is None:
+                    session = self._find_session_locked(event.session_id)
+                    if session is None:
                         logger.warning(
                             "SQLite event materialization skipped message because session was not found: %s",
                             event.session_id,
                         )
                         raise SessionNotFoundError(event.session_id)
-                    self._insert_message(event.session_id, Message.model_validate(message_data))
+                    message = Message.model_validate(message_data)
+                    if self._insert_message_if_new(event.session_id, message):
+                        self._upsert_session(
+                            session.model_copy(
+                                update={
+                                    "updated_at": utc_now(),
+                                    "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
+                                }
+                            )
+                        )
 
     def upsert_session(self, session: Session) -> None:
         with self._lock, self._connection:
@@ -301,15 +311,15 @@ class SQLiteRepository:
                 logger.warning("SQLite message add failed because session was not found: %s", session_id)
                 raise SessionNotFoundError(session_id)
 
-            self._insert_message(session_id, message)
-            self._upsert_session(
-                session.model_copy(
-                    update={
-                        "updated_at": utc_now(),
-                        "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
-                    }
+            if self._insert_message_if_new(session_id, message):
+                self._upsert_session(
+                    session.model_copy(
+                        update={
+                            "updated_at": utc_now(),
+                            "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
+                        }
+                    )
                 )
-            )
 
     def _initialize_schema(self) -> None:
         with self._lock, self._connection:
@@ -382,6 +392,16 @@ class SQLiteRepository:
             ),
         )
 
+    def _insert_message_if_new(self, session_id: str, message: Message) -> bool:
+        row = self._connection.execute(
+            "select payload from messages where session_id = ? order by row_id desc limit 1",
+            (session_id,),
+        ).fetchone()
+        if row is not None and _messages_equivalent(_model_from_row(row, "payload", Message), message):
+            return False
+        self._insert_message(session_id, message)
+        return True
+
     def _insert_event(self, event: Event) -> None:
         self._connection.execute(
             """
@@ -415,3 +435,7 @@ def _model_from_row(row: sqlite3.Row, column: str, model_type: type[TModel]) -> 
     except ValueError:
         logger.exception("Failed to load %s payload from SQLite", model_type.__name__)
         raise
+
+
+def _messages_equivalent(left: Message, right: Message) -> bool:
+    return left.role == right.role and left.blocks == right.blocks

@@ -170,7 +170,10 @@ class InMemoryRepository:
         with self._lock:
             if session_id not in self._sessions:
                 raise SessionNotFoundError(session_id)
-            self._messages.setdefault(session_id, []).append(message)
+            messages = self._messages.setdefault(session_id, [])
+            if messages and _messages_equivalent(messages[-1], message):
+                return
+            messages.append(message)
             session = self._sessions[session_id]
             self._sessions[session_id] = session.model_copy(
                 update={
@@ -178,3 +181,7 @@ class InMemoryRepository:
                     "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
                 }
             )
+
+
+def _messages_equivalent(left: Message, right: Message) -> bool:
+    return left.role == right.role and left.blocks == right.blocks

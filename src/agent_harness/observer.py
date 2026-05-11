@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
-_IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "queue-operation"}
+_IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "pr-link", "queue-operation", "system"}
 _IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
     "context_compacted",
@@ -341,6 +341,7 @@ def _parse_claude_record(
                 role=role,
                 source_type=record_type,
                 model=_string_value(message.get("model")),
+                text=_text_from_claude_message(message),
                 offset=offset,
             )
         )
@@ -396,6 +397,7 @@ def _parse_codex_record(
                 role=role,
                 source_type=payload_type or record_type or "unknown",
                 model=_string_value(payload.get("model")),
+                text=_text_from_codex_payload(payload),
                 offset=offset,
             )
         )
@@ -450,11 +452,13 @@ def _message_event(
     role: MessageRole,
     source_type: str,
     model: str | None,
+    text: str | None,
     offset: int | None,
 ) -> Event:
+    message_text = text or f"Observed external {role} message"
     message = Message(
         role=role,
-        blocks=[TextBlock(text=f"Observed external {role} message")],
+        blocks=[TextBlock(text=message_text)],
         model=model,
     )
     data: dict[str, Any] = {
@@ -463,6 +467,37 @@ def _message_event(
         "source_type": source_type,
     }
     return Event(event="message", session_id=identity.session_id, data=data)
+
+
+def _text_from_claude_message(message: Mapping[str, Any]) -> str | None:
+    return _text_from_content(message.get("content"))
+
+
+def _text_from_codex_payload(payload: Mapping[str, Any]) -> str | None:
+    for key in ("message", "content", "text_elements"):
+        text = _text_from_content(payload.get(key))
+        if text:
+            return text
+    return None
+
+
+def _text_from_content(content: object) -> str | None:
+    if isinstance(content, str):
+        return content if content else None
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, Mapping):
+                text = _string_value(item.get("text"))
+                if text:
+                    parts.append(text)
+        joined = "\n".join(part for part in parts if part)
+        return joined or None
+
+    return None
 
 
 def _source_data(identity: TranscriptIdentity, *, offset: int | None) -> dict[str, Any]:

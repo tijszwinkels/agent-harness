@@ -95,6 +95,23 @@ def test_parser_materializes_external_session_for_supported_claude_line() -> Non
     assert observations[0].data["session"]["origin"] == "external"
     assert observations[0].session_id == identity.session_id
     assert observations[1].data["message"]["role"] == "assistant"
+    assert observations[1].data["message"]["blocks"][0]["text"] == "done"
+
+
+def test_parser_extracts_text_from_supported_claude_user_line() -> None:
+    identity = transcript_identity_from_path(
+        claude_transcript_path("/home/me/project", "123e4567-e89b-12d3-a456-426614174000", home="/tmp/home")
+    )
+
+    observations = parse_transcript_line(
+        (
+            '{"type":"user","cwd":"/home/me/project",'
+            '"message":{"role":"user","content":"hello from claude"}}'
+        ),
+        identity=identity,
+    )
+
+    assert observations[0].data["message"]["blocks"][0]["text"] == "hello from claude"
 
 
 def test_parser_ignores_known_claude_metadata_without_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -106,7 +123,9 @@ def test_parser_ignores_known_claude_metadata_without_warning(caplog: pytest.Log
         events = [
             *parse_transcript_record({"type": "attachment", "cwd": "/repo"}, identity=identity),
             *parse_transcript_record({"type": "last-prompt", "lastPrompt": "hello"}, identity=identity),
+            *parse_transcript_record({"type": "pr-link", "prUrl": "https://example.test/pr/1"}, identity=identity),
             *parse_transcript_record({"type": "queue-operation", "operation": "push"}, identity=identity),
+            *parse_transcript_record({"type": "system", "subtype": "hook"}, identity=identity),
         ]
 
     assert events == []
@@ -256,6 +275,38 @@ def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogC
 
     assert events == []
     assert caplog.text == ""
+
+
+def test_parser_extracts_text_from_supported_codex_payloads() -> None:
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=8,
+            timestamp="2026-05-08T10-30-00",
+            rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+            home="/tmp/home",
+        )
+    )
+
+    user_events = parse_transcript_record(
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "hello from codex"}},
+        identity=identity,
+    )
+    assistant_events = parse_transcript_record(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "assistant reply"}],
+            },
+        },
+        identity=identity,
+    )
+
+    assert user_events[0].data["message"]["blocks"][0]["text"] == "hello from codex"
+    assert assistant_events[0].data["message"]["blocks"][0]["text"] == "assistant reply"
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,20 @@ from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, Mapping
 
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import BackendName, Event, Message, MessageRole, Project, Session, TextBlock
+from agent_harness.models import (
+    BackendName,
+    Event,
+    ImageBlock,
+    Message,
+    MessageBlock,
+    MessageRole,
+    Project,
+    Session,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from agent_harness.repository import InMemoryRepository, SessionNotFoundError
 
 try:
@@ -27,14 +40,10 @@ _IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "pr-link", "queue-o
 _IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
     "context_compacted",
-    "custom_tool_call",
-    "custom_tool_call_output",
-    "function_call",
-    "function_call_output",
-    "reasoning",
     "task_complete",
     "task_started",
     "token_count",
+    "web_search_call",
 }
 
 
@@ -343,7 +352,7 @@ def _parse_claude_record(
             role=role,
             source_type=record_type,
             model=_string_value(message.get("model")),
-            text=_text_from_claude_message(message),
+            blocks=_blocks_from_claude_message(message),
             offset=offset,
         )
         if message_event is not None:
@@ -393,13 +402,52 @@ def _parse_codex_record(
         )
         return events
 
+    if record_type == "response_item" and payload_type == "reasoning":
+        message_event = _message_event(
+            identity=identity,
+            role="assistant",
+            source_type=payload_type,
+            model=_string_value(payload.get("model")),
+            blocks=_blocks_from_codex_reasoning(payload),
+            offset=offset,
+        )
+        if message_event is not None:
+            events.append(message_event)
+        return events
+
+    if record_type == "response_item" and payload_type in {"function_call", "custom_tool_call"}:
+        message_event = _message_event(
+            identity=identity,
+            role="assistant",
+            source_type=payload_type,
+            model=_string_value(payload.get("model")),
+            blocks=_blocks_from_codex_tool_call(payload),
+            offset=offset,
+        )
+        if message_event is not None:
+            events.append(message_event)
+        return events
+
+    if record_type == "response_item" and payload_type in {"function_call_output", "custom_tool_call_output"}:
+        message_event = _message_event(
+            identity=identity,
+            role="user",
+            source_type=payload_type,
+            model=_string_value(payload.get("model")),
+            blocks=_blocks_from_codex_tool_result(payload),
+            offset=offset,
+        )
+        if message_event is not None:
+            events.append(message_event)
+        return events
+
     if record_type in {"event_msg", "response_item"} and role is not None:
         message_event = _message_event(
             identity=identity,
             role=role,
             source_type=payload_type or record_type or "unknown",
             model=_string_value(payload.get("model")),
-            text=_text_from_codex_payload(payload),
+            blocks=_blocks_from_codex_payload(payload),
             offset=offset,
         )
         if message_event is not None:
@@ -455,12 +503,12 @@ def _message_event(
     role: MessageRole,
     source_type: str,
     model: str | None,
-    text: str | None,
+    blocks: list[MessageBlock],
     offset: int | None,
 ) -> Event | None:
-    if not text:
+    if not blocks:
         logger.debug(
-            "Skipping observed message without extractable text: path=%s role=%s source_type=%s",
+            "Skipping observed message without normalized blocks: path=%s role=%s source_type=%s",
             identity.path,
             role,
             source_type,
@@ -469,7 +517,7 @@ def _message_event(
 
     message = Message(
         role=role,
-        blocks=[TextBlock(text=text)],
+        blocks=blocks,
         model=model,
     )
     data: dict[str, Any] = {
@@ -480,21 +528,173 @@ def _message_event(
     return Event(event="message", session_id=identity.session_id, data=data)
 
 
-def _text_from_claude_message(message: Mapping[str, Any]) -> str | None:
-    return _text_from_content(message.get("content"))
+def _blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:
+    return _blocks_from_content(message.get("content"))
 
 
-def _text_from_codex_payload(payload: Mapping[str, Any]) -> str | None:
+def _blocks_from_codex_payload(payload: Mapping[str, Any]) -> list[MessageBlock]:
     for key in ("message", "content", "text_elements"):
-        text = _text_from_content(payload.get(key))
-        if text:
-            return text
+        blocks = _blocks_from_content(payload.get(key))
+        if blocks:
+            return blocks
+    return []
+
+
+def _blocks_from_codex_reasoning(payload: Mapping[str, Any]) -> list[MessageBlock]:
+    blocks: list[MessageBlock] = []
+    for key in ("summary", "content", "text"):
+        for text in _text_parts_from_content(payload.get(key)):
+            blocks.append(ThinkingBlock(text=text))
+    return blocks
+
+
+def _blocks_from_codex_tool_call(payload: Mapping[str, Any]) -> list[MessageBlock]:
+    block = _tool_use_block(payload)
+    return [block] if block is not None else []
+
+
+def _blocks_from_codex_tool_result(payload: Mapping[str, Any]) -> list[MessageBlock]:
+    block = _tool_result_block(
+        tool_use_id=_string_value(payload.get("call_id")) or _string_value(payload.get("id")),
+        content=payload.get("output"),
+        is_error=payload.get("is_error"),
+    )
+    return [block] if block is not None else []
+
+
+def _blocks_from_content(content: object) -> list[MessageBlock]:
+    if isinstance(content, str):
+        return [TextBlock(text=content)] if content else []
+
+    if not isinstance(content, list):
+        return []
+
+    blocks: list[MessageBlock] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                blocks.append(TextBlock(text=item))
+            continue
+
+        if not isinstance(item, Mapping):
+            continue
+
+        item_type = _string_value(item.get("type"))
+        if item_type in {"text", "input_text", "output_text", "summary_text"}:
+            text = _string_value(item.get("text"))
+            if text:
+                blocks.append(TextBlock(text=text))
+            continue
+
+        if item_type == "thinking":
+            text = _string_value(item.get("thinking")) or _string_value(item.get("text"))
+            if text:
+                blocks.append(ThinkingBlock(text=text))
+            continue
+
+        if item_type == "tool_use":
+            block = _tool_use_block(item)
+            if block is not None:
+                blocks.append(block)
+            continue
+
+        if item_type == "tool_result":
+            block = _tool_result_block(
+                tool_use_id=_string_value(item.get("tool_use_id")),
+                content=item.get("content"),
+                is_error=item.get("is_error"),
+            )
+            if block is not None:
+                blocks.append(block)
+            continue
+
+        if item_type in {"image", "input_image", "output_image"}:
+            block = _image_block(item)
+            if block is not None:
+                blocks.append(block)
+
+    return blocks
+
+
+def _tool_use_block(item: Mapping[str, Any]) -> ToolUseBlock | None:
+    name = _string_value(item.get("name"))
+    tool_id = _string_value(item.get("id")) or _string_value(item.get("call_id"))
+    if not name or not tool_id:
+        return None
+
+    input_data = _tool_input_from_value(
+        item.get("input")
+        if "input" in item
+        else item.get("arguments")
+        if "arguments" in item
+        else item.get("args")
+    )
+    return ToolUseBlock(name=name, input=input_data, id=tool_id)
+
+
+def _tool_input_from_value(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+        except JSONDecodeError:
+            return {"input": value}
+        return dict(parsed) if isinstance(parsed, Mapping) else {"input": parsed}
+    return {}
+
+
+def _tool_result_block(
+    *,
+    tool_use_id: str | None,
+    content: object,
+    is_error: object,
+) -> ToolResultBlock | None:
+    if not tool_use_id:
+        return None
+    return ToolResultBlock(
+        tool_use_id=tool_use_id,
+        content=_text_from_content(content) or "",
+        is_error=is_error is True,
+    )
+
+
+def _image_block(item: Mapping[str, Any]) -> ImageBlock | None:
+    source = item.get("source")
+    if isinstance(source, Mapping):
+        media_type = _string_value(source.get("media_type"))
+        data = _string_value(source.get("data"))
+        if media_type and data:
+            return ImageBlock(media_type=media_type, data=data)
+
+    image_url = _string_value(item.get("image_url")) or _string_value(item.get("url"))
+    if image_url and image_url.startswith("data:"):
+        return _image_block_from_data_url(image_url)
+
     return None
 
 
+def _image_block_from_data_url(value: str) -> ImageBlock | None:
+    header, separator, data = value.partition(",")
+    if not separator or not data:
+        return None
+    media_prefix = "data:"
+    media_type = header[len(media_prefix) :].split(";", 1)[0] if header.startswith(media_prefix) else ""
+    if not media_type:
+        return None
+    return ImageBlock(media_type=media_type, data=data)
+
+
 def _text_from_content(content: object) -> str | None:
+    joined = "\n".join(_text_parts_from_content(content))
+    return joined or None
+
+
+def _text_parts_from_content(content: object) -> list[str]:
     if isinstance(content, str):
-        return content if content else None
+        return [content] if content else []
 
     if isinstance(content, list):
         parts: list[str] = []
@@ -505,10 +705,14 @@ def _text_from_content(content: object) -> str | None:
                 text = _string_value(item.get("text"))
                 if text:
                     parts.append(text)
-        joined = "\n".join(part for part in parts if part)
-        return joined or None
+        return [part for part in parts if part]
 
-    return None
+    if isinstance(content, Mapping):
+        text = _string_value(content.get("text")) or _string_value(content.get("summary"))
+        return [text] if text else []
+
+    return []
+
 
 
 def _source_data(identity: TranscriptIdentity, *, offset: int | None) -> dict[str, Any]:

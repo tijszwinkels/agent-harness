@@ -30,6 +30,7 @@ uv run agent-harness serve \
 The ASGI app import string is `agent_harness.api:app`.
 
 By default, the server observes the known Claude Code and Codex transcript roots under `HOME` when those directories exist. Use `--no-observer` to disable that automatic observation.
+Transcript records are normalized into the existing message block models where possible; see `docs/transcript-normalization.md` for coverage and limits.
 
 For a fake transcript demo, run with an explicit observed root:
 

@@ -67,6 +67,7 @@ class ClaudeCodeCommandBuilder:
             "--print",
             "--output-format",
             "stream-json",
+            "--verbose",
             "--include-partial-messages",
             "--model",
             session.model,

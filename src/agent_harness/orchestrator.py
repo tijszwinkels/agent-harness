@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock
+from agent_harness.observer import blocks_from_claude_message
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,51 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
     }
 
 
+StdoutParser = Callable[[str], list[tuple[str, dict[str, Any]]]]
+
+
+def parse_claude_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
+    # Bridge needs the final `{"type":"assistant", "message":{...}}` record. Other shapes
+    # (system/init, stream_event chunks from --include-partial-messages, result, hooks, etc.)
+    # are ignored — the final assistant record already carries the full content.
+    if not line:
+        return []
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(record, dict):
+        return []
+    record_type = record.get("type")
+    if record_type not in ("assistant", "user"):
+        return []
+    msg = record.get("message")
+    if not isinstance(msg, Mapping):
+        return []
+    role = msg.get("role")
+    if role not in ("assistant", "user"):
+        return []
+    blocks = blocks_from_claude_message(msg)
+    if not blocks:
+        return []
+    message = Message(role=role, blocks=blocks, model=msg.get("model"))
+    return [
+        (
+            "message",
+            {
+                "message": message.model_dump(mode="json"),
+                "source_type": record_type,
+            },
+        )
+    ]
+
+
+def default_stdout_parsers() -> dict[str, StdoutParser]:
+    return {
+        "claude-code": parse_claude_stream_line,
+    }
+
+
 def validate_session_resume_target(session: Session) -> None:
     if session.origin != "external":
         return
@@ -151,12 +198,16 @@ class RunProcess:
         command: ProcessCommand,
         event_bus: InMemoryEventBus,
         process_factory: ProcessFactory | None = None,
+        stdout_parsers: Mapping[str, StdoutParser] | None = None,
     ) -> None:
         self.session = session
         self.run_record = run
         self.command = command
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
+        self._stdout_parsers: Mapping[str, StdoutParser] = (
+            stdout_parsers if stdout_parsers is not None else default_stdout_parsers()
+        )
         self._process: ManagedProcess | None = None
         self._interrupted = False
 
@@ -216,10 +267,28 @@ class RunProcess:
         return tasks
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
+        parser: StdoutParser | None = None
+        if stream_name == "stdout":
+            parser = self._stdout_parsers.get(self.session.backend)
         while line := await stream.readline():
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            if text:
-                await self._publish("message.delta", {"stream": stream_name, "text": text})
+            if not text:
+                continue
+            await self._publish("message.delta", {"stream": stream_name, "text": text})
+            if parser is None:
+                continue
+            try:
+                events = parser(text)
+            except Exception:
+                logger.exception(
+                    "Stdout parser raised: session=%s run=%s backend=%s",
+                    self.session.id,
+                    self.run_record.id,
+                    self.session.backend,
+                )
+                continue
+            for event_name, data in events:
+                await self._publish(event_name, data)
 
     async def _finish_streams(self, tasks: list[asyncio.Task[None]]) -> None:
         if not tasks:
@@ -251,9 +320,13 @@ class RunManager:
         *,
         event_bus: InMemoryEventBus,
         process_factory: ProcessFactory | None = None,
+        stdout_parsers: Mapping[str, StdoutParser] | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
+        self._stdout_parsers: Mapping[str, StdoutParser] = (
+            stdout_parsers if stdout_parsers is not None else default_stdout_parsers()
+        )
         self._active: dict[str, RunProcess] = {}
         self._tasks: dict[str, asyncio.Task[RunProcessResult]] = {}
 
@@ -264,6 +337,7 @@ class RunManager:
             command=command,
             event_bus=self._event_bus,
             process_factory=self._process_factory,
+            stdout_parsers=self._stdout_parsers,
         )
         self._active[run.id] = run_process
         task = asyncio.create_task(self._run_and_forget(run_process))

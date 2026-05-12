@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -11,6 +12,7 @@ from agent_harness.orchestrator import (
     ProcessCommand,
     RunManager,
     RunProcess,
+    parse_claude_stream_line,
 )
 
 
@@ -254,6 +256,108 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
     assert process.terminated is True
     assert result.status == "interrupted"
     assert events[-1].event == "run.interrupted"
+
+
+def test_parse_claude_stream_line_extracts_assistant_message() -> None:
+    record = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "pong"}],
+        },
+    }
+
+    events = parse_claude_stream_line(json.dumps(record))
+
+    assert len(events) == 1
+    name, data = events[0]
+    assert name == "message"
+    assert data["source_type"] == "assistant"
+    assert data["message"]["role"] == "assistant"
+    assert data["message"]["model"] == "claude-sonnet-4-6"
+    assert data["message"]["blocks"] == [{"type": "text", "text": "pong"}]
+
+
+def test_parse_claude_stream_line_extracts_tool_use_blocks() -> None:
+    record = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                {"type": "text", "text": "looking…"},
+                {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "ls"}},
+            ],
+        },
+    }
+
+    events = parse_claude_stream_line(json.dumps(record))
+
+    assert len(events) == 1
+    data = events[0][1]
+    blocks = data["message"]["blocks"]
+    assert blocks[0] == {"type": "text", "text": "looking…"}
+    assert blocks[1]["type"] == "tool_use"
+    assert blocks[1]["name"] == "Bash"
+    assert blocks[1]["input"] == {"command": "ls"}
+    assert blocks[1]["id"] == "tu_1"
+
+
+def test_parse_claude_stream_line_ignores_system_and_stream_event_records() -> None:
+    for record in (
+        {"type": "system", "subtype": "init"},
+        {"type": "stream_event", "event": {"type": "content_block_delta"}},
+        {"type": "result", "subtype": "success", "result": "pong"},
+        {"type": "rate_limit_event"},
+    ):
+        assert parse_claude_stream_line(json.dumps(record)) == []
+
+
+def test_parse_claude_stream_line_ignores_non_json_and_empty_messages() -> None:
+    assert parse_claude_stream_line("not json") == []
+    assert parse_claude_stream_line("") == []
+    assert parse_claude_stream_line(json.dumps({"type": "assistant"})) == []
+    assert parse_claude_stream_line(json.dumps({"type": "assistant", "message": {}})) == []
+
+
+@pytest.mark.asyncio
+async def test_run_process_emits_structured_message_for_claude_assistant_stdout() -> None:
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    assistant_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "pong"}],
+            },
+        }
+    ).encode()
+    process = FakeProcess(stdout=[assistant_line + b"\n"], returncode=0)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    events = await bus.replay(session_id=session.id, run_id=run.id)
+    event_names = [event.event for event in events]
+    assert "message" in event_names
+    message_event = next(event for event in events if event.event == "message")
+    assert message_event.data["message"]["role"] == "assistant"
+    assert message_event.data["message"]["blocks"] == [{"type": "text", "text": "pong"}]
 
 
 @pytest.mark.asyncio

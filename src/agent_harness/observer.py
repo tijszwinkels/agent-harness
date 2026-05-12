@@ -537,8 +537,11 @@ def _message_event(
     return Event(event="message", session_id=identity.session_id, data=data)
 
 
-def _blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:
+def blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:
     return _blocks_from_content(message.get("content"))
+
+
+_blocks_from_claude_message = blocks_from_claude_message
 
 
 def _blocks_from_codex_payload(payload: Mapping[str, Any]) -> list[MessageBlock]:

@@ -31,13 +31,33 @@ class ProcessCommand:
 
 
 class BackendCommandBuilder(Protocol):
-    def build(self, *, session: Session, run: Run, message: Message) -> ProcessCommand:
-        """Build a non-interactive CLI command for a harness-owned run."""
+    def build(
+        self,
+        *,
+        session: Session,
+        run: Run,
+        message: Message,
+        is_first_run: bool = True,
+    ) -> ProcessCommand:
+        """Build a non-interactive CLI command for a harness-owned run.
+
+        ``is_first_run`` is ``True`` when no prior run exists for this
+        session. Builders use it to pick between session-creation and
+        session-resume flags (e.g. ``claude --session-id`` vs
+        ``claude --resume``).
+        """
 
 
 class CodexCommandBuilder:
-    def build(self, *, session: Session, run: Run, message: Message) -> ProcessCommand:
-        del run
+    def build(
+        self,
+        *,
+        session: Session,
+        run: Run,
+        message: Message,
+        is_first_run: bool = True,
+    ) -> ProcessCommand:
+        del run, is_first_run
         text = _message_text(message)
         if session.origin == "external":
             return ProcessCommand(
@@ -60,8 +80,27 @@ class CodexCommandBuilder:
         )
 
 
+def _harness_session_id_as_uuid(session_id: str) -> str:
+    # Harness session ids are ``ses_<uuid4_hex>`` (32 hex chars). Reformat
+    # the hex back to a standard 8-4-4-4-12 UUID so claude --session-id /
+    # --resume accept it (claude validates UUID format).
+    hex_part = session_id.removeprefix("ses_") if session_id.startswith("ses_") else session_id
+    if len(hex_part) != 32 or not all(c in "0123456789abcdef" for c in hex_part):
+        raise CommandBuildError(
+            f"Cannot derive claude session UUID from harness session id {session_id!r}",
+        )
+    return f"{hex_part[0:8]}-{hex_part[8:12]}-{hex_part[12:16]}-{hex_part[16:20]}-{hex_part[20:32]}"
+
+
 class ClaudeCodeCommandBuilder:
-    def build(self, *, session: Session, run: Run, message: Message) -> ProcessCommand:
+    def build(
+        self,
+        *,
+        session: Session,
+        run: Run,
+        message: Message,
+        is_first_run: bool = True,
+    ) -> ProcessCommand:
         del run
         text = _message_text(message)
         argv = (
@@ -76,6 +115,15 @@ class ClaudeCodeCommandBuilder:
         )
         if session.origin == "external":
             argv = (*argv, "--resume", _external_resume_id(session, prefix="claude_"))
+        else:
+            # Pin a deterministic claude session UUID derived from the
+            # harness session id so subsequent runs can resume and retain
+            # conversation context. claude --session-id creates the session
+            # on first use and errors on duplicate, so we switch to
+            # --resume for follow-up runs.
+            claude_uuid = _harness_session_id_as_uuid(session.id)
+            flag = "--session-id" if is_first_run else "--resume"
+            argv = (*argv, flag, claude_uuid)
 
         return ProcessCommand(
             argv=(*argv, text),

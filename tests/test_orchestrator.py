@@ -119,11 +119,16 @@ def test_codex_command_builder_resumes_external_codex_session() -> None:
 
 
 def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
-    session = make_session("claude-code")
+    # Pin the session id to a known hex so the derived UUID is predictable.
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
     run = make_run(session)
     message = Message.user("review it")
 
-    command = ClaudeCodeCommandBuilder().build(session=session, run=run, message=message)
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=message, is_first_run=True,
+    )
 
     assert command.argv == (
         "claude",
@@ -134,9 +139,38 @@ def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
         "--include-partial-messages",
         "--model",
         "gpt-5.4",
+        "--session-id",
+        "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
         "review it",
     )
     assert command.cwd == "/workspace/project"
+
+
+def test_claude_code_command_builder_resumes_harness_session_on_subsequent_runs() -> None:
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    run = make_run(session)
+    message = Message.user("follow-up question")
+
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=message, is_first_run=False,
+    )
+
+    assert "--session-id" not in command.argv
+    assert "--resume" in command.argv
+    resume_idx = command.argv.index("--resume")
+    assert command.argv[resume_idx + 1] == "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc"
+
+
+def test_claude_code_command_builder_rejects_non_hex_harness_session_id() -> None:
+    session = make_session("claude-code").model_copy(update={"id": "ses_not-uuid-shaped"})
+    run = make_run(session)
+
+    with pytest.raises(CommandBuildError, match="Cannot derive claude session UUID"):
+        ClaudeCodeCommandBuilder().build(
+            session=session, run=run, message=Message.user("hi"), is_first_run=True,
+        )
 
 
 def test_claude_code_command_builder_resumes_external_claude_session() -> None:

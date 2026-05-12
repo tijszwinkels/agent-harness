@@ -172,7 +172,20 @@ def create_app(
                 session = preflight_session or repo.get_session(session_id)
                 message = _input_message_for_run(repo.list_messages(session_id), run.input_message_id)
                 builder = builders[session.backend]
-                run_manager.start(session=session, run=run, command=builder.build(session=session, run=run, message=message))
+                # repo.create_run already inserted ``run``; if it's the only
+                # row, this is the session's first run and the builder may
+                # need a creation flag instead of a resume flag.
+                is_first_run = len(repo.list_runs(session_id)) <= 1
+                run_manager.start(
+                    session=session,
+                    run=run,
+                    command=builder.build(
+                        session=session,
+                        run=run,
+                        message=message,
+                        is_first_run=is_first_run,
+                    ),
+                )
                 _schedule_run_result_materialization(run_manager, repo, session_id=session_id, run_id=run.id)
             except KeyError as exc:
                 logger.warning("No command builder configured for backend: %s", session.backend)

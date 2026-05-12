@@ -106,8 +106,8 @@ def test_run_create_starts_run_manager_when_configured() -> None:
             self.started.append((session, run, command))
 
     class FakeBuilder:
-        def build(self, *, session, run, message):
-            return ("fake", session.id, run.id, message.id)
+        def build(self, *, session, run, message, is_first_run=True):
+            return ("fake", session.id, run.id, message.id, is_first_run)
 
     manager = FakeRunManager()
     client = TestClient(

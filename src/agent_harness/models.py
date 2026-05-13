@@ -174,6 +174,19 @@ class CreateRunRequest(HarnessModel):
 class CreateRunResponse(HarnessModel):
     session_id: str
     run_id: str
+    # "running" when the harness spawned the subprocess immediately, "queued"
+    # when the session already had an in-flight run and this one is waiting.
+    status: RunStatus = "running"
+
+
+class InterruptRunResponse(HarnessModel):
+    # ``run`` is the run targeted by the DELETE — interrupted whether it was
+    # actively running or merely queued. ``dropped_queued`` lists *other*
+    # runs that were sitting in the session's queue and got dropped as a
+    # side-effect (a DELETE on any run empties the per-session queue, since
+    # the user is signalling they want this conversation flow stopped).
+    run: Run
+    dropped_queued: list[Run] = Field(default_factory=list)
 
 
 class DataList(HarnessModel):

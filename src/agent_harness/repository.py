@@ -59,6 +59,10 @@ class InMemoryRepository:
             return archived.model_copy(deep=True)
 
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
+        # Runs are born ``queued`` and stay that way until the orchestrator
+        # actually spawns the subprocess (via ``start_run``). This lets the
+        # RunManager serialize concurrent ``POST /runs`` calls on the same
+        # session without lying about lifecycle state in the repo.
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -67,8 +71,8 @@ class InMemoryRepository:
             input_message = Message.user(request.message)
             run = Run(
                 session_id=session.id,
-                status="running",
-                started_at=utc_now(),
+                status="queued",
+                started_at=None,
                 input_message_id=input_message.id,
                 origin="harness",
             )
@@ -83,6 +87,44 @@ class InMemoryRepository:
             self._runs[run.id] = run
             self._messages.setdefault(session_id, []).append(input_message)
             return run.model_copy(deep=True)
+
+    def start_run(self, session_id: str, run_id: str) -> Run:
+        # Flip a queued run to ``running``, stamping ``started_at``. Idempotent:
+        # calling on an already-running run just refreshes the timestamp.
+        with self._lock:
+            if session_id not in self._sessions:
+                raise SessionNotFoundError(session_id)
+            run = self._runs.get(run_id)
+            if run is None or run.session_id != session_id:
+                raise RunNotFoundError(run_id)
+
+            started = run.model_copy(update={"status": "running", "started_at": utc_now()})
+            self._runs[run_id] = started
+            return started.model_copy(deep=True)
+
+    def drop_queued_runs(self, session_id: str) -> list[Run]:
+        # Mark every still-queued run for this session as ``interrupted`` and
+        # return the resulting Run records. Used by ``interrupt_run`` flow so
+        # callers can observe (and surface to clients) which queued follow-ups
+        # were cancelled as a side-effect of cancelling the active run.
+        with self._lock:
+            if session_id not in self._sessions:
+                raise SessionNotFoundError(session_id)
+            dropped: list[Run] = []
+            now = utc_now()
+            for run_id, run in list(self._runs.items()):
+                if run.session_id != session_id or run.status != "queued":
+                    continue
+                interrupted = run.model_copy(
+                    update={
+                        "status": "interrupted",
+                        "completed_at": now,
+                        "stop_reason": "interrupted",
+                    }
+                )
+                self._runs[run_id] = interrupted
+                dropped.append(interrupted.model_copy(deep=True))
+            return dropped
 
     def list_runs(self, session_id: str) -> list[Run]:
         with self._lock:

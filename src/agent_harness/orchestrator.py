@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -387,6 +388,28 @@ class RunProcess:
         )
 
 
+RUN_QUEUE_MAX_PER_SESSION = 16
+
+
+@dataclass(frozen=True)
+class SubmitResult:
+    # ``status`` is "running" or "queued" on accept, None on reject. Reject
+    # currently only happens when the per-session queue cap is exceeded —
+    # ``reason`` carries the machine-readable code (``"queue_full"``) so
+    # callers can map it to a transport-specific failure (api.py → 429).
+    accepted: bool
+    status: RunStatus | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedRun:
+    session: Session
+    run: Run
+    command: ProcessCommand
+    on_start: Callable[[], None] | None
+
+
 class RunManager:
     def __init__(
         self,
@@ -394,28 +417,70 @@ class RunManager:
         event_bus: InMemoryEventBus,
         process_factory: ProcessFactory | None = None,
         stdout_parsers: Mapping[str, StdoutParser] | None = None,
+        queue_max_per_session: int = RUN_QUEUE_MAX_PER_SESSION,
     ) -> None:
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
         self._stdout_parsers: Mapping[str, StdoutParser] = (
             stdout_parsers if stdout_parsers is not None else default_stdout_parsers()
         )
+        self._queue_max_per_session = queue_max_per_session
         self._active: dict[str, RunProcess] = {}
         self._tasks: dict[str, asyncio.Task[RunProcessResult]] = {}
+        # Tracks which run_id currently owns the subprocess for each session
+        # (at most one). New submits for an already-owned session land on the
+        # per-session FIFO in ``_queues`` instead of spawning concurrently —
+        # which would race on the shared claude-code rollout JSONL.
+        self._active_run_by_session: dict[str, str] = {}
+        self._queues: dict[str, deque[_QueuedRun]] = {}
+
+    def submit(
+        self,
+        *,
+        session: Session,
+        run: Run,
+        command: ProcessCommand,
+        on_start: Callable[[], None] | None = None,
+    ) -> SubmitResult:
+        # Decide whether to spawn the run immediately or queue it. Must be
+        # called from the event loop thread (it may schedule asyncio tasks);
+        # FastAPI's single-loop model satisfies this.
+        if session.id not in self._active_run_by_session:
+            self._start_now(session, run, command, on_start)
+            return SubmitResult(accepted=True, status="running")
+
+        queue = self._queues.setdefault(session.id, deque())
+        if len(queue) >= self._queue_max_per_session:
+            return SubmitResult(accepted=False, status=None, reason="queue_full")
+        queue.append(_QueuedRun(session=session, run=run, command=command, on_start=on_start))
+        return SubmitResult(accepted=True, status="queued")
 
     def start(self, *, session: Session, run: Run, command: ProcessCommand) -> RunProcess:
-        run_process = RunProcess(
-            session=session,
-            run=run,
-            command=command,
-            event_bus=self._event_bus,
-            process_factory=self._process_factory,
-            stdout_parsers=self._stdout_parsers,
-        )
-        self._active[run.id] = run_process
-        task = asyncio.create_task(self._run_and_forget(run_process))
-        self._tasks[run.id] = task
+        # Back-compat shim for callers and tests that pre-date ``submit``. It
+        # raises on rejection — pre-queue callers had no concept of "queue full".
+        result = self.submit(session=session, run=run, command=command)
+        if not result.accepted:
+            raise RuntimeError(f"RunManager.start cannot accept run: {result.reason}")
+        # When the submit landed on the queue rather than spawning, there is
+        # no RunProcess instance yet. Existing call sites only consult the
+        # return value in tests; surface a clear error rather than a None.
+        run_process = self._active.get(run.id)
+        if run_process is None:
+            raise RuntimeError(
+                "RunManager.start returned a queued submit; callers needing the "
+                "RunProcess object must use submit() and handle status='queued'.",
+            )
         return run_process
+
+    def drop_queued(self, session_id: str) -> list[str]:
+        # Pop every queued entry for ``session_id`` and return their run ids.
+        # The caller is responsible for reflecting the drop in the repository
+        # (we deliberately don't reach into the repo from here). Idempotent:
+        # returns [] when there's nothing queued.
+        queue = self._queues.pop(session_id, None)
+        if not queue:
+            return []
+        return [entry.run.id for entry in queue]
 
     async def interrupt(self, session_id: str, run_id: str) -> bool:
         run_process = self._active.get(run_id)
@@ -427,11 +492,61 @@ class RunManager:
         task = self._tasks[run_id]
         return await task
 
+    def _start_now(
+        self,
+        session: Session,
+        run: Run,
+        command: ProcessCommand,
+        on_start: Callable[[], None] | None,
+    ) -> RunProcess:
+        # ``on_start`` runs before the subprocess is launched so the caller
+        # (typically api.py) can flip the run's repo status to "running" and
+        # schedule materialization in lock-step with the actual spawn. We log
+        # and swallow callback failures rather than abort the spawn — losing
+        # a status update is preferable to leaving the user's prompt dropped.
+        if on_start is not None:
+            try:
+                on_start()
+            except Exception:
+                logger.exception(
+                    "RunManager on_start callback raised: session=%s run=%s",
+                    session.id,
+                    run.id,
+                )
+
+        run_process = RunProcess(
+            session=session,
+            run=run,
+            command=command,
+            event_bus=self._event_bus,
+            process_factory=self._process_factory,
+            stdout_parsers=self._stdout_parsers,
+        )
+        self._active[run.id] = run_process
+        self._active_run_by_session[session.id] = run.id
+        task = asyncio.create_task(self._run_and_forget(run_process))
+        self._tasks[run.id] = task
+        return run_process
+
     async def _run_and_forget(self, run_process: RunProcess) -> RunProcessResult:
         try:
             return await run_process.run()
         finally:
-            self._active.pop(run_process.run_record.id, None)
+            run_id = run_process.run_record.id
+            session_id = run_process.session.id
+            self._active.pop(run_id, None)
+            if self._active_run_by_session.get(session_id) == run_id:
+                self._active_run_by_session.pop(session_id, None)
+            self._spawn_next_queued(session_id)
+
+    def _spawn_next_queued(self, session_id: str) -> None:
+        queue = self._queues.get(session_id)
+        if not queue:
+            return
+        nxt = queue.popleft()
+        if not queue:
+            self._queues.pop(session_id, None)
+        self._start_now(nxt.session, nxt.run, nxt.command, nxt.on_start)
 
 
 def _message_text(message: Message) -> str:

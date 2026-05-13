@@ -109,6 +109,122 @@ def test_sqlite_repository_propagates_bypass_permissions(tmp_path) -> None:
     reopened.close()
 
 
+def test_materialize_session_updated_preserves_harness_origin(tmp_path) -> None:
+    """The external transcript observer always emits session.updated with
+    origin=external. When a session was originally created via the
+    harness-spawn path (origin=harness) — and after the ses_<hex>
+    canonicalization, that record shares the canonical id with whatever
+    the observer scans — the observer's event must NOT downgrade the
+    record's origin to external. Otherwise the bridge sees the next MM
+    user post in that channel as targeting an "external" session, fires
+    _replace_external_session, and the user's harness-spawned session
+    gets adopted/replaced on every bridge restart cycle."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+
+    harness_session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+            bypass_permissions=True,
+        )
+    )
+    assert harness_session.origin == "harness"
+    assert harness_session.bypass_permissions is True
+
+    # Observer-style event for the *same* canonical id, with the always-
+    # external payload it emits.
+    observer_payload = harness_session.model_copy(
+        update={
+            "origin": "external",
+            "bypass_permissions": False,
+            "model": "claude-opus-4-7",
+        }
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=harness_session.id,
+            data={"session": observer_payload.model_dump(mode="json")},
+        )
+    )
+
+    after = repository.get_session(harness_session.id)
+    assert after.origin == "harness", "observer must not downgrade harness origin"
+    assert after.bypass_permissions is True, "observer must not clear bypass_permissions"
+    repository.close()
+
+
+def test_materialize_session_updated_creates_when_session_absent(tmp_path) -> None:
+    """For a brand-new external claude session the observer is the only
+    source — its session.updated event must create the record."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+
+    external = Session(
+        id="ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=external.id,
+            data={"session": external.model_dump(mode="json")},
+        )
+    )
+
+    after = repository.get_session(external.id)
+    assert after.origin == "external"
+    assert after.model == "claude-opus-4-7"
+    repository.close()
+
+
+def test_materialize_session_updated_allows_observer_updates_to_external(tmp_path) -> None:
+    """For an existing origin=external session, the observer is the source
+    of truth — later session.updated events should still flow through
+    (e.g. if model changes mid-session)."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+
+    initial = Session(
+        id="ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+        backend="claude-code",
+        model="claude-opus-4-6",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=initial.id,
+            data={"session": initial.model_dump(mode="json")},
+        )
+    )
+    updated = initial.model_copy(update={"model": "claude-opus-4-7"})
+    repository.materialize_event(
+        Event(
+            sequence=2,
+            event="session.updated",
+            session_id=initial.id,
+            data={"session": updated.model_dump(mode="json")},
+        )
+    )
+
+    after = repository.get_session(initial.id)
+    assert after.model == "claude-opus-4-7"
+    assert after.origin == "external"
+    repository.close()
+
+
 def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
 

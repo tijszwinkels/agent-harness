@@ -278,7 +278,19 @@ class SQLiteRepository:
             if event.event == "session.updated":
                 session_data = event.data.get("session")
                 if isinstance(session_data, dict):
-                    self._upsert_session(Session.model_validate(session_data))
+                    incoming = Session.model_validate(session_data)
+                    existing = self._find_session_locked(incoming.id)
+                    # The external transcript observer always emits payloads
+                    # with origin="external". If a harness-spawned session
+                    # already exists under this canonical id, the observer
+                    # is not authoritative — letting the upsert run would
+                    # downgrade origin to "external", and the next bridge
+                    # restart would re-derive _external_sessions and adopt
+                    # the channel away from the live harness session. Skip
+                    # the upsert in that case; for absent or already-external
+                    # records the observer remains the source of truth.
+                    if existing is None or existing.origin == "external":
+                        self._upsert_session(incoming)
                 return
 
             if event.event == "message":

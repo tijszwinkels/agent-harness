@@ -154,7 +154,18 @@ class InMemoryRepository:
         if event.event == "session.updated":
             session_data = event.data.get("session")
             if isinstance(session_data, dict):
-                self.upsert_session(Session.model_validate(session_data))
+                incoming = Session.model_validate(session_data)
+                with self._lock:
+                    existing = self._sessions.get(incoming.id)
+                # The external transcript observer always emits payloads
+                # with origin="external"; if a harness-spawned record
+                # already exists under the canonical ses_<hex> id, skip
+                # the upsert so we don't downgrade its origin /
+                # bypass_permissions / etc. See test_storage.py for the
+                # rationale (a downgrade causes the bridge to adopt the
+                # channel away from the live session on next MM post).
+                if existing is None or existing.origin == "external":
+                    self.upsert_session(incoming)
             return
 
         if event.event == "message":

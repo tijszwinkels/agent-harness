@@ -15,7 +15,7 @@ from agent_harness.observer import (
     parse_transcript_line,
     transcript_identity_from_path,
 )
-from agent_harness.models import Message, Session
+from agent_harness.models import Event, Message, Project, Session
 from agent_harness.repository import InMemoryRepository
 
 
@@ -650,3 +650,94 @@ async def test_watch_service_uses_changed_jsonl_paths(tmp_path) -> None:
     await service.watch_forever()
 
     assert [event.event for event in await bus.replay()] == ["session.updated"]
+
+
+def test_inmemory_repo_materialize_preserves_harness_origin() -> None:
+    """Mirror of the storage.py test for the in-memory path: observer's
+    session.updated event must not downgrade a harness-origin session to
+    external (otherwise the bridge replaces it on the next MM post)."""
+    repository = InMemoryRepository()
+    from agent_harness.models import CreateSessionRequest
+
+    harness_session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+            bypass_permissions=True,
+        )
+    )
+    assert harness_session.origin == "harness"
+
+    observer_payload = harness_session.model_copy(
+        update={"origin": "external", "bypass_permissions": False}
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=harness_session.id,
+            data={"session": observer_payload.model_dump(mode="json")},
+        )
+    )
+
+    after = repository.get_session(harness_session.id)
+    assert after.origin == "harness"
+    assert after.bypass_permissions is True
+
+
+def test_inmemory_repo_materialize_creates_when_absent() -> None:
+    repository = InMemoryRepository()
+    external = Session(
+        id="ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=external.id,
+            data={"session": external.model_dump(mode="json")},
+        )
+    )
+    after = repository.get_session(external.id)
+    assert after.origin == "external"
+
+
+def test_inmemory_repo_materialize_allows_updates_to_external() -> None:
+    repository = InMemoryRepository()
+    initial = Session(
+        id="ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+        backend="claude-code",
+        model="claude-opus-4-6",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=initial.id,
+            data={"session": initial.model_dump(mode="json")},
+        )
+    )
+    repository.materialize_event(
+        Event(
+            sequence=2,
+            event="session.updated",
+            session_id=initial.id,
+            data={
+                "session": initial.model_copy(
+                    update={"model": "claude-opus-4-7"}
+                ).model_dump(mode="json")
+            },
+        )
+    )
+    after = repository.get_session(initial.id)
+    assert after.model == "claude-opus-4-7"
+    assert after.origin == "external"

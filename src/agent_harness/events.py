@@ -59,15 +59,55 @@ class InMemoryEventBus:
         after: int = 0,
         *,
         session_id: str | None = None,
-    ) -> AsyncIterator[Event]:
+        keepalive_seconds: float | None = None,
+    ) -> AsyncIterator[Event | None]:
+        # When ``keepalive_seconds`` is set the generator yields ``None`` after
+        # each interval of bus silence, letting the SSE layer inject a comment
+        # frame so the wire never goes longer than the interval without bytes.
+        # The timeout lives INSIDE the generator on purpose: cancelling
+        # ``__anext__`` from outside would propagate into the ``queue.get()``
+        # await and tear down the subscription via the ``finally`` block.
+        if keepalive_seconds is not None and keepalive_seconds <= 0:
+            raise ValueError("keepalive_seconds must be positive when provided")
         replay, queue = await self._register(after, session_id=session_id)
+        loop = asyncio.get_running_loop()
         try:
             for event in replay:
                 yield event
 
+            deadline = (
+                loop.time() + keepalive_seconds
+                if keepalive_seconds is not None
+                else None
+            )
             while True:
-                event = await queue.get()
+                if deadline is None:
+                    event = await queue.get()
+                else:
+                    # Keepalive timeout is bound to the SUBSCRIBER's last
+                    # yield, not the bus's last publish. Without this,
+                    # high-volume traffic filtered out by ``_matches``
+                    # (other sessions / events at or below ``after``)
+                    # would keep ``queue.get`` returning instantly and
+                    # the keepalive would never fire — leaving the very
+                    # stale-cursor failure mode we're trying to detect
+                    # invisible to the client.
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        yield None
+                        deadline = loop.time() + keepalive_seconds
+                        continue
+                    try:
+                        event = await asyncio.wait_for(
+                            queue.get(), timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        yield None
+                        deadline = loop.time() + keepalive_seconds
+                        continue
                 if _matches(event, after=after, session_id=session_id):
+                    if deadline is not None:
+                        deadline = loop.time() + keepalive_seconds
                     yield event
         finally:
             with suppress(RuntimeError):

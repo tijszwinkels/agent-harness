@@ -306,3 +306,86 @@ def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:
         }
 
     assert {"schema_migrations", "sessions", "runs", "messages", "events"} <= tables
+
+
+def test_startup_reconciles_dangling_running_runs_and_sessions(tmp_path) -> None:
+    """On a harness crash, runs and sessions persist in SQLite with status
+    ``running``/``queued`` while the in-memory RunManager state evaporates.
+    Reopening the repository must flip those rows to terminal/idle so the
+    next process can start fresh runs without the bridge perceiving them
+    as still alive."""
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+    session, run_a, run_b = _seed_session_with_runs(repo)
+    # run_a is running (via start_run), run_b is queued in the same call
+    # path; tweak run_b back to queued explicitly so we cover both states.
+    queued = repo.get_run(session.id, run_b.id).model_copy(
+        update={"status": "queued", "started_at": None},
+    )
+    repo._upsert_run(queued)
+    # Sanity preconditions.
+    assert repo.get_session(session.id).status == "running"
+    assert repo.get_run(session.id, run_a.id).status == "running"
+    assert repo.get_run(session.id, run_b.id).status == "queued"
+    repo.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        assert reopened.get_session(session.id).status == "idle"
+        assert reopened.get_run(session.id, run_a.id).status == "failed"
+        assert reopened.get_run(session.id, run_a.id).completed_at is not None
+        assert reopened.get_run(session.id, run_b.id).status == "failed"
+    finally:
+        reopened.close()
+
+
+def test_startup_reconcile_preserves_external_running_sessions(tmp_path) -> None:
+    """External sessions (transcript-observer-owned) are managed by the
+    actual CLI process, not the harness's RunManager. A live external
+    session can legitimately stay ``running`` across harness restarts;
+    the startup sweep must leave it alone."""
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+    external = Session(
+        id="ses_external_live_one",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repo.upsert_session(external)
+    repo.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        after = reopened.get_session(external.id)
+        assert after.status == "running", "external session was wrongly idled"
+        assert after.origin == "external"
+    finally:
+        reopened.close()
+
+
+def test_startup_reconcile_leaves_terminal_runs_untouched(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+    session = repo.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repo.create_run(session.id, CreateRunRequest(message="done"))
+    repo.finish_run(session.id, run.id, status="completed", stop_reason="end_turn")
+    repo.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        finished = reopened.get_run(session.id, run.id)
+        assert finished.status == "completed"
+        assert finished.stop_reason == "end_turn"
+        # Session went idle naturally when its only run completed.
+        assert reopened.get_session(session.id).status == "idle"
+    finally:
+        reopened.close()

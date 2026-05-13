@@ -12,7 +12,7 @@ from agent_harness.orchestrator import (
     ProcessCommand,
     RunManager,
     RunProcess,
-    parse_claude_stream_line,
+    default_stdout_parsers,
 )
 
 
@@ -398,71 +398,21 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
     assert events[-1].event == "run.interrupted"
 
 
-def test_parse_claude_stream_line_extracts_assistant_message() -> None:
-    record = {
-        "type": "assistant",
-        "message": {
-            "role": "assistant",
-            "model": "claude-sonnet-4-6",
-            "content": [{"type": "text", "text": "pong"}],
-        },
-    }
-
-    events = parse_claude_stream_line(json.dumps(record))
-
-    assert len(events) == 1
-    name, data = events[0]
-    assert name == "message"
-    assert data["source_type"] == "assistant"
-    assert data["message"]["role"] == "assistant"
-    assert data["message"]["model"] == "claude-sonnet-4-6"
-    assert data["message"]["blocks"] == [{"type": "text", "text": "pong"}]
-
-
-def test_parse_claude_stream_line_extracts_tool_use_blocks() -> None:
-    record = {
-        "type": "assistant",
-        "message": {
-            "role": "assistant",
-            "model": "claude-sonnet-4-6",
-            "content": [
-                {"type": "text", "text": "looking…"},
-                {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "ls"}},
-            ],
-        },
-    }
-
-    events = parse_claude_stream_line(json.dumps(record))
-
-    assert len(events) == 1
-    data = events[0][1]
-    blocks = data["message"]["blocks"]
-    assert blocks[0] == {"type": "text", "text": "looking…"}
-    assert blocks[1]["type"] == "tool_use"
-    assert blocks[1]["name"] == "Bash"
-    assert blocks[1]["input"] == {"command": "ls"}
-    assert blocks[1]["id"] == "tu_1"
-
-
-def test_parse_claude_stream_line_ignores_system_and_stream_event_records() -> None:
-    for record in (
-        {"type": "system", "subtype": "init"},
-        {"type": "stream_event", "event": {"type": "content_block_delta"}},
-        {"type": "result", "subtype": "success", "result": "pong"},
-        {"type": "rate_limit_event"},
-    ):
-        assert parse_claude_stream_line(json.dumps(record)) == []
-
-
-def test_parse_claude_stream_line_ignores_non_json_and_empty_messages() -> None:
-    assert parse_claude_stream_line("not json") == []
-    assert parse_claude_stream_line("") == []
-    assert parse_claude_stream_line(json.dumps({"type": "assistant"})) == []
-    assert parse_claude_stream_line(json.dumps({"type": "assistant", "message": {}})) == []
+def test_default_stdout_parsers_is_empty() -> None:
+    # Stream parsing of assistant JSON records on stdout was removed: the
+    # transcript file observer is the single source of "message" events.
+    # Keep this asserted so a future change can't quietly re-introduce the
+    # double-ingestion bug by re-registering a parser here.
+    assert default_stdout_parsers() == {}
 
 
 @pytest.mark.asyncio
-async def test_run_process_emits_structured_message_for_claude_assistant_stdout() -> None:
+async def test_run_process_does_not_emit_message_event_for_claude_stdout() -> None:
+    # Claude --print stdout is mirrored as message.delta lines but must NOT
+    # publish "message" events: the file-watching observer is the single
+    # source of message events. Emitting from both paths produces every
+    # assistant turn twice on the SSE stream (see bug investigation in
+    # ses_fd2a57b5a06d4b14abd86af1f4a53647).
     bus = InMemoryEventBus()
     session = make_session("claude-code")
     run = make_run(session)
@@ -494,10 +444,10 @@ async def test_run_process_emits_structured_message_for_claude_assistant_stdout(
 
     events = await bus.replay(session_id=session.id, run_id=run.id)
     event_names = [event.event for event in events]
-    assert "message" in event_names
-    message_event = next(event for event in events if event.event == "message")
-    assert message_event.data["message"]["role"] == "assistant"
-    assert message_event.data["message"]["blocks"] == [{"type": "text", "text": "pong"}]
+    assert "message" not in event_names, (
+        f"RunProcess must not emit message events from stdout (got {event_names})"
+    )
+    assert event_names == ["run.started", "message.delta", "run.completed"]
 
 
 @pytest.mark.asyncio

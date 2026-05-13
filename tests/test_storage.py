@@ -1,6 +1,7 @@
 import sqlite3
 
 from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Project, Session
+from agent_harness.repository import InMemoryRepository
 from agent_harness.storage import open_sqlite_repository
 
 
@@ -223,6 +224,71 @@ def test_materialize_session_updated_allows_observer_updates_to_external(tmp_pat
     assert after.model == "claude-opus-4-7"
     assert after.origin == "external"
     repository.close()
+
+
+def _seed_session_with_runs(repo, session_id_suffix: str = "session"):
+    """Create a session + two runs (one running, one queued) for race tests."""
+    session = repo.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run_a = repo.create_run(session.id, CreateRunRequest(message="first"))
+    run_b = repo.create_run(session.id, CreateRunRequest(message="second"))
+    repo.start_run(session.id, run_a.id)
+    repo.start_run(session.id, run_b.id)
+    return session, run_a, run_b
+
+
+def test_finish_run_does_not_set_session_idle_when_another_run_is_active_inmemory() -> None:
+    """Regression: ``finish_run`` used to unconditionally set
+    ``session.status = "idle"`` even when a queued/running successor
+    existed. That contradicted the actual repo state — the second run
+    was running, but the session looked idle — and surfaced via the
+    ``GET /v1/sessions/{id}`` endpoint.
+
+    Behavior: when another non-terminal run exists for the session,
+    finish_run leaves session.status alone.
+    """
+    repo = InMemoryRepository()
+    session, run_a, run_b = _seed_session_with_runs(repo)
+
+    repo.finish_run(session.id, run_a.id, status="completed", stop_reason="end_turn")
+
+    assert repo.get_run(session.id, run_a.id).status == "completed"
+    assert repo.get_run(session.id, run_b.id).status == "running"
+    # Session should still appear active because run_b is running.
+    assert repo.get_session(session.id).status != "idle", (
+        "session flipped to idle while run_b is still running"
+    )
+
+    # Now finish the last run — session should finally go idle.
+    repo.finish_run(session.id, run_b.id, status="completed", stop_reason="end_turn")
+    assert repo.get_session(session.id).status == "idle"
+
+
+def test_finish_run_does_not_set_session_idle_when_another_run_is_active_sqlite(tmp_path) -> None:
+    """SQLite counterpart of the previous test — same invariant must
+    hold across persistent storage."""
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+    try:
+        session, run_a, run_b = _seed_session_with_runs(repo)
+
+        repo.finish_run(session.id, run_a.id, status="completed", stop_reason="end_turn")
+
+        assert repo.get_run(session.id, run_a.id).status == "completed"
+        assert repo.get_run(session.id, run_b.id).status == "running"
+        assert repo.get_session(session.id).status != "idle", (
+            "session flipped to idle while run_b is still running"
+        )
+
+        repo.finish_run(session.id, run_b.id, status="completed", stop_reason="end_turn")
+        assert repo.get_session(session.id).status == "idle"
+    finally:
+        repo.close()
 
 
 def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:

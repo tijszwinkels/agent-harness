@@ -183,7 +183,21 @@ class InMemoryRepository:
                 }
             )
             self._runs[run_id] = finished
-            self._sessions[session_id] = session.model_copy(update={"status": "idle", "updated_at": utc_now()})
+            # Only flip the session to idle if no other run for this
+            # session is still queued or running. A successor may have
+            # been promoted from the per-session FIFO queue before this
+            # finish_run was scheduled — if so, leaving the session at
+            # idle would contradict the repo's actual state.
+            other_active = any(
+                r.session_id == session_id
+                and r.id != run_id
+                and r.status in ("queued", "running")
+                for r in self._runs.values()
+            )
+            if not other_active:
+                self._sessions[session_id] = session.model_copy(
+                    update={"status": "idle", "updated_at": utc_now()}
+                )
             return finished.model_copy(deep=True)
 
     def list_messages(self, session_id: str) -> list[Message]:

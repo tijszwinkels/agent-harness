@@ -282,7 +282,25 @@ class SQLiteRepository:
                 }
             )
             self._upsert_run(finished)
-            self._upsert_session(session.model_copy(update={"status": "idle", "updated_at": utc_now()}))
+            # Only flip the session to idle if no other run for this
+            # session is still queued or running. See the matching
+            # InMemoryRepository.finish_run comment — a successor may
+            # already be running by the time this completion is
+            # materialized.
+            other_active = self._connection.execute(
+                """
+                select 1 from runs
+                where session_id = ?
+                  and id != ?
+                  and json_extract(payload, '$.status') in ('queued', 'running')
+                limit 1
+                """,
+                (session_id, run_id),
+            ).fetchone()
+            if other_active is None:
+                self._upsert_session(
+                    session.model_copy(update={"status": "idle", "updated_at": utc_now()})
+                )
         return finished.model_copy(deep=True)
 
     def list_messages(self, session_id: str) -> list[Message]:

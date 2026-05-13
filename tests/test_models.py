@@ -36,6 +36,28 @@ def test_session_defaults_and_message_blocks_match_contract() -> None:
     assert message.blocks[0].type == "tool_use"
 
 
+def test_session_bypass_permissions_defaults_false_and_round_trips() -> None:
+    session = Session(
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/tmp/proj", name="proj"),
+    )
+    assert session.bypass_permissions is False
+
+    yolo = session.model_copy(update={"bypass_permissions": True})
+    assert yolo.bypass_permissions is True
+
+
+def test_create_session_request_accepts_bypass_permissions() -> None:
+    request = CreateSessionRequest(
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/tmp/proj", name="proj"),
+        bypass_permissions=True,
+    )
+    assert request.bypass_permissions is True
+
+
 def test_models_reject_unknown_fields_and_invalid_backend_names() -> None:
     with pytest.raises(ValidationError):
         CreateSessionRequest(backend="unknown", model="x", project={"path": "/tmp", "name": "tmp"})

@@ -140,6 +140,10 @@ class Session(HarnessModel):
     status: SessionStatus = "idle"
     origin: Origin = "harness"
     stats: SessionStats = Field(default_factory=SessionStats)
+    # When True, builders pass the backend's permission-bypass flag
+    # (`--dangerously-skip-permissions` for claude-code,
+    # `--dangerously-bypass-approvals-and-sandbox` for codex).
+    bypass_permissions: bool = False
 
 
 class Event(HarnessModel):
@@ -159,6 +163,7 @@ class CreateSessionRequest(HarnessModel):
     model: str = Field(min_length=1)
     project: Project
     title: str | None = None
+    bypass_permissions: bool = False
 
 
 class CreateRunRequest(HarnessModel):

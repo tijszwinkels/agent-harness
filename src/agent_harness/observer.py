@@ -101,6 +101,14 @@ class ExternalTranscriptObserver:
             with transcript_path.open("rb") as transcript:
                 transcript.seek(self._state.next_offset(transcript_path))
                 while line := transcript.readline():
+                    # Lines without a trailing newline are partial flushes by
+                    # the writer — leave the offset put so the next tail_file
+                    # invocation re-reads from the start of the partial line
+                    # once the rest (and the newline) arrives. Without this,
+                    # the offset would advance past half a JSON object and
+                    # the assistant turn would be lost.
+                    if not line.endswith(b"\n"):
+                        break
                     start_offset = transcript.tell() - len(line)
                     end_offset = transcript.tell()
                     published.extend(

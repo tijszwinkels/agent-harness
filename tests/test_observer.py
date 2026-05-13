@@ -216,6 +216,41 @@ async def test_observer_deduplicates_by_file_offset(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_observer_holds_offset_until_partial_line_completes(tmp_path) -> None:
+    """Regression: ``tail_file`` used to advance ``next_offset`` past a
+    line that was only partially flushed by the writer, which caused the
+    next read to start mid-record and lose the assistant turn.
+
+    Now: a line without a trailing newline is treated as incomplete; the
+    offset is held until the rest of the line (with newline) lands, and
+    the complete line is then published exactly once.
+    """
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    # First flush: one complete record + the first half of a second record.
+    full_first = '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n'
+    partial_second = '{"type":"event_msg","payload":{"type":"user_message","message":"hal'
+    transcript.write_bytes((full_first + partial_second).encode("utf-8"))
+    observer = ExternalTranscriptObserver(InMemoryEventBus())
+
+    first = await observer.tail_file(transcript)
+    # Only the complete record is published; the partial tail is held.
+    assert len(first) == 1
+    assert first[0].event == "message"
+
+    # Writer flushes the rest of the second record with a final newline.
+    with transcript.open("ab") as f:
+        f.write(b'f-finished"}}\n')
+
+    second = await observer.tail_file(transcript)
+    # The second record is delivered exactly once, with its content intact.
+    assert len(second) == 1, "partial line was skipped or duplicated"
+    assert second[0].event == "message"
+    assert second[0].data["message"]["blocks"][0]["text"] == "half-finished"
+
+
+@pytest.mark.asyncio
 async def test_observer_publishes_event_sequence_through_bus(tmp_path) -> None:
     path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
     transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"

@@ -147,6 +147,69 @@ def test_run_create_starts_run_manager_when_configured() -> None:
     assert command[0] == "fake"
 
 
+@pytest.mark.asyncio
+async def test_run_create_schedules_materializer_even_if_repo_start_run_fails() -> None:
+    """Regression: ``on_start`` used to call ``repo.start_run`` and
+    ``_schedule_run_result_materialization`` back-to-back. If the first
+    raised, the orchestrator's swallow-and-log caught it and the
+    materializer was never scheduled — leaving the run stuck at
+    ``queued`` in the repo even after the process finished.
+
+    The fix isolates the two calls so materializer scheduling always
+    happens, regardless of whether the start-status persistence raised.
+    """
+    captured: dict = {}
+
+    class FakeRunManager:
+        async def wait(self, run_id):
+            return RunProcessResult(run_id=run_id, status="completed", returncode=0)
+
+        def submit(self, *, session, run, command, on_start=None):
+            # Mirror real RunManager: invoke on_start to trigger the
+            # repo.start_run + materializer scheduling path under test.
+            if on_start is not None:
+                on_start()
+            return SubmitResult(accepted=True, status="running")
+
+    class RaisingRepo(InMemoryRepository):
+        def start_run(self, session_id, run_id):
+            captured["start_run_called"] = True
+            raise RuntimeError("simulated repo failure")
+
+    class FakeBuilder:
+        def build(self, *, session, run, message, is_first_run=True):
+            return ("fake", session.id, run.id, message.id, is_first_run)
+
+    repo = RaisingRepo()
+    client = TestClient(
+        create_app(
+            repository=repo,
+            run_manager=FakeRunManager(),
+            command_builders={"codex": FakeBuilder()},
+        )
+    )
+    session = client.post(
+        "/v1/sessions",
+        json={"backend": "codex", "model": "gpt-5.4", "project": {"path": "/tmp/proj", "name": "proj"}},
+    ).json()
+    response = client.post(f"/v1/sessions/{session['id']}/runs", json={"message": "hello"})
+
+    assert response.status_code == 202
+    assert captured.get("start_run_called") is True
+
+    # Materializer is fire-and-forget — give it the event loop tick to
+    # call finish_run, then confirm the run reached "completed". If the
+    # bug were present, the run would stay "queued".
+    run_id = response.json()["run_id"]
+    for _ in range(10):
+        stored = repo.get_run(session["id"], run_id)
+        if stored.status == "completed":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError(f"run stuck at status={stored.status} — materializer did not run")
+
+
 def test_run_create_returns_409_when_external_session_cannot_be_resumed() -> None:
     class FakeRunManager:
         def submit(self, *, session, run, command, on_start=None):  # pragma: no cover - should not be reached

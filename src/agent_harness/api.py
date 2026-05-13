@@ -212,8 +212,20 @@ def create_app(
             # current run for this session finishes draining the queue).
             # Coupling repo.start_run + materialization scheduling to that
             # moment keeps the repo's lifecycle aligned with the orchestrator.
+            #
+            # The two operations are isolated: if ``start_run`` raises
+            # (e.g. the run was already finalized via a concurrent path),
+            # the materializer must still be scheduled — otherwise the run
+            # would stay stuck at ``queued`` in the repo forever even after
+            # the subprocess completes.
             def on_start(_session_id: str = session_id, _run_id: str = run.id) -> None:
-                repo.start_run(_session_id, _run_id)
+                try:
+                    repo.start_run(_session_id, _run_id)
+                except Exception:
+                    logger.exception(
+                        "on_start: repo.start_run raised — proceeding with materializer scheduling: session=%s run=%s",
+                        _session_id, _run_id,
+                    )
                 _schedule_run_result_materialization(
                     run_manager, repo, session_id=_session_id, run_id=_run_id,
                 )

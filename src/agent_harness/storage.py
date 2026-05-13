@@ -131,6 +131,8 @@ class SQLiteRepository:
         return archived.model_copy(deep=True)
 
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
+        # Runs are born ``queued`` and stay that way until the orchestrator
+        # spawns the subprocess (see ``start_run``). Mirrors InMemoryRepository.
         with self._lock, self._connection:
             session = self._find_session_locked(session_id)
             if session is None:
@@ -140,8 +142,8 @@ class SQLiteRepository:
             input_message = Message.user(request.message)
             run = Run(
                 session_id=session.id,
-                status="running",
-                started_at=utc_now(),
+                status="queued",
+                started_at=None,
                 input_message_id=input_message.id,
                 origin="harness",
             )
@@ -156,6 +158,50 @@ class SQLiteRepository:
             self._upsert_run(run)
             self._insert_message(session_id, input_message)
         return run.model_copy(deep=True)
+
+    def start_run(self, session_id: str, run_id: str) -> Run:
+        with self._lock, self._connection:
+            if self._find_session_locked(session_id) is None:
+                logger.warning("SQLite run start failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            row = self._connection.execute(
+                "select payload from runs where id = ? and session_id = ?",
+                (run_id, session_id),
+            ).fetchone()
+            if row is None:
+                logger.warning("SQLite run start failed: session=%s run=%s", session_id, run_id)
+                raise RunNotFoundError(run_id)
+
+            run = _model_from_row(row, "payload", Run)
+            started = run.model_copy(update={"status": "running", "started_at": utc_now()})
+            self._upsert_run(started)
+        return started.model_copy(deep=True)
+
+    def drop_queued_runs(self, session_id: str) -> list[Run]:
+        with self._lock, self._connection:
+            if self._find_session_locked(session_id) is None:
+                logger.warning("SQLite drop_queued_runs failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            rows = self._connection.execute(
+                "select payload from runs where session_id = ?",
+                (session_id,),
+            ).fetchall()
+            dropped: list[Run] = []
+            now = utc_now()
+            for row in rows:
+                run = _model_from_row(row, "payload", Run)
+                if run.status != "queued":
+                    continue
+                interrupted = run.model_copy(
+                    update={
+                        "status": "interrupted",
+                        "completed_at": now,
+                        "stop_reason": "interrupted",
+                    }
+                )
+                self._upsert_run(interrupted)
+                dropped.append(interrupted.model_copy(deep=True))
+        return dropped
 
     def list_runs(self, session_id: str) -> list[Run]:
         with self._lock:

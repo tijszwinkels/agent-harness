@@ -12,6 +12,7 @@ from agent_harness.orchestrator import (
     ProcessCommand,
     RunManager,
     RunProcess,
+    SubmitResult,
     default_stdout_parsers,
 )
 
@@ -448,6 +449,190 @@ async def test_run_process_does_not_emit_message_event_for_claude_stdout() -> No
         f"RunProcess must not emit message events from stdout (got {event_names})"
     )
     assert event_names == ["run.started", "message.delta", "run.completed"]
+
+
+class FakeFactoryQueue:
+    # Like FakeFactory but hands out a different FakeProcess on each call —
+    # required for tests that exercise multiple sequential subprocess spawns
+    # (queued runs draining into running ones).
+    def __init__(self, processes: list[FakeProcess]) -> None:
+        self.processes = list(processes)
+        self.commands: list[ProcessCommand] = []
+        self.spawned: list[FakeProcess] = []
+
+    async def __call__(self, command: ProcessCommand) -> FakeProcess:
+        self.commands.append(command)
+        if not self.processes:
+            raise AssertionError("FakeFactoryQueue exhausted — too many spawns")
+        process = self.processes.pop(0)
+        self.spawned.append(process)
+        return process
+
+
+def _make_queued_run(session: Session, *, run_id: str) -> Run:
+    return Run(
+        id=run_id,
+        session_id=session.id,
+        status="queued",
+        started_at=None,
+        input_message_id="msg_input",
+        origin="harness",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_manager_serializes_rapid_back_to_back_submits_on_same_session() -> None:
+    # The core bug: two POST /runs in quick succession on one session must
+    # not spawn concurrent subprocesses (they would race on the shared
+    # claude rollout JSONL). First submit spawns, second submit queues.
+    bus = InMemoryEventBus()
+    session = make_session()
+    run_a = _make_queued_run(session, run_id="run_a")
+    run_b = _make_queued_run(session, run_id="run_b")
+    proc_a = FakeProcess(returncode=0)
+    proc_b = FakeProcess(returncode=0)
+    factory = FakeFactoryQueue([proc_a, proc_b])
+    manager = RunManager(event_bus=bus, process_factory=factory)
+
+    started_callbacks: list[str] = []
+
+    def on_start_a() -> None:
+        started_callbacks.append("a")
+
+    def on_start_b() -> None:
+        started_callbacks.append("b")
+
+    result_a = manager.submit(
+        session=session, run=run_a,
+        command=ProcessCommand(argv=("claude", "--print", "a")),
+        on_start=on_start_a,
+    )
+    result_b = manager.submit(
+        session=session, run=run_b,
+        command=ProcessCommand(argv=("claude", "--print", "b")),
+        on_start=on_start_b,
+    )
+
+    assert result_a == SubmitResult(accepted=True, status="running")
+    assert result_b == SubmitResult(accepted=True, status="queued")
+    # Only the first run's on_start fires synchronously. The second's is
+    # held until the queue drains, which proves no concurrent spawn yet.
+    assert started_callbacks == ["a"]
+    await asyncio.sleep(0)
+    assert len(factory.spawned) == 1
+
+    # Drain run A; run B should now spawn and fire its on_start.
+    proc_a.finish()
+    await asyncio.wait_for(manager.wait("run_a"), timeout=1)
+    # Yield to let _run_and_forget's finally schedule the next spawn.
+    await asyncio.sleep(0)
+    assert started_callbacks == ["a", "b"]
+    assert len(factory.spawned) == 2
+
+    proc_b.finish()
+    await asyncio.wait_for(manager.wait("run_b"), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_run_manager_rejects_submit_when_queue_cap_reached() -> None:
+    bus = InMemoryEventBus()
+    session = make_session()
+    active_run = _make_queued_run(session, run_id="run_active")
+    proc = FakeProcess(returncode=0)
+    factory = FakeFactoryQueue([proc] + [FakeProcess() for _ in range(3)])
+    # Cap at 3 to keep the test small but exercise the same code path.
+    manager = RunManager(event_bus=bus, process_factory=factory, queue_max_per_session=3)
+
+    assert manager.submit(
+        session=session, run=active_run,
+        command=ProcessCommand(argv=("claude", "--print", "active")),
+    ).status == "running"
+
+    # Three queued submits should all be accepted; the fourth must reject.
+    for i in range(3):
+        run = _make_queued_run(session, run_id=f"run_q{i}")
+        assert manager.submit(
+            session=session, run=run,
+            command=ProcessCommand(argv=("claude", "--print", f"q{i}")),
+        ).status == "queued"
+
+    overflow_run = _make_queued_run(session, run_id="run_overflow")
+    result = manager.submit(
+        session=session, run=overflow_run,
+        command=ProcessCommand(argv=("claude", "--print", "overflow")),
+    )
+    assert result == SubmitResult(accepted=False, status=None, reason="queue_full")
+
+    # Cleanup: finish the active run and drain the queue so the test doesn't
+    # leave dangling tasks. drop_queued() pops everything before the active
+    # run's finally would re-spawn it.
+    assert manager.drop_queued(session.id) == ["run_q0", "run_q1", "run_q2"]
+    proc.finish()
+    await asyncio.wait_for(manager.wait("run_active"), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_run_manager_queue_is_per_session_not_global() -> None:
+    bus = InMemoryEventBus()
+    session_a = make_session().model_copy(update={"id": "ses_aaa"})
+    session_b = make_session().model_copy(update={"id": "ses_bbb"})
+    run_a = _make_queued_run(session_a, run_id="run_a")
+    run_b = _make_queued_run(session_b, run_id="run_b")
+    proc_a = FakeProcess(returncode=0)
+    proc_b = FakeProcess(returncode=0)
+    factory = FakeFactoryQueue([proc_a, proc_b])
+    manager = RunManager(event_bus=bus, process_factory=factory)
+
+    assert manager.submit(
+        session=session_a, run=run_a,
+        command=ProcessCommand(argv=("claude", "a")),
+    ).status == "running"
+    # Different session — should spawn concurrently, NOT queue behind run_a.
+    assert manager.submit(
+        session=session_b, run=run_b,
+        command=ProcessCommand(argv=("claude", "b")),
+    ).status == "running"
+
+    await asyncio.sleep(0)
+    assert len(factory.spawned) == 2
+
+    proc_a.finish()
+    proc_b.finish()
+    await asyncio.wait_for(manager.wait("run_a"), timeout=1)
+    await asyncio.wait_for(manager.wait("run_b"), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_drop_queued_returns_popped_run_ids_and_prevents_spawn() -> None:
+    bus = InMemoryEventBus()
+    session = make_session()
+    active = _make_queued_run(session, run_id="run_active")
+    queued = _make_queued_run(session, run_id="run_queued")
+    active_proc = FakeProcess(returncode=0)
+    # If drop_queued fails, we'd attempt to spawn the queued run too — the
+    # factory has no second process, so an assertion would fire.
+    factory = FakeFactoryQueue([active_proc])
+    manager = RunManager(event_bus=bus, process_factory=factory)
+
+    manager.submit(
+        session=session, run=active,
+        command=ProcessCommand(argv=("claude", "active")),
+    )
+    manager.submit(
+        session=session, run=queued,
+        command=ProcessCommand(argv=("claude", "queued")),
+    )
+
+    popped = manager.drop_queued(session.id)
+    assert popped == ["run_queued"]
+
+    # Idempotency check.
+    assert manager.drop_queued(session.id) == []
+
+    active_proc.finish()
+    await asyncio.wait_for(manager.wait("run_active"), timeout=1)
+    # And the queued run must NOT have been spawned by the finally block.
+    assert len(factory.spawned) == 1
 
 
 @pytest.mark.asyncio

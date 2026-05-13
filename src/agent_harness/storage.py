@@ -97,6 +97,7 @@ class SQLiteRepository:
             model=request.model,
             project=request.project,
             title=request.title,
+            bypass_permissions=request.bypass_permissions,
         )
         with self._lock, self._connection:
             self._upsert_session(session)

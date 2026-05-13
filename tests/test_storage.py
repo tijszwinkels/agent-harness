@@ -89,6 +89,26 @@ def test_sqlite_repository_skips_duplicate_observed_messages(tmp_path) -> None:
     repository.close()
 
 
+def test_sqlite_repository_propagates_bypass_permissions(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+            bypass_permissions=True,
+        )
+    )
+    assert session.bypass_permissions is True
+
+    repository.close()
+    reopened = open_sqlite_repository(db_path)
+    assert reopened.get_session(session.id).bypass_permissions is True
+    reopened.close()
+
+
 def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
 

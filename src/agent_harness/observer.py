@@ -254,10 +254,20 @@ def codex_transcript_path(
 
 
 def external_session_id_from_claude_path(path: str | Path) -> str:
+    # Canonical form: ``ses_<32hex>``. This matches the shape harness-origin
+    # claude sessions use (see ``_harness_session_id_as_uuid``), so an
+    # external observation and a harness spawn of the *same* claude session
+    # UUID produce the *same* session id — no more duplicate session
+    # records / duplicate MM channels per terminal session.
     transcript_path = Path(path)
     if transcript_path.suffix != ".jsonl" or not transcript_path.stem:
         raise ValueError(f"Not a Claude Code transcript path: {transcript_path}")
-    return f"claude_{transcript_path.stem}"
+    hex_part = transcript_path.stem.replace("-", "")
+    if len(hex_part) != 32 or not all(c in "0123456789abcdef" for c in hex_part.lower()):
+        raise ValueError(
+            f"Claude Code transcript stem is not a UUID: {transcript_path.stem!r}",
+        )
+    return f"ses_{hex_part.lower()}"
 
 
 def external_session_id_from_codex_path(path: str | Path) -> str:

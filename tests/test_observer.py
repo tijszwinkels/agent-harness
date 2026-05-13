@@ -26,8 +26,12 @@ def test_claude_transcript_path_and_external_id_helpers() -> None:
         "/tmp/home/.claude/projects/-home-me-project/123e4567-e89b-12d3-a456-426614174000.jsonl"
     )
     assert claude_project_dir_name("/home/me/project") == "-home-me-project"
-    assert external_session_id_from_claude_path(path) == "claude_123e4567-e89b-12d3-a456-426614174000"
-    assert transcript_identity_from_path(path).session_id == "claude_123e4567-e89b-12d3-a456-426614174000"
+    # Canonical form: ses_<32hex>. Same shape as harness-origin session ids,
+    # so the external observer and harness-spawn paths produce equivalent ids
+    # for the same underlying claude session UUID (no more dual session records
+    # / duplicate MM channels for one terminal claude session).
+    assert external_session_id_from_claude_path(path) == "ses_123e4567e89b12d3a456426614174000"
+    assert transcript_identity_from_path(path).session_id == "ses_123e4567e89b12d3a456426614174000"
 
 
 def test_codex_transcript_path_and_external_id_helpers() -> None:

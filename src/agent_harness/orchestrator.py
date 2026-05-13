@@ -87,10 +87,23 @@ class CodexCommandBuilder:
 
 
 def _harness_session_id_as_uuid(session_id: str) -> str:
-    # Harness session ids are ``ses_<uuid4_hex>`` (32 hex chars). Reformat
-    # the hex back to a standard 8-4-4-4-12 UUID so claude --session-id /
-    # --resume accept it (claude validates UUID format).
-    hex_part = session_id.removeprefix("ses_") if session_id.startswith("ses_") else session_id
+    # Accepts any of the session-id shapes the harness or observer can
+    # produce for a claude session and returns the canonical
+    # 8-4-4-4-12 UUID string (claude --session-id / --resume validates UUID
+    # format).
+    #
+    #   * ``ses_<32hex>``               — canonical harness + external form
+    #   * ``claude_<uuid-with-dashes>`` — legacy external-observer form,
+    #                                     kept for records persisted before
+    #                                     the canonicalization.
+    #   * bare 32-hex or dashed UUID    — best-effort fallback.
+    if session_id.startswith("ses_"):
+        body = session_id.removeprefix("ses_")
+    elif session_id.startswith("claude_"):
+        body = session_id.removeprefix("claude_")
+    else:
+        body = session_id
+    hex_part = body.replace("-", "").lower()
     if len(hex_part) != 32 or not all(c in "0123456789abcdef" for c in hex_part):
         raise CommandBuildError(
             f"Cannot derive claude session UUID from harness session id {session_id!r}",
@@ -121,15 +134,17 @@ class ClaudeCodeCommandBuilder:
         )
         if session.bypass_permissions:
             argv = (*argv, "--dangerously-skip-permissions")
+        claude_uuid = _harness_session_id_as_uuid(session.id)
         if session.origin == "external":
-            argv = (*argv, "--resume", _external_resume_id(session, prefix="claude_"))
+            # External claude sessions are already running under this UUID
+            # (claude wrote the .jsonl with it). We can only --resume — we
+            # don't own session creation.
+            argv = (*argv, "--resume", claude_uuid)
         else:
-            # Pin a deterministic claude session UUID derived from the
-            # harness session id so subsequent runs can resume and retain
-            # conversation context. claude --session-id creates the session
-            # on first use and errors on duplicate, so we switch to
-            # --resume for follow-up runs.
-            claude_uuid = _harness_session_id_as_uuid(session.id)
+            # Harness-origin: pin a deterministic claude session UUID so
+            # subsequent runs can --resume and retain conversation context.
+            # claude --session-id creates the session on first use and
+            # errors on duplicate, so we switch to --resume for follow-up.
             flag = "--session-id" if is_first_run else "--resume"
             argv = (*argv, flag, claude_uuid)
 
@@ -198,7 +213,9 @@ def validate_session_resume_target(session: Session) -> None:
         _external_resume_id(session, prefix="codex_")
         return
     if session.backend == "claude-code":
-        _external_resume_id(session, prefix="claude_")
+        # Validates session.id resolves to a claude UUID under any of the
+        # accepted shapes (ses_<hex>, legacy claude_<uuid>, raw UUID).
+        _harness_session_id_as_uuid(session.id)
         return
     raise CommandBuildError(f"Cannot resume external session for backend {session.backend}")
 

@@ -174,8 +174,12 @@ def test_claude_code_command_builder_rejects_non_hex_harness_session_id() -> Non
 
 
 def test_claude_code_command_builder_resumes_external_claude_session() -> None:
+    # External claude sessions now share the canonical ses_<32hex> form with
+    # harness-origin sessions — the external observer's
+    # external_session_id_from_claude_path emits this format. The builder
+    # derives the claude UUID via _harness_session_id_as_uuid.
     session = make_session("claude-code").model_copy(
-        update={"id": "claude_2a9857de-2f9d-4190-aa76-e433619602fb", "origin": "external"}
+        update={"id": "ses_2a9857de2f9d4190aa76e433619602fb", "origin": "external"}
     )
     run = make_run(session)
     message = Message.user("continue this")
@@ -196,6 +200,23 @@ def test_claude_code_command_builder_resumes_external_claude_session() -> None:
         "continue this",
     )
     assert command.cwd == "/workspace/project"
+
+
+def test_claude_code_command_builder_resumes_legacy_claude_prefixed_external_session() -> None:
+    # Backward-compat: external sessions persisted under the legacy
+    # claude_<uuid-with-dashes> id (before the canonicalization) must still
+    # resume cleanly. _harness_session_id_as_uuid accepts both forms.
+    session = make_session("claude-code").model_copy(
+        update={"id": "claude_2a9857de-2f9d-4190-aa76-e433619602fb", "origin": "external"}
+    )
+    run = make_run(session)
+
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=Message.user("legacy resume"),
+    )
+    assert "--resume" in command.argv
+    resume_idx = command.argv.index("--resume")
+    assert command.argv[resume_idx + 1] == "2a9857de-2f9d-4190-aa76-e433619602fb"
 
 
 def test_codex_command_builder_appends_dangerously_bypass_when_bypass_permissions_set() -> None:
@@ -268,7 +289,7 @@ def test_claude_code_command_builder_appends_dangerously_skip_when_flag_set() ->
 def test_claude_code_command_builder_appends_dangerously_skip_on_external_resume() -> None:
     session = make_session("claude-code").model_copy(
         update={
-            "id": "claude_2a9857de-2f9d-4190-aa76-e433619602fb",
+            "id": "ses_2a9857de2f9d4190aa76e433619602fb",
             "origin": "external",
             "bypass_permissions": True,
         }

@@ -86,6 +86,78 @@ class SQLiteRepository:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("pragma foreign_keys = on")
         self._initialize_schema()
+        self._reconcile_dangling_state()
+
+    def _reconcile_dangling_state(self) -> None:
+        # Run/session liveness lives in the in-memory ``RunManager``; on a
+        # harness restart that state is gone but the SQLite rows persist.
+        # Without this sweep, runs left at ``running`` / ``queued`` and
+        # harness-owned sessions stuck at ``running`` would lie about their
+        # state forever (the orchestrator never re-attaches to a dead
+        # subprocess). Flip them to terminal/idle so a fresh process can
+        # resume cleanly.
+        #
+        # External sessions (``origin == "external"``) are excluded: their
+        # lifecycle is owned by the transcript observer + the actual CLI
+        # process (claude-code / codex), not by the in-memory RunManager.
+        # A live external session legitimately stays ``running`` across
+        # harness restarts; idling it here would lie in the other direction.
+        with self._lock, self._connection:
+            run_rows = self._connection.execute(
+                """
+                select id, session_id, payload
+                from runs
+                where json_extract(payload, '$.status') in ('queued', 'running')
+                """,
+            ).fetchall()
+            now = utc_now()
+            failed_runs = 0
+            for row in run_rows:
+                try:
+                    run = _model_from_row(row, "payload", Run)
+                except Exception:
+                    logger.exception(
+                        "Skipping run during startup reconcile: id=%s",
+                        row["id"],
+                    )
+                    continue
+                reconciled = run.model_copy(
+                    update={"status": "failed", "completed_at": now},
+                )
+                self._upsert_run(reconciled)
+                failed_runs += 1
+
+            session_rows = self._connection.execute(
+                """
+                select id, payload
+                from sessions
+                where json_extract(payload, '$.status') = 'running'
+                  and json_extract(payload, '$.origin') = 'harness'
+                """,
+            ).fetchall()
+            idle_sessions = 0
+            for row in session_rows:
+                try:
+                    session = _model_from_row(row, "payload", Session)
+                except Exception:
+                    logger.exception(
+                        "Skipping session during startup reconcile: id=%s",
+                        row["id"],
+                    )
+                    continue
+                self._upsert_session(
+                    session.model_copy(
+                        update={"status": "idle", "updated_at": now},
+                    )
+                )
+                idle_sessions += 1
+
+        if failed_runs or idle_sessions:
+            logger.info(
+                "Startup reconcile: marked %d run(s) failed, %d session(s) idle",
+                failed_runs,
+                idle_sessions,
+            )
 
     def close(self) -> None:
         with self._lock:

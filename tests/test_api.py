@@ -3,7 +3,7 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_harness.api import _materialize_run_result, create_app
+from agent_harness.api import _materialize_run_result, _sse_stream, create_app
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import CreateRunRequest, CreateSessionRequest, Project, Session
 from agent_harness.orchestrator import ProcessCommand, RunManager, RunProcessResult, SubmitResult
@@ -591,6 +591,34 @@ def test_session_messages_endpoint_returns_materialized_messages() -> None:
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
     assert messages[0]["blocks"][0] == {"type": "text", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_emits_keepalive_comment_when_bus_idle() -> None:
+    """Without periodic frames clients can't detect a silently dead stream
+    or a stale-cursor situation. The SSE layer must inject ``:ka`` comment
+    frames after each ``keepalive_seconds`` window of bus silence."""
+    from agent_harness.models import Event
+
+    bus = InMemoryEventBus()
+    stream = _sse_stream(bus, keepalive_seconds=0.01).__aiter__()
+    try:
+        # Without keepalives the iterator would block forever; the timeout
+        # is the assertion that the keepalive path fires.
+        frame = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+        assert frame.startswith(":")
+        assert frame.endswith("\n\n")
+
+        # Real events still get framed normally; the keepalive must not
+        # cancel the subscription.
+        published = await bus.publish(
+            Event(event="run.started", session_id="ses_a", run_id="run_a", data={}),
+        )
+        event_frame = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+        assert "event: run.started" in event_frame
+        assert f"id: {published.sequence}" in event_frame
+    finally:
+        await stream.aclose()
 
 
 def test_missing_session_returns_404() -> None:

@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 OBSERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
+# Idle interval after which `_sse_stream` injects an SSE comment (`:ka\n\n`)
+# so the wire never goes silent for too long. Without keepalives, a client
+# with a stale "future" cursor sees no events at all after a harness restart
+# (the in-memory bus filters them out by sequence), and httpx waits forever.
+# A 15s cadence pairs with a 45s client read timeout to recover from such
+# silent-stuck streams within ~one minute.
+SSE_KEEPALIVE_SECONDS = 15.0
+
 
 class WatchService(Protocol):
     async def watch_forever(self, *, stop_event: object | None = None) -> None:
@@ -498,8 +506,20 @@ async def _sse_stream(
     *,
     after: int = 0,
     session_id: str | None = None,
+    keepalive_seconds: float = SSE_KEEPALIVE_SECONDS,
 ) -> AsyncIterator[str]:
-    async for event in event_bus.subscribe(after=after, session_id=session_id):
+    # ``subscribe`` yields ``None`` after each silent ``keepalive_seconds``
+    # window; surface those as SSE comment frames so clients never see the
+    # wire go quiet for longer than the interval. Real events round-trip
+    # unchanged.
+    async for event in event_bus.subscribe(
+        after=after,
+        session_id=session_id,
+        keepalive_seconds=keepalive_seconds,
+    ):
+        if event is None:
+            yield ": ka\n\n"
+            continue
         yield _format_sse(event)
 
 

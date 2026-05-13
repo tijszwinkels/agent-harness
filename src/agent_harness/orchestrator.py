@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -10,7 +9,6 @@ from typing import Any, Literal, Protocol
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock
-from agent_harness.observer import blocks_from_claude_message
 
 logger = logging.getLogger(__name__)
 
@@ -164,46 +162,13 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
 StdoutParser = Callable[[str], list[tuple[str, dict[str, Any]]]]
 
 
-def parse_claude_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
-    # Bridge needs the final `{"type":"assistant", "message":{...}}` record. Other shapes
-    # (system/init, stream_event chunks from --include-partial-messages, result, hooks, etc.)
-    # are ignored — the final assistant record already carries the full content.
-    if not line:
-        return []
-    try:
-        record = json.loads(line)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(record, dict):
-        return []
-    record_type = record.get("type")
-    if record_type not in ("assistant", "user"):
-        return []
-    msg = record.get("message")
-    if not isinstance(msg, Mapping):
-        return []
-    role = msg.get("role")
-    if role not in ("assistant", "user"):
-        return []
-    blocks = blocks_from_claude_message(msg)
-    if not blocks:
-        return []
-    message = Message(role=role, blocks=blocks, model=msg.get("model"))
-    return [
-        (
-            "message",
-            {
-                "message": message.model_dump(mode="json"),
-                "source_type": record_type,
-            },
-        )
-    ]
-
-
 def default_stdout_parsers() -> dict[str, StdoutParser]:
-    return {
-        "claude-code": parse_claude_stream_line,
-    }
+    # No structured stdout parsers: ``message`` events are published
+    # exclusively by ``ExternalTranscriptObserver`` from the backend's rollout
+    # JSONL. RunProcess still emits ``message.delta`` raw stdout lines and the
+    # ``run.*`` lifecycle events, which is enough for typing indicators and
+    # log streaming.
+    return {}
 
 
 def validate_session_resume_target(session: Session) -> None:

@@ -345,19 +345,6 @@ def create_app(
             media_type="text/event-stream",
         )
 
-    @app.get("/v1/sessions/{session_id}/runs/{run_id}/events")
-    async def stream_run_events(
-        session_id: str,
-        run_id: str,
-        after: int = Query(default=0, ge=0),
-        from_: str = Query(default="now", alias="from"),
-    ) -> StreamingResponse:
-        replay_after = 0 if from_ == "beginning" else after
-        return StreamingResponse(
-            _sse_stream(events, after=replay_after, session_id=session_id, run_id=run_id),
-            media_type="text/event-stream",
-        )
-
     return app
 
 
@@ -511,9 +498,8 @@ async def _sse_stream(
     *,
     after: int = 0,
     session_id: str | None = None,
-    run_id: str | None = None,
 ) -> AsyncIterator[str]:
-    async for event in event_bus.subscribe(after=after, session_id=session_id, run_id=run_id):
+    async for event in event_bus.subscribe(after=after, session_id=session_id):
         yield _format_sse(event)
 
 

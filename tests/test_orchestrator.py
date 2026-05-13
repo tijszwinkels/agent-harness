@@ -334,7 +334,7 @@ async def test_run_process_publishes_stdout_and_stderr_deltas_then_completion() 
     process.finish()
     result = await asyncio.wait_for(task, timeout=1)
 
-    events = await bus.replay(session_id=session.id, run_id=run.id)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     assert result.status == "completed"
     assert [event.event for event in events] == [
         "run.started",
@@ -368,7 +368,7 @@ async def test_run_process_publishes_failed_for_nonzero_exit() -> None:
     process.finish()
     result = await asyncio.wait_for(task, timeout=1)
 
-    events = await bus.replay(session_id=session.id, run_id=run.id)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     assert result.status == "failed"
     assert [event.event for event in events] == ["run.started", "message.delta", "run.failed"]
     assert events[-1].data == {"returncode": 2}
@@ -392,7 +392,7 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
     assert await manager.interrupt(session.id, owned_run.id) is True
 
     result = await asyncio.wait_for(manager.wait(owned_run.id), timeout=1)
-    events = await bus.replay(session_id=session.id, run_id=owned_run.id)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == owned_run.id]
 
     assert process.terminated is True
     assert result.status == "interrupted"
@@ -443,7 +443,7 @@ async def test_run_process_does_not_emit_message_event_for_claude_stdout() -> No
     process.finish()
     await asyncio.wait_for(task, timeout=1)
 
-    events = await bus.replay(session_id=session.id, run_id=run.id)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     event_names = [event.event for event in events]
     assert "message" not in event_names, (
         f"RunProcess must not emit message events from stdout (got {event_names})"

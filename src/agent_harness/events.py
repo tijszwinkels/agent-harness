@@ -26,12 +26,12 @@ class InMemoryEventBus:
 
         return published
 
-    async def replay(self, after: int = 0, *, session_id: str | None = None, run_id: str | None = None) -> list[Event]:
+    async def replay(self, after: int = 0, *, session_id: str | None = None) -> list[Event]:
         async with self._lock:
             return [
                 event
                 for event in self._history
-                if _matches(event, after=after, session_id=session_id, run_id=run_id)
+                if _matches(event, after=after, session_id=session_id)
             ]
 
     async def _register(
@@ -39,14 +39,13 @@ class InMemoryEventBus:
         after: int,
         *,
         session_id: str | None,
-        run_id: str | None,
     ) -> tuple[list[Event], asyncio.Queue[Event]]:
         queue: asyncio.Queue[Event] = asyncio.Queue()
         async with self._lock:
             replay = [
                 event
                 for event in self._history
-                if _matches(event, after=after, session_id=session_id, run_id=run_id)
+                if _matches(event, after=after, session_id=session_id)
             ]
             self._subscribers.add(queue)
         return replay, queue
@@ -60,27 +59,24 @@ class InMemoryEventBus:
         after: int = 0,
         *,
         session_id: str | None = None,
-        run_id: str | None = None,
     ) -> AsyncIterator[Event]:
-        replay, queue = await self._register(after, session_id=session_id, run_id=run_id)
+        replay, queue = await self._register(after, session_id=session_id)
         try:
             for event in replay:
                 yield event
 
             while True:
                 event = await queue.get()
-                if _matches(event, after=after, session_id=session_id, run_id=run_id):
+                if _matches(event, after=after, session_id=session_id):
                     yield event
         finally:
             with suppress(RuntimeError):
                 await self._unregister(queue)
 
 
-def _matches(event: Event, *, after: int, session_id: str | None, run_id: str | None) -> bool:
+def _matches(event: Event, *, after: int, session_id: str | None) -> bool:
     if event.sequence is None or event.sequence <= after:
         return False
     if session_id is not None and event.session_id != session_id:
-        return False
-    if run_id is not None and event.run_id != run_id:
         return False
     return True

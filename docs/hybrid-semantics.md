@@ -76,7 +76,6 @@ SSE streams follow new events by default:
 ```text
 GET /v1/events
 GET /v1/sessions/{session_id}/events
-GET /v1/sessions/{id}/runs/{run_id}/events
 ```
 
 `?from=beginning` replays retained events for the selected scope before

@@ -198,6 +198,91 @@ def test_claude_code_command_builder_resumes_external_claude_session() -> None:
     assert command.cwd == "/workspace/project"
 
 
+def test_codex_command_builder_appends_dangerously_bypass_when_bypass_permissions_set() -> None:
+    session = make_session("codex").model_copy(update={"bypass_permissions": True})
+    run = make_run(session)
+    message = Message.user("yolo run")
+
+    command = CodexCommandBuilder().build(session=session, run=run, message=message)
+
+    assert command.argv == (
+        "codex",
+        "exec",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "yolo run",
+    )
+
+
+def test_codex_command_builder_appends_dangerously_bypass_on_external_resume_when_bypass_permissions_set() -> None:
+    session = make_session("codex").model_copy(
+        update={
+            "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4",
+            "origin": "external",
+            "bypass_permissions": True,
+        }
+    )
+    run = make_run(session)
+
+    command = CodexCommandBuilder().build(session=session, run=run, message=Message.user("yolo resume"))
+
+    assert "--dangerously-bypass-approvals-and-sandbox" in command.argv
+    # Must appear before the resume id + prompt positional args.
+    flag_idx = command.argv.index("--dangerously-bypass-approvals-and-sandbox")
+    assert command.argv[-2] == "019e07c3-4682-7ff1-99e8-948e64bb70c4"
+    assert command.argv[-1] == "yolo resume"
+    assert flag_idx < len(command.argv) - 2
+
+
+def test_claude_code_command_builder_appends_dangerously_skip_when_flag_set() -> None:
+    session = make_session("claude-code").model_copy(
+        update={
+            "id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+            "bypass_permissions": True,
+        }
+    )
+    run = make_run(session)
+
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=Message.user("yolo claude"), is_first_run=True,
+    )
+
+    assert command.argv == (
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--model",
+        "gpt-5.4",
+        "--dangerously-skip-permissions",
+        "--session-id",
+        "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "yolo claude",
+    )
+
+
+def test_claude_code_command_builder_appends_dangerously_skip_on_external_resume() -> None:
+    session = make_session("claude-code").model_copy(
+        update={
+            "id": "claude_2a9857de-2f9d-4190-aa76-e433619602fb",
+            "origin": "external",
+            "bypass_permissions": True,
+        }
+    )
+    run = make_run(session)
+
+    command = ClaudeCodeCommandBuilder().build(session=session, run=run, message=Message.user("yolo resume"))
+
+    assert "--dangerously-skip-permissions" in command.argv
+    skip_idx = command.argv.index("--dangerously-skip-permissions")
+    resume_idx = command.argv.index("--resume")
+    assert skip_idx < resume_idx
+
+
 def test_external_resume_requires_expected_session_id_prefix() -> None:
     session = make_session("codex").model_copy(update={"id": "external_without_backend_prefix", "origin": "external"})
     run = make_run(session)

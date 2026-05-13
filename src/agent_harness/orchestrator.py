@@ -59,6 +59,11 @@ class CodexCommandBuilder:
     ) -> ProcessCommand:
         del run, is_first_run
         text = _message_text(message)
+        bypass: tuple[str, ...] = (
+            ("--dangerously-bypass-approvals-and-sandbox",)
+            if session.bypass_permissions
+            else ()
+        )
         if session.origin == "external":
             return ProcessCommand(
                 argv=(
@@ -68,6 +73,7 @@ class CodexCommandBuilder:
                     "--json",
                     "--model",
                     session.model,
+                    *bypass,
                     _external_resume_id(session, prefix="codex_"),
                     text,
                 ),
@@ -75,7 +81,7 @@ class CodexCommandBuilder:
             )
 
         return ProcessCommand(
-            argv=("codex", "exec", "--json", "--model", session.model, text),
+            argv=("codex", "exec", "--json", "--model", session.model, *bypass, text),
             cwd=session.project.path,
         )
 
@@ -113,6 +119,8 @@ class ClaudeCodeCommandBuilder:
             "--model",
             session.model,
         )
+        if session.bypass_permissions:
+            argv = (*argv, "--dangerously-skip-permissions")
         if session.origin == "external":
             argv = (*argv, "--resume", _external_resume_id(session, prefix="claude_"))
         else:

@@ -67,6 +67,21 @@ def test_sqlite_repository_persists_materialized_external_events_after_reopen(tm
     reopened.close()
 
 
+def test_sqlite_repository_append_event_allocates_next_sequence_after_reopen(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+
+    first = repository.append_event(Event(event="session.updated", session_id="ses_a", data={}))
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    second = reopened.append_event(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+
+    assert [first.sequence, second.sequence] == [1, 2]
+    assert [event.sequence for event in reopened.list_events()] == [1, 2]
+    reopened.close()
+
+
 def test_sqlite_repository_skips_duplicate_observed_messages(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)

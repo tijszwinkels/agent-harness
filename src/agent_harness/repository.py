@@ -206,7 +206,8 @@ class InMemoryRepository:
                 raise SessionNotFoundError(session_id)
             return [message.model_copy(deep=True) for message in self._messages.get(session_id, [])]
 
-    def materialize_event(self, event: Event) -> None:
+    def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
+        del store_event
         if event.event == "session.updated":
             session_data = event.data.get("session")
             if isinstance(session_data, dict):
@@ -224,10 +225,38 @@ class InMemoryRepository:
                     self.upsert_session(incoming)
             return
 
+        if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
+            self._materialize_run_lifecycle_event(event)
+            return
+
         if event.event == "message":
             message_data = event.data.get("message")
             if event.session_id and isinstance(message_data, dict):
                 self.add_message(event.session_id, Message.model_validate(message_data))
+
+    def _materialize_run_lifecycle_event(self, event: Event) -> None:
+        if event.session_id is None or event.run_id is None:
+            return
+        with self._lock:
+            run = self._runs.get(event.run_id)
+            if run is None or run.session_id != event.session_id:
+                return
+
+            status_by_event: dict[str, RunStatus] = {
+                "run.started": "running",
+                "run.completed": "completed",
+                "run.failed": "failed",
+                "run.interrupted": "interrupted",
+            }
+            update: dict[str, object] = {"status": status_by_event[event.event]}
+            if event.event == "run.started" and run.started_at is None:
+                update["started_at"] = event.created_at
+            if event.event in {"run.completed", "run.failed", "run.interrupted"}:
+                update["completed_at"] = event.created_at
+            if event.event == "run.interrupted":
+                update["stop_reason"] = "interrupted"
+
+            self._runs[event.run_id] = run.model_copy(update=update)
 
     def upsert_session(self, session: Session) -> None:
         with self._lock:

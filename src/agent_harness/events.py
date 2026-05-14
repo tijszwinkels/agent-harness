@@ -3,11 +3,34 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
+import logging
+from typing import Protocol
 
 from agent_harness.models import Event
 
+logger = logging.getLogger(__name__)
+
+
+class EventRepository(Protocol):
+    def append_event(self, event: Event) -> Event:
+        pass
+
+    def list_events(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        after: int = 0,
+    ) -> list[Event]:
+        pass
+
+    def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
+        pass
+
 
 class InMemoryEventBus:
+    stores_events = False
+
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._next_seq = 1
@@ -112,6 +135,103 @@ class InMemoryEventBus:
         finally:
             with suppress(RuntimeError):
                 await self._unregister(queue)
+
+
+class DurableEventBus:
+    stores_events = True
+
+    def __init__(self, repository: EventRepository) -> None:
+        self._repository = repository
+        self._lock = asyncio.Lock()
+        self._subscribers: set[asyncio.Queue[Event]] = set()
+
+    async def publish(self, event: Event) -> Event:
+        async with self._lock:
+            published = self._repository.append_event(event)
+            self._materialize_lifecycle_event(published)
+            subscribers = tuple(self._subscribers)
+
+        for subscriber in subscribers:
+            subscriber.put_nowait(published)
+
+        return published
+
+    async def replay(self, after: int = 0, *, session_id: str | None = None) -> list[Event]:
+        async with self._lock:
+            return self._repository.list_events(after=after, session_id=session_id)
+
+    async def _register(
+        self,
+        after: int,
+        *,
+        session_id: str | None,
+    ) -> tuple[list[Event], asyncio.Queue[Event]]:
+        queue: asyncio.Queue[Event] = asyncio.Queue()
+        async with self._lock:
+            replay = self._repository.list_events(after=after, session_id=session_id)
+            self._subscribers.add(queue)
+        return replay, queue
+
+    async def _unregister(self, queue: asyncio.Queue[Event]) -> None:
+        async with self._lock:
+            self._subscribers.discard(queue)
+
+    async def subscribe(
+        self,
+        after: int = 0,
+        *,
+        session_id: str | None = None,
+        keepalive_seconds: float | None = None,
+    ) -> AsyncIterator[Event | None]:
+        if keepalive_seconds is not None and keepalive_seconds <= 0:
+            raise ValueError("keepalive_seconds must be positive when provided")
+        replay, queue = await self._register(after, session_id=session_id)
+        loop = asyncio.get_running_loop()
+        try:
+            for event in replay:
+                yield event
+
+            deadline = (
+                loop.time() + keepalive_seconds
+                if keepalive_seconds is not None
+                else None
+            )
+            while True:
+                if deadline is None:
+                    event = await queue.get()
+                else:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        yield None
+                        deadline = loop.time() + keepalive_seconds
+                        continue
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        yield None
+                        deadline = loop.time() + keepalive_seconds
+                        continue
+                if _matches(event, after=after, session_id=session_id):
+                    if deadline is not None:
+                        deadline = loop.time() + keepalive_seconds
+                    yield event
+        finally:
+            with suppress(RuntimeError):
+                await self._unregister(queue)
+
+    def _materialize_lifecycle_event(self, event: Event) -> None:
+        if event.event not in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
+            return
+        try:
+            self._repository.materialize_event(event, store_event=False)
+        except Exception:
+            logger.exception(
+                "Failed to materialize durable run lifecycle event: event=%s session=%s run=%s sequence=%s",
+                event.event,
+                event.session_id,
+                event.run_id,
+                event.sequence,
+            )
 
 
 def _matches(event: Event, *, after: int, session_id: str | None) -> bool:

@@ -155,7 +155,7 @@ class ExternalTranscriptObserver:
             return
 
         try:
-            self._repository.materialize_event(event)
+            self._repository.materialize_event(event, store_event=not self._event_bus.stores_events)
         except SessionNotFoundError:
             if event.event == "message" and event.session_id:
                 self._buffer_materialization(event)
@@ -195,7 +195,7 @@ class ExternalTranscriptObserver:
         still_pending: list[Event] = []
         for event in pending:
             try:
-                self._repository.materialize_event(event)
+                self._repository.materialize_event(event, store_event=not self._event_bus.stores_events)
             except SessionNotFoundError:
                 still_pending.append(event)
 

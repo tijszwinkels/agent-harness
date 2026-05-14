@@ -3,8 +3,9 @@ import contextlib
 
 import pytest
 
-from agent_harness.events import InMemoryEventBus
+from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.models import Event
+from agent_harness.storage import open_sqlite_repository
 
 
 @pytest.mark.asyncio
@@ -111,3 +112,41 @@ async def test_replay_can_filter_by_session() -> None:
     session_events = await bus.replay(session_id="ses_a")
 
     assert [event.sequence for event in session_events] == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    first_bus = DurableEventBus(repository)
+    first = await first_bus.publish(Event(event="session.updated", session_id="ses_a", data={}))
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    second_bus = DurableEventBus(reopened)
+    second = await second_bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    replayed = await second_bus.replay()
+
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert [event.sequence for event in replayed] == [1, 2]
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_subscribe_has_no_gap_between_replay_and_live(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+    await bus.publish(Event(event="session.updated", session_id="ses_a", data={}))
+
+    subscription = bus.subscribe(after=0, session_id="ses_a")
+    replayed = await subscription.__anext__()
+    live_event = asyncio.create_task(subscription.__anext__())
+    published = await bus.publish(Event(event="message", session_id="ses_a", data={}))
+
+    try:
+        assert replayed.sequence == 1
+        assert await asyncio.wait_for(live_event, timeout=1) == published
+    finally:
+        await subscription.aclose()
+        repository.close()

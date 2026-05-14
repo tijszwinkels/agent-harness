@@ -23,7 +23,7 @@ from agent_harness.repository import RunNotFoundError, SessionNotFoundError
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TModel = TypeVar("TModel", bound=BaseModel)
 
 _SCHEMA = """
@@ -401,15 +401,22 @@ class SQLiteRepository:
         if run_id is not None:
             query += " and run_id = ?"
             parameters.append(run_id)
-        query += " order by row_id"
+        query += " order by sequence"
 
         with self._lock:
             rows = self._connection.execute(query, parameters).fetchall()
         return [_model_from_row(row, "payload", Event) for row in rows]
 
-    def materialize_event(self, event: Event) -> None:
+    def append_event(self, event: Event) -> Event:
         with self._lock, self._connection:
-            self._insert_event(event)
+            published = event.with_sequence(self._next_event_sequence_locked())
+            self._insert_event(published)
+        return published.model_copy(deep=True)
+
+    def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
+        with self._lock, self._connection:
+            if store_event:
+                self._insert_event(event)
 
             if event.event == "session.updated":
                 session_data = event.data.get("session")
@@ -427,6 +434,10 @@ class SQLiteRepository:
                     # records the observer remains the source of truth.
                     if existing is None or existing.origin == "external":
                         self._upsert_session(incoming)
+                return
+
+            if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
+                self._materialize_run_lifecycle_event(event)
                 return
 
             if event.event == "message":
@@ -561,25 +572,74 @@ class SQLiteRepository:
         return True
 
     def _insert_event(self, event: Event) -> None:
+        stored = event
+        if stored.sequence is None:
+            stored = event.with_sequence(self._next_event_sequence_locked())
         self._connection.execute(
             """
             insert into events(sequence, event, session_id, run_id, payload, created_at)
             values (?, ?, ?, ?, ?, ?)
             """,
             (
+                stored.sequence,
+                stored.event,
+                stored.session_id,
+                stored.run_id,
+                stored.model_dump_json(),
+                stored.created_at.isoformat(),
+            ),
+        )
+
+    def _next_event_sequence_locked(self) -> int:
+        row = self._connection.execute("select coalesce(max(sequence), 0) + 1 from events").fetchone()
+        if row is None:
+            logger.error("SQLite event sequence lookup returned no row")
+            raise RuntimeError("Failed to allocate event sequence")
+        return int(row[0])
+
+    def _materialize_run_lifecycle_event(self, event: Event) -> None:
+        if event.session_id is None or event.run_id is None:
+            logger.warning(
+                "SQLite run lifecycle materialization skipped event without ids: event=%s sequence=%s",
+                event.event,
                 event.sequence,
+            )
+            return
+
+        row = self._connection.execute(
+            "select payload from runs where id = ? and session_id = ?",
+            (event.run_id, event.session_id),
+        ).fetchone()
+        if row is None:
+            logger.warning(
+                "SQLite run lifecycle materialization skipped missing run: event=%s session=%s run=%s",
                 event.event,
                 event.session_id,
                 event.run_id,
-                event.model_dump_json(),
-                event.created_at.isoformat(),
-            ),
-        )
+            )
+            return
+
+        run = _model_from_row(row, "payload", Run)
+        status_by_event: dict[str, RunStatus] = {
+            "run.started": "running",
+            "run.completed": "completed",
+            "run.failed": "failed",
+            "run.interrupted": "interrupted",
+        }
+        update: dict[str, object] = {"status": status_by_event[event.event]}
+        if event.event == "run.started" and run.started_at is None:
+            update["started_at"] = event.created_at
+        if event.event in {"run.completed", "run.failed", "run.interrupted"}:
+            update["completed_at"] = event.created_at
+        if event.event == "run.interrupted":
+            update["stop_reason"] = "interrupted"
+
+        self._upsert_run(run.model_copy(update=update))
 
 
 def open_sqlite_repository(database_path: str | Path) -> SQLiteRepository:
     try:
-        connection = sqlite3.connect(database_path)
+        connection = sqlite3.connect(database_path, check_same_thread=False)
     except sqlite3.Error:
         logger.exception("Failed to open SQLite repository: %s", database_path)
         raise

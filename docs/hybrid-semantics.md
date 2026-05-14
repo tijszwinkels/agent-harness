@@ -14,6 +14,15 @@ Sources consulted on 2026-05-08:
   `https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events`,
   for the `text/event-stream` transport model.
 
+Additional sources consulted on 2026-05-14:
+
+- MDN Server-Sent Events documentation,
+  `https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events`,
+  for SSE `id` fields and reconnect framing.
+- Prior WIP diff in
+  `/home/claude/projects/agent-harness-echo/worktrees/durable-events`,
+  for the first durable event-bus design sketch.
+
 ## Session Identity
 
 External session ids are stable and backend-prefixed:
@@ -91,6 +100,21 @@ equal to that value.
 Message list endpoints return materialized message state. SSE endpoints return
 the event log. Clients that need lossless incremental updates should use SSE.
 
+When SQLite is configured, the SSE event log is durable. Every event published
+through the harness event bus is assigned a monotonically increasing sequence,
+inserted into the SQLite `events` table, and only then fanned out to live SSE
+subscribers. Restarting the harness with the same database continues allocating
+from the existing maximum sequence, so clients can resume with `after=<last id>`
+without treating a restart as a sequence reset.
+
+When SQLite is not configured, the same SSE contract is served by the in-memory
+event bus. Replay works only for events retained by the current process.
+
+Events are retained indefinitely in v1. The rows are small and the bridge needs
+a continuous event log more than it needs automatic pruning. If this becomes a
+storage issue, add an explicit max-age or max-row policy rather than silently
+discarding resumable history.
+
 ## External Liveness
 
 The harness does not own external processes and must not imply that it can prove
@@ -117,11 +141,12 @@ logged with enough context to identify the backend, path, and exception.
 
 ## Ordering And Event Bus
 
-All harness and observer publications go through one in-process event bus.
+All harness and observer publications go through one event bus instance.
 
 The bus assigns a single monotonically increasing integer `sequence` to every
-event after parsing and before fan-out. This sequence is the authoritative
-ordering key for:
+event after parsing and before fan-out. With SQLite, sequence allocation and
+event insertion happen inside the repository transaction while the event bus
+holds its publisher lock. This sequence is the authoritative ordering key for:
 
 - SSE `id`
 - event replay with `after`

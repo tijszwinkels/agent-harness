@@ -3,12 +3,13 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_harness.api import _materialize_run_result, _sse_stream, create_app
-from agent_harness.events import InMemoryEventBus
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Project, Session
+from agent_harness.api import _materialize_run_result, _replay_after, _sse_stream, create_app
+from agent_harness.events import DurableEventBus, InMemoryEventBus
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project, Session
 from agent_harness.orchestrator import ProcessCommand, RunManager, RunProcessResult, SubmitResult
 from agent_harness.repository import InMemoryRepository
 from agent_harness.settings import ObserverSettings
+from agent_harness.storage import open_sqlite_repository
 
 
 def test_health_and_backend_listing() -> None:
@@ -619,6 +620,41 @@ async def test_sse_stream_emits_keepalive_comment_when_bus_idle() -> None:
         assert f"id: {published.sequence}" in event_frame
     finally:
         await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_durable_sse_stream_replays_reopened_repository_from_beginning(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    first_bus = DurableEventBus(repository)
+    published = await first_bus.publish(
+        Event(event="session.updated", session_id="ses_a", data={}),
+    )
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    stream = _sse_stream(DurableEventBus(reopened), after=0, keepalive_seconds=1).__aiter__()
+    try:
+        frame = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+        assert f"id: {published.sequence}" in frame
+        assert "event: session.updated" in frame
+    finally:
+        await stream.aclose()
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_after_defaults_to_current_sequence_for_now(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+    await bus.publish(Event(event="session.updated", session_id="ses_a", data={}))
+
+    try:
+        assert await _replay_after(bus, after=0, from_="now") == 1
+        assert await _replay_after(bus, after=0, from_="beginning") == 0
+        assert await _replay_after(bus, after=7, from_="beginning") == 7
+    finally:
+        repository.close()
 
 
 def test_missing_session_returns_404() -> None:

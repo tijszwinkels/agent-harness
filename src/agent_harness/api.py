@@ -13,7 +13,7 @@ from fastapi.encoders import jsonable_encoder
 from starlette.responses import StreamingResponse
 
 from agent_harness.backends import BackendRegistry, default_backend_registry
-from agent_harness.events import InMemoryEventBus
+from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.models import (
     CreateRunRequest,
     CreateRunResponse,
@@ -59,7 +59,7 @@ TaskFactory = Callable[[Awaitable[None]], asyncio.Task[None]]
 def create_app(
     *,
     repository: InMemoryRepository | None = None,
-    event_bus: InMemoryEventBus | None = None,
+    event_bus: InMemoryEventBus | DurableEventBus | None = None,
     backend_registry: BackendRegistry | None = None,
     observer_settings: ObserverSettings | None = None,
     watch_service_factory: WatchServiceFactory | None = None,
@@ -68,7 +68,7 @@ def create_app(
     command_builders: Mapping[str, BackendCommandBuilder] | None = None,
 ) -> FastAPI:
     repo = repository or InMemoryRepository()
-    events = event_bus or InMemoryEventBus()
+    events = event_bus or _event_bus_for_repository(repo)
     backends = backend_registry or default_backend_registry()
     settings = observer_settings or ObserverSettings()
     builders = command_builders or default_command_builders()
@@ -338,7 +338,7 @@ def create_app(
         after: int = Query(default=0, ge=0),
         from_: str = Query(default="now", alias="from"),
     ) -> StreamingResponse:
-        replay_after = 0 if from_ == "beginning" else after
+        replay_after = await _replay_after(events, after=after, from_=from_)
         return StreamingResponse(_sse_stream(events, after=replay_after), media_type="text/event-stream")
 
     @app.get("/v1/sessions/{session_id}/events")
@@ -347,7 +347,7 @@ def create_app(
         after: int = Query(default=0, ge=0),
         from_: str = Query(default="now", alias="from"),
     ) -> StreamingResponse:
-        replay_after = 0 if from_ == "beginning" else after
+        replay_after = await _replay_after(events, after=after, from_=from_, session_id=session_id)
         return StreamingResponse(
             _sse_stream(events, after=replay_after, session_id=session_id),
             media_type="text/event-stream",
@@ -359,7 +359,7 @@ def create_app(
 def _lifespan(
     *,
     repository: InMemoryRepository,
-    event_bus: InMemoryEventBus,
+    event_bus: InMemoryEventBus | DurableEventBus,
     observer_settings: ObserverSettings,
     watch_service_factory: WatchServiceFactory | None,
     task_factory: TaskFactory | None,
@@ -403,6 +403,14 @@ def _lifespan(
                 await _stop_observer_task(observer_task, stop_event)
 
     return lifespan
+
+
+def _event_bus_for_repository(repository: InMemoryRepository) -> InMemoryEventBus | DurableEventBus:
+    append_event = getattr(repository, "append_event", None)
+    list_events = getattr(repository, "list_events", None)
+    if callable(append_event) and callable(list_events):
+        return DurableEventBus(repository)
+    return InMemoryEventBus()
 
 
 def _create_watch_service(
@@ -502,7 +510,7 @@ def _log_observer_task_result(task: asyncio.Task[None]) -> None:
 
 
 async def _sse_stream(
-    event_bus: InMemoryEventBus,
+    event_bus: InMemoryEventBus | DurableEventBus,
     *,
     after: int = 0,
     session_id: str | None = None,
@@ -521,6 +529,21 @@ async def _sse_stream(
             yield ": ka\n\n"
             continue
         yield _format_sse(event)
+
+
+async def _replay_after(
+    event_bus: InMemoryEventBus | DurableEventBus,
+    *,
+    after: int,
+    from_: str,
+    session_id: str | None = None,
+) -> int:
+    if after > 0:
+        return after
+    if from_ == "beginning":
+        return 0
+    replay = await event_bus.replay(session_id=session_id)
+    return max((event.sequence or 0 for event in replay), default=0)
 
 
 def _format_sse(event: Event) -> str:

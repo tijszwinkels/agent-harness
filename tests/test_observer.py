@@ -1060,3 +1060,54 @@ async def test_observer_freshness_tick_only_flips_silent_sessions(tmp_path) -> N
 
     assert repository.get_session(session_a).status == "idle"
     assert repository.get_session(session_b).status == "running"
+
+
+@pytest.mark.asyncio
+async def test_watch_service_runs_freshness_tick_alongside_watcher(tmp_path) -> None:
+    """Integration: ``TranscriptWatchService`` must spawn the freshness loop
+    while the file watcher is alive. A regression that drops the
+    ``asyncio.create_task(self._freshness_loop())`` would otherwise go
+    unnoticed because the unit tests call ``freshness_tick`` directly."""
+    import asyncio
+
+    transcript = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08" / (
+        "rollout-2026-05-08T10-30-00-eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n',
+        encoding="utf-8",
+    )
+
+    tick_calls = 0
+
+    class CountingObserver(ExternalTranscriptObserver):
+        async def freshness_tick(self) -> None:  # type: ignore[override]
+            nonlocal tick_calls
+            tick_calls += 1
+            await super().freshness_tick()
+
+    watcher_done = asyncio.Event()
+
+    async def slow_watcher(*_roots, **_kwargs):
+        # Yield one batch so the file is ingested, then hold the loop open
+        # long enough for the freshness loop to fire at least once.
+        yield {("modified", str(transcript))}
+        await watcher_done.wait()
+
+    observer = CountingObserver(InMemoryEventBus(), repository=InMemoryRepository())
+    service = TranscriptWatchService(
+        roots=[tmp_path],
+        observer=observer,
+        watcher=slow_watcher,
+        freshness_interval_seconds=0.05,  # ~1/200th of production interval
+    )
+
+    task = asyncio.create_task(service.watch_forever())
+    try:
+        # Allow the freshness loop ample wall-clock time to tick.
+        await asyncio.sleep(0.25)
+        assert tick_calls >= 2, f"expected ≥2 freshness ticks, got {tick_calls}"
+    finally:
+        watcher_done.set()
+        await asyncio.wait_for(task, timeout=1.0)

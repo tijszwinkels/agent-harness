@@ -171,8 +171,10 @@ class PatchSessionRequest(HarnessModel):
     # Patch payload for ``PATCH /v1/sessions/{id}``. Only the listed fields
     # are user-mutable; everything else on Session is either derived
     # (status, stats, updated_at) or immutable (id, backend, origin,
-    # created_at). Unset fields are left untouched.
-    title: str | None = None
+    # created_at). Unset fields are left untouched. Explicit ``null`` is
+    # rejected at the route layer to avoid a silent "clear field" path
+    # that no current consumer wants — omit the field instead.
+    title: str | None = Field(default=None, min_length=1)
 
 
 class CreateRunRequest(HarnessModel):

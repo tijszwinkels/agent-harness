@@ -779,6 +779,31 @@ def test_patch_session_rejects_unknown_fields() -> None:
     assert response.status_code == 422
 
 
+def test_patch_session_rejects_explicit_null_title() -> None:
+    # ``{"title": null}`` would otherwise silently clear the title. No
+    # documented consumer wants that today; require an explicit omission
+    # for "leave unchanged".
+    client = TestClient(create_app())
+    session = _create_session(client, title="keep me")
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"title": None})
+
+    assert response.status_code == 422
+    assert client.get(f"/v1/sessions/{session['id']}").json()["title"] == "keep me"
+
+
+def test_patch_session_rejects_empty_title() -> None:
+    # ``min_length=1`` on the model field catches empty strings before
+    # they reach the route. Same intent as the null guard.
+    client = TestClient(create_app())
+    session = _create_session(client, title="keep me")
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"title": ""})
+
+    assert response.status_code == 422
+    assert client.get(f"/v1/sessions/{session['id']}").json()["title"] == "keep me"
+
+
 def test_observer_service_starts_and_stops_with_lifespan(tmp_path) -> None:
     root = tmp_path / "transcripts"
     root.mkdir()

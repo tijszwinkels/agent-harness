@@ -676,6 +676,39 @@ async def test_replay_after_uses_max_sequence_for_now() -> None:
     assert bus.session_id == "ses_a"
 
 
+def test_events_max_sequence_endpoint_reports_current_max(tmp_path) -> None:
+    """Cheap synchronous probe so clients (e.g. mm-bridge) can detect a
+    harness restart without opening an SSE stream and waiting for an idle
+    window. Returns 0 on a fresh bus; reflects the global max after publishes;
+    accepts ``session_id`` for a per-session max."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+    try:
+        client = TestClient(create_app(repository=repository, event_bus=bus))
+
+        empty = client.get("/v1/events/max-sequence")
+        assert empty.status_code == 200
+        assert empty.json() == {"sequence": 0}
+
+        asyncio.run(bus.publish(Event(event="session.updated", session_id="ses_a", data={})))
+        asyncio.run(bus.publish(Event(event="message", session_id="ses_a", data={})))
+        asyncio.run(bus.publish(Event(event="message", session_id="ses_b", data={})))
+
+        all_resp = client.get("/v1/events/max-sequence")
+        assert all_resp.status_code == 200
+        assert all_resp.json() == {"sequence": 3}
+
+        per_session = client.get("/v1/events/max-sequence", params={"session_id": "ses_a"})
+        assert per_session.status_code == 200
+        assert per_session.json() == {"sequence": 2}
+
+        missing = client.get("/v1/events/max-sequence", params={"session_id": "ses_missing"})
+        assert missing.status_code == 200
+        assert missing.json() == {"sequence": 0}
+    finally:
+        repository.close()
+
+
 def test_missing_session_returns_404() -> None:
     client = TestClient(create_app())
 

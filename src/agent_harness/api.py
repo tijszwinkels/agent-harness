@@ -333,6 +333,16 @@ def create_app(
         )
         return InterruptRunResponse(run=target, dropped_queued=other_dropped)
 
+    @app.get("/v1/events/max-sequence")
+    async def events_max_sequence(
+        session_id: str | None = Query(default=None),
+    ) -> dict[str, int]:
+        # Cheap synchronous probe for clients that need to know the current
+        # max event sequence without opening an SSE stream (e.g. mm-bridge
+        # uses it after reconnect to distinguish "I'm caught up" from "the
+        # harness restarted"). Returns 0 on an empty bus or unknown session.
+        return {"sequence": await events.max_sequence(session_id=session_id)}
+
     @app.get("/v1/events")
     async def stream_events(
         after: int = Query(default=0, ge=0),

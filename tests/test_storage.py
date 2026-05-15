@@ -82,6 +82,23 @@ def test_sqlite_repository_append_event_allocates_next_sequence_after_reopen(tmp
     reopened.close()
 
 
+def test_sqlite_repository_reports_max_event_sequence(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+
+    assert repository.max_sequence() == 0
+    assert repository.max_sequence(session_id="ses_a") == 0
+
+    repository.append_event(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    repository.append_event(Event(event="run.started", session_id="ses_b", run_id="run_b", data={}))
+    repository.append_event(Event(event="message", session_id="ses_a", run_id="run_a", data={}))
+
+    assert repository.max_sequence() == 3
+    assert repository.max_sequence(session_id="ses_a") == 3
+    assert repository.max_sequence(session_id="ses_b") == 2
+    assert repository.max_sequence(session_id="ses_missing") == 0
+    repository.close()
+
+
 def test_sqlite_repository_skips_duplicate_observed_messages(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)

@@ -407,6 +407,19 @@ class SQLiteRepository:
             rows = self._connection.execute(query, parameters).fetchall()
         return [_model_from_row(row, "payload", Event) for row in rows]
 
+    def max_sequence(self, *, session_id: str | None = None) -> int:
+        query = "select max(sequence) from events"
+        parameters: list[object] = []
+        if session_id is not None:
+            query += " where session_id = ?"
+            parameters.append(session_id)
+
+        with self._lock:
+            row = self._connection.execute(query, parameters).fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
     def append_event(self, event: Event) -> Event:
         with self._lock, self._connection:
             published = event.with_sequence(self._next_event_sequence_locked())

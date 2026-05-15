@@ -24,6 +24,9 @@ class EventRepository(Protocol):
     ) -> list[Event]:
         pass
 
+    def max_sequence(self, *, session_id: str | None = None) -> int:
+        pass
+
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
         pass
 
@@ -56,6 +59,19 @@ class InMemoryEventBus:
                 for event in self._history
                 if _matches(event, after=after, session_id=session_id)
             ]
+
+    async def max_sequence(self, *, session_id: str | None = None) -> int:
+        async with self._lock:
+            if session_id is None:
+                return self._next_seq - 1
+            return max(
+                (
+                    event.sequence or 0
+                    for event in self._history
+                    if event.session_id == session_id
+                ),
+                default=0,
+            )
 
     async def _register(
         self,
@@ -159,6 +175,10 @@ class DurableEventBus:
     async def replay(self, after: int = 0, *, session_id: str | None = None) -> list[Event]:
         async with self._lock:
             return self._repository.list_events(after=after, session_id=session_id)
+
+    async def max_sequence(self, *, session_id: str | None = None) -> int:
+        async with self._lock:
+            return self._repository.max_sequence(session_id=session_id)
 
     async def _register(
         self,

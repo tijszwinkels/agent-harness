@@ -542,8 +542,7 @@ async def _replay_after(
         return after
     if from_ == "beginning":
         return 0
-    replay = await event_bus.replay(session_id=session_id)
-    return max((event.sequence or 0 for event in replay), default=0)
+    return await event_bus.max_sequence(session_id=session_id)
 
 
 def _format_sse(event: Event) -> str:

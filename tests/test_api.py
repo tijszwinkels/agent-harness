@@ -657,6 +657,25 @@ async def test_replay_after_defaults_to_current_sequence_for_now(tmp_path) -> No
         repository.close()
 
 
+@pytest.mark.asyncio
+async def test_replay_after_uses_max_sequence_for_now() -> None:
+    class Bus:
+        def __init__(self) -> None:
+            self.session_id: str | None = None
+
+        async def max_sequence(self, *, session_id: str | None = None) -> int:
+            self.session_id = session_id
+            return 42
+
+        async def replay(self, *args, **kwargs):
+            raise AssertionError("from=now must not replay stored events")
+
+    bus = Bus()
+
+    assert await _replay_after(bus, after=0, from_="now", session_id="ses_a") == 42
+    assert bus.session_id == "ses_a"
+
+
 def test_missing_session_returns_404() -> None:
     client = TestClient(create_app())
 

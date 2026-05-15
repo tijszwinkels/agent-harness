@@ -115,6 +115,23 @@ async def test_replay_can_filter_by_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inmemory_event_bus_reports_max_sequence() -> None:
+    bus = InMemoryEventBus()
+
+    assert await bus.max_sequence() == 0
+    assert await bus.max_sequence(session_id="ses_a") == 0
+
+    await bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    await bus.publish(Event(event="run.started", session_id="ses_b", run_id="run_b", data={}))
+    await bus.publish(Event(event="message", session_id="ses_a", run_id="run_a", data={}))
+
+    assert await bus.max_sequence() == 3
+    assert await bus.max_sequence(session_id="ses_a") == 3
+    assert await bus.max_sequence(session_id="ses_b") == 2
+    assert await bus.max_sequence(session_id="ses_missing") == 0
+
+
+@pytest.mark.asyncio
 async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)
@@ -131,6 +148,25 @@ async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> No
     assert second.sequence == 2
     assert [event.sequence for event in replayed] == [1, 2]
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_event_bus_reports_max_sequence(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+
+    assert await bus.max_sequence() == 0
+    assert await bus.max_sequence(session_id="ses_a") == 0
+
+    await bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    await bus.publish(Event(event="run.started", session_id="ses_b", run_id="run_b", data={}))
+    await bus.publish(Event(event="message", session_id="ses_a", run_id="run_a", data={}))
+
+    assert await bus.max_sequence() == 3
+    assert await bus.max_sequence(session_id="ses_a") == 3
+    assert await bus.max_sequence(session_id="ses_b") == 2
+    assert await bus.max_sequence(session_id="ses_missing") == 0
+    repository.close()
 
 
 @pytest.mark.asyncio

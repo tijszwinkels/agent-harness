@@ -1,10 +1,12 @@
 import logging
+from pathlib import Path
 
 import pytest
 
-from agent_harness.events import InMemoryEventBus
+from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.observer import (
     ExternalTranscriptObserver,
+    ObserverState,
     TranscriptWatchService,
     codex_transcript_path,
     external_session_id_from_codex_path,
@@ -17,6 +19,7 @@ from agent_harness.observer import (
 )
 from agent_harness.models import Event, Message, Project, Session
 from agent_harness.repository import InMemoryRepository
+from agent_harness.storage import open_sqlite_repository
 
 
 def test_claude_transcript_path_and_external_id_helpers() -> None:
@@ -741,6 +744,77 @@ def test_inmemory_repo_materialize_creates_when_absent() -> None:
     )
     after = repository.get_session(external.id)
     assert after.origin == "external"
+
+
+@pytest.mark.asyncio
+async def test_observer_offsets_survive_repository_reopen(tmp_path) -> None:
+    """Root cause of the 2026-05-15 MM flood: ``ObserverState`` was
+    in-memory only, so after a harness restart the observer re-read every
+    transcript from offset 0 and re-published every line into the durable
+    event bus. With offsets persisted via the repository, a re-opened
+    observer must skip already-processed lines."""
+    transcript_dir = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = transcript_dir / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"world"}}\n',
+        encoding="utf-8",
+    )
+
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    bus = DurableEventBus(repository)
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+
+    first_run = await observer.tail_file(transcript)
+    assert [event.event for event in first_run] == ["session.updated", "message", "message"]
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        reopened_bus = DurableEventBus(reopened)
+        # Fresh observer — fresh in-memory state. Without persistence this
+        # would re-emit both transcript lines as new bus events.
+        reopened_observer = ExternalTranscriptObserver(reopened_bus, repository=reopened)
+        second_run = await reopened_observer.tail_file(transcript)
+        assert second_run == [], "observer re-emitted events after restart"
+
+        # Appending a *new* line must still be picked up — offsets shouldn't
+        # block legitimate tail forward.
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write('{"type":"event_msg","payload":{"type":"user_message","message":"third"}}\n')
+        forward = await reopened_observer.tail_file(transcript)
+        assert [event.event for event in forward] == ["message"]
+    finally:
+        reopened.close()
+
+
+def test_observer_state_from_store_loads_existing_offsets() -> None:
+    """``ObserverState.from_store`` primes ``next_offsets`` from the store
+    so a freshly-constructed state behaves as if the previous lifetime had
+    already advanced to the persisted positions."""
+    class FakeStore:
+        def __init__(self) -> None:
+            self.writes: list[tuple[str, int]] = []
+
+        def get_observer_offsets(self) -> dict[str, int]:
+            return {"/transcripts/a.jsonl": 128, "/transcripts/b.jsonl": 256}
+
+        def set_observer_offset(self, path: str, next_offset: int) -> None:
+            self.writes.append((path, next_offset))
+
+    store = FakeStore()
+    state = ObserverState.from_store(store)
+
+    assert state.next_offset(Path("/transcripts/a.jsonl")) == 128
+    assert state.next_offset(Path("/transcripts/b.jsonl")) == 256
+    assert state.next_offset(Path("/transcripts/unknown.jsonl")) == 0
+
+    state.set_next_offset(Path("/transcripts/a.jsonl"), 512)
+    assert state.next_offset(Path("/transcripts/a.jsonl")) == 512
+    assert ("/transcripts/a.jsonl", 512) in store.writes
 
 
 def test_inmemory_repo_materialize_allows_updates_to_external() -> None:

@@ -24,7 +24,7 @@ from agent_harness.repository import RunNotFoundError, SessionNotFoundError
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TModel = TypeVar("TModel", bound=BaseModel)
 RUN_LIFECYCLE_EVENTS = {"run.started", "run.completed", "run.failed", "run.interrupted"}
 RUN_TERMINAL_EVENTS = RUN_LIFECYCLE_EVENTS - {"run.started"}
@@ -69,6 +69,12 @@ create table if not exists events (
     run_id text,
     payload text not null,
     created_at text not null
+);
+
+create table if not exists observer_offsets (
+    path text primary key,
+    next_offset integer not null,
+    updated_at text not null
 );
 
 create index if not exists idx_runs_session_id on runs(session_id);
@@ -165,6 +171,26 @@ class SQLiteRepository:
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    def get_observer_offsets(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._connection.execute(
+                "select path, next_offset from observer_offsets"
+            ).fetchall()
+        return {row["path"]: int(row["next_offset"]) for row in rows}
+
+    def set_observer_offset(self, path: str, next_offset: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                insert into observer_offsets(path, next_offset, updated_at)
+                values (?, ?, ?)
+                on conflict(path) do update set
+                    next_offset = excluded.next_offset,
+                    updated_at = excluded.updated_at
+                """,
+                (path, int(next_offset), utc_now().isoformat()),
+            )
 
     def create_session(self, request: CreateSessionRequest) -> Session:
         session = Session(

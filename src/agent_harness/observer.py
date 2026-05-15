@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from json import JSONDecodeError
 from pathlib import Path
 from collections.abc import AsyncIterator, Callable, Iterable
@@ -23,6 +25,7 @@ from agent_harness.models import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    utc_now,
 )
 from agent_harness.repository import InMemoryRepository, SessionNotFoundError
 
@@ -118,6 +121,9 @@ class ObserverState:
                 )
 
 
+DEFAULT_IDLE_AFTER_SECONDS = 30.0
+
+
 class ExternalTranscriptObserver:
     def __init__(
         self,
@@ -125,6 +131,8 @@ class ExternalTranscriptObserver:
         *,
         repository: InMemoryRepository | None = None,
         state: ObserverState | None = None,
+        idle_after_seconds: float = DEFAULT_IDLE_AFTER_SECONDS,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._repository = repository
@@ -137,6 +145,13 @@ class ExternalTranscriptObserver:
             )
         self._state = state
         self._pending_materialization: dict[str, list[Event]] = {}
+        self._idle_after = timedelta(seconds=idle_after_seconds)
+        self._clock = clock or utc_now
+        # Per-session last-seen-transcript-event timestamp. Drives the
+        # bidirectional running ↔ idle status transitions: a tick past the
+        # threshold flips silent sessions to idle; a fresh event on an idle
+        # session kicks it back to running.
+        self._last_event_at: dict[str, datetime] = {}
 
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)
@@ -194,7 +209,76 @@ class ExternalTranscriptObserver:
             if self._repository is not None:
                 self._materialize_or_buffer(published_event)
             published.append(published_event)
+            if published_event.session_id:
+                self._last_event_at[published_event.session_id] = self._clock()
+                # If a fresh transcript event arrives for a session that was
+                # marked idle by a previous freshness tick, flip it back to
+                # running so subscribers see the resumption.
+                kick = await self._maybe_publish_status_flip(
+                    published_event.session_id,
+                    target_status="running",
+                    identity=resolved_identity,
+                    offset=offset,
+                )
+                if kick is not None:
+                    published.append(kick)
         return published
+
+    async def freshness_tick(self) -> None:
+        """Flip running sessions to idle when their last transcript event is
+        older than the configured threshold. Idempotent — only emits a
+        ``session.updated`` event on the first flip.
+
+        Called periodically by :class:`TranscriptWatchService` and also
+        suitable for direct invocation in tests with a fake clock.
+        """
+        if self._repository is None:
+            return
+        now = self._clock()
+        for session_id, last_seen in list(self._last_event_at.items()):
+            if now - last_seen <= self._idle_after:
+                continue
+            await self._maybe_publish_status_flip(
+                session_id,
+                target_status="idle",
+                identity=None,
+                offset=None,
+            )
+
+    async def _maybe_publish_status_flip(
+        self,
+        session_id: str,
+        *,
+        target_status: str,
+        identity: TranscriptIdentity | None,
+        offset: int | None,
+    ) -> Event | None:
+        if self._repository is None:
+            return None
+        try:
+            session = self._repository.get_session(session_id)
+        except SessionNotFoundError:
+            return None
+        if session.status == target_status:
+            return None
+
+        updated = session.model_copy(update={"status": target_status, "updated_at": self._clock()})
+        data: dict[str, Any] = {"session": updated.model_dump(mode="json")}
+        if identity is not None:
+            data = {**_source_data(identity, offset=offset), **data}
+        event = await self._event_bus.publish(
+            Event(event="session.updated", session_id=session.id, data=data)
+        )
+        # Materialize into the repository so subsequent ``get_session`` calls
+        # reflect the new status. Skip buffering (session is known to exist).
+        if self._repository is not None:
+            try:
+                self._repository.materialize_event(
+                    event, store_event=not self._event_bus.stores_events
+                )
+            except SessionNotFoundError:
+                pass
+        return event
 
     def _materialize_or_buffer(self, event: Event) -> None:
         if self._repository is None:
@@ -263,6 +347,7 @@ class TranscriptWatchService:
         roots: Iterable[str | Path],
         observer: ExternalTranscriptObserver,
         watcher: Watcher | None = None,
+        freshness_interval_seconds: float = 10.0,
     ) -> None:
         self._roots = tuple(Path(root) for root in roots)
         self._observer = observer
@@ -272,13 +357,35 @@ class TranscriptWatchService:
             self._watcher = awatch
         else:
             raise RuntimeError("watchfiles is required for live transcript watching")
+        self._freshness_interval_seconds = freshness_interval_seconds
 
     async def watch_forever(self, *, stop_event: object | None = None) -> None:
-        async for changes in self._watcher(*self._roots, stop_event=stop_event):
-            for _change, changed_path in changes:
-                path = Path(changed_path)
-                if path.suffix == ".jsonl":
-                    await self._observer.tail_file(path)
+        freshness_task = asyncio.create_task(self._freshness_loop())
+        try:
+            async for changes in self._watcher(*self._roots, stop_event=stop_event):
+                for _change, changed_path in changes:
+                    path = Path(changed_path)
+                    if path.suffix == ".jsonl":
+                        await self._observer.tail_file(path)
+        finally:
+            freshness_task.cancel()
+            try:
+                await freshness_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _freshness_loop(self) -> None:
+        # Walks the observer's last-event map and flips silent sessions to
+        # idle. Errors are logged and swallowed so a transient repository
+        # blip can't take down the whole watch service.
+        while True:
+            try:
+                await asyncio.sleep(self._freshness_interval_seconds)
+                await self._observer.freshness_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Observer freshness tick failed")
 
 
 def claude_project_dir_name(cwd: str | Path) -> str:

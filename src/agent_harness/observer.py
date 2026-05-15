@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from json import JSONDecodeError
 from pathlib import Path
 from collections.abc import AsyncIterator, Callable, Iterable
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import (
@@ -56,10 +56,44 @@ class TranscriptIdentity:
     session_id: str
 
 
+class ObserverOffsetStore(Protocol):
+    def get_observer_offsets(self) -> dict[str, int]:
+        pass
+
+    def set_observer_offset(self, path: str, next_offset: int) -> None:
+        pass
+
+
+def _offset_store_from(repository: object) -> "ObserverOffsetStore | None":
+    # Duck-type: SQLite-backed repositories expose persistence; the
+    # in-memory repository does not. We don't synthesize an in-memory
+    # store because the existing ``next_offsets`` dict already plays
+    # that role for the observer's lifetime.
+    if repository is None:
+        return None
+    get = getattr(repository, "get_observer_offsets", None)
+    setter = getattr(repository, "set_observer_offset", None)
+    if callable(get) and callable(setter):
+        return repository  # type: ignore[return-value]
+    return None
+
+
 @dataclass(slots=True)
 class ObserverState:
     seen_offsets: dict[Path, set[int]] = field(default_factory=dict)
     next_offsets: dict[Path, int] = field(default_factory=dict)
+    # Write-through store for ``next_offsets``. Without it the observer
+    # loses its place on harness restart and re-emits every transcript
+    # line — the 2026-05-15 MM flood.
+    offset_store: ObserverOffsetStore | None = None
+
+    @classmethod
+    def from_store(cls, store: ObserverOffsetStore) -> "ObserverState":
+        persisted = store.get_observer_offsets()
+        return cls(
+            next_offsets={Path(p): int(off) for p, off in persisted.items()},
+            offset_store=store,
+        )
 
     def mark_seen(self, path: Path, offset: int) -> bool:
         offsets = self.seen_offsets.setdefault(path, set())
@@ -73,6 +107,15 @@ class ObserverState:
 
     def set_next_offset(self, path: Path, offset: int) -> None:
         self.next_offsets[path] = offset
+        if self.offset_store is not None:
+            try:
+                self.offset_store.set_observer_offset(str(path), offset)
+            except Exception:
+                logger.exception(
+                    "Failed to persist observer offset for %s; in-memory "
+                    "state is up to date but a restart will re-tail.",
+                    path,
+                )
 
 
 class ExternalTranscriptObserver:
@@ -85,7 +128,14 @@ class ExternalTranscriptObserver:
     ) -> None:
         self._event_bus = event_bus
         self._repository = repository
-        self._state = state or ObserverState()
+        if state is None:
+            offset_store = _offset_store_from(repository)
+            state = (
+                ObserverState.from_store(offset_store)
+                if offset_store is not None
+                else ObserverState()
+            )
+        self._state = state
         self._pending_materialization: dict[str, list[Event]] = {}
 
     async def tail_file(self, path: str | Path) -> list[Event]:

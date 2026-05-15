@@ -585,3 +585,73 @@ def test_startup_reconcile_leaves_terminal_runs_untouched(tmp_path) -> None:
         assert reopened.get_session(session.id).status == "idle"
     finally:
         reopened.close()
+
+
+def test_observer_offsets_persist_across_reopen(tmp_path) -> None:
+    """Transcript tail offsets must survive a harness restart — otherwise the
+    observer re-reads every transcript from the start on each boot and
+    re-emits every historical event into the durable event bus (the
+    2026-05-15 message-flood). Upsert is keyed by path."""
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+
+    assert repo.get_observer_offsets() == {}
+
+    repo.set_observer_offset("/transcripts/a.jsonl", 256)
+    repo.set_observer_offset("/transcripts/b.jsonl", 128)
+    # Upsert: later write to the same key replaces the earlier value.
+    repo.set_observer_offset("/transcripts/a.jsonl", 512)
+    repo.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        assert reopened.get_observer_offsets() == {
+            "/transcripts/a.jsonl": 512,
+            "/transcripts/b.jsonl": 128,
+        }
+    finally:
+        reopened.close()
+
+
+def test_observer_offsets_table_creation_is_idempotent_on_legacy_db(tmp_path) -> None:
+    """The migration must not destroy data on a DB that predates this
+    change. Simulate an old DB (sessions + events but no
+    ``observer_offsets`` table) and verify a fresh open backfills the
+    table without touching existing rows."""
+    db_path = tmp_path / "harness.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        legacy.executescript(
+            """
+            create table sessions (
+                id text primary key,
+                payload text not null,
+                created_at text not null,
+                updated_at text not null
+            );
+            create table events (
+                row_id integer primary key autoincrement,
+                sequence integer,
+                event text not null,
+                session_id text,
+                run_id text,
+                payload text not null,
+                created_at text not null
+            );
+            insert into sessions(id, payload, created_at, updated_at)
+                values ('keep-me', '{}', '2026-05-15T00:00:00Z', '2026-05-15T00:00:00Z');
+            """
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    repo = open_sqlite_repository(db_path)
+    try:
+        assert repo.get_observer_offsets() == {}
+        repo.set_observer_offset("/transcripts/a.jsonl", 42)
+        survivor = repo._connection.execute("select id from sessions").fetchone()
+        assert survivor["id"] == "keep-me"
+        assert repo.get_observer_offsets() == {"/transcripts/a.jsonl": 42}
+    finally:
+        repo.close()

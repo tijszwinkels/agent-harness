@@ -878,3 +878,185 @@ def test_inmemory_repo_materialize_allows_updates_to_external() -> None:
     after = repository.get_session(initial.id)
     assert after.model == "claude-opus-4-7"
     assert after.origin == "external"
+
+
+# -----------------------------------------------------------------------------
+# Observer session-status freshness (2026-05-15)
+# -----------------------------------------------------------------------------
+# External (observer-tracked) sessions get stamped ``status="running"`` at
+# synthesis and never transition back. ``ExternalTranscriptObserver`` now
+# tracks per-session last-event time and flips status both ways: silent for
+# >threshold → idle, fresh event on an idle session → running again.
+
+
+def _make_codex_transcript(tmp_path: Path) -> tuple[Path, str]:
+    """Return (transcript_path, session_id) primed with a minimal codex
+    rollout that already includes cwd/model so the first tail synthesizes
+    a session record."""
+    transcript = (
+        tmp_path
+        / ".codex" / "sessions" / "2026" / "05" / "08"
+        / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n',
+        encoding="utf-8",
+    )
+    return transcript, "codex_123e4567-e89b-12d3-a456-426614174000"
+
+
+@pytest.mark.asyncio
+async def test_observer_freshness_tick_flips_silent_session_to_idle(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    transcript, session_id = _make_codex_transcript(tmp_path)
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC)
+    clock = lambda: now  # noqa: E731 — small fake-clock closure
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, idle_after_seconds=30.0, clock=clock,
+    )
+
+    await observer.tail_file(transcript)
+    assert repository.get_session(session_id).status == "running"
+
+    # Advance 31s past the last transcript event and tick.
+    now = now + timedelta(seconds=31)
+    await observer.freshness_tick()
+
+    assert repository.get_session(session_id).status == "idle"
+    # A session.updated event must be published so SSE subscribers see the flip.
+    events = await bus.replay(session_id=session_id)
+    status_events = [
+        e for e in events
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("status") == "idle"
+    ]
+    assert len(status_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_observer_freshness_tick_leaves_fresh_session_running(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    transcript, session_id = _make_codex_transcript(tmp_path)
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC)
+    clock = lambda: now  # noqa: E731
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, idle_after_seconds=30.0, clock=clock,
+    )
+
+    await observer.tail_file(transcript)
+
+    # Advance only 10s — well under the threshold.
+    now = now + timedelta(seconds=10)
+    await observer.freshness_tick()
+
+    assert repository.get_session(session_id).status == "running"
+
+
+@pytest.mark.asyncio
+async def test_observer_kicks_idle_session_back_to_running_on_new_event(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    transcript, session_id = _make_codex_transcript(tmp_path)
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC)
+    clock = lambda: now  # noqa: E731
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, idle_after_seconds=30.0, clock=clock,
+    )
+
+    await observer.tail_file(transcript)
+    # Move past threshold, tick → idle.
+    now = now + timedelta(seconds=31)
+    await observer.freshness_tick()
+    assert repository.get_session(session_id).status == "idle"
+
+    # Append a new transcript line — the observer should flip the session
+    # back to "running" and publish a session.updated.
+    with transcript.open("a", encoding="utf-8") as f:
+        f.write('{"type":"event_msg","payload":{"type":"user_message","message":"second"}}\n')
+    now = now + timedelta(seconds=1)
+    await observer.tail_file(transcript)
+
+    assert repository.get_session(session_id).status == "running"
+    running_flips = [
+        e for e in await bus.replay(session_id=session_id)
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("status") == "running"
+    ]
+    # Two: the original creation + the kick-back.
+    assert len(running_flips) >= 2
+
+
+@pytest.mark.asyncio
+async def test_observer_freshness_tick_does_not_emit_duplicate_idle_events(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    transcript, session_id = _make_codex_transcript(tmp_path)
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC)
+    clock = lambda: now  # noqa: E731
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, idle_after_seconds=30.0, clock=clock,
+    )
+
+    await observer.tail_file(transcript)
+    now = now + timedelta(seconds=31)
+    await observer.freshness_tick()
+    await observer.freshness_tick()  # second tick on already-idle session
+
+    idle_events = [
+        e for e in await bus.replay(session_id=session_id)
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("status") == "idle"
+    ]
+    assert len(idle_events) == 1, "freshness tick must be idempotent on already-idle sessions"
+
+
+@pytest.mark.asyncio
+async def test_observer_freshness_tick_only_flips_silent_sessions(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    # Two distinct codex rollouts, only one goes silent.
+    a_dir = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    a_dir.mkdir(parents=True)
+    transcript_a = a_dir / "rollout-2026-05-08T10-30-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+    transcript_b = a_dir / "rollout-2026-05-08T10-30-00-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+    init_payload = '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+    transcript_a.write_text(init_payload, encoding="utf-8")
+    transcript_b.write_text(init_payload, encoding="utf-8")
+    session_a = "codex_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    session_b = "codex_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=UTC)
+    clock = lambda: now  # noqa: E731
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, idle_after_seconds=30.0, clock=clock,
+    )
+
+    await observer.tail_file(transcript_a)
+    await observer.tail_file(transcript_b)
+
+    # 20s later, only B receives a new line — A stays silent.
+    now = now + timedelta(seconds=20)
+    with transcript_b.open("a", encoding="utf-8") as f:
+        f.write('{"type":"event_msg","payload":{"type":"user_message","message":"keepalive"}}\n')
+    await observer.tail_file(transcript_b)
+
+    # 20s further (40s since A's last activity, 20s since B's) — tick.
+    now = now + timedelta(seconds=20)
+    await observer.freshness_tick()
+
+    assert repository.get_session(session_a).status == "idle"
+    assert repository.get_session(session_b).status == "running"

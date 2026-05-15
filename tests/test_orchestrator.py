@@ -14,6 +14,7 @@ from agent_harness.orchestrator import (
     RunProcess,
     SubmitResult,
     default_stdout_parsers,
+    parse_codex_stream_line,
 )
 
 
@@ -399,12 +400,128 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
     assert events[-1].event == "run.interrupted"
 
 
-def test_default_stdout_parsers_is_empty() -> None:
-    # Stream parsing of assistant JSON records on stdout was removed: the
-    # transcript file observer is the single source of "message" events.
-    # Keep this asserted so a future change can't quietly re-introduce the
-    # double-ingestion bug by re-registering a parser here.
-    assert default_stdout_parsers() == {}
+def test_default_stdout_parsers_registers_codex_only() -> None:
+    # Claude stdout remains delta-only because the transcript observer can
+    # tag claude events with the harness session id. Codex needs a stdout
+    # parser because codex exec --json uses an independent rollout UUID.
+    assert default_stdout_parsers() == {"codex": parse_codex_stream_line}
+
+
+def test_parse_codex_stream_line_extracts_agent_message() -> None:
+    record = {
+        "type": "item.completed",
+        "item": {"id": "item_0", "type": "agent_message", "text": "hello from codex"},
+    }
+
+    events = parse_codex_stream_line(json.dumps(record))
+
+    assert len(events) == 1
+    name, data = events[0]
+    assert name == "message"
+    assert data["source_type"] == "agent_message"
+    assert data["message"]["role"] == "assistant"
+    assert data["message"]["model"] is None
+    assert data["message"]["blocks"] == [{"type": "text", "text": "hello from codex"}]
+
+
+def test_parse_codex_stream_line_ignores_tool_use_records() -> None:
+    for record in (
+        {"type": "thread.started", "thread_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4"},
+        {"type": "turn.started"},
+        {"type": "turn.completed"},
+        {
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "true", "status": "completed"},
+        },
+        {"type": "item.completed", "item": {"type": "web_search", "query": "docs"}},
+    ):
+        assert parse_codex_stream_line(json.dumps(record)) == []
+
+
+def test_parse_codex_stream_line_ignores_malformed_json_and_empty_messages() -> None:
+    assert parse_codex_stream_line("not json") == []
+    assert parse_codex_stream_line("") == []
+    assert parse_codex_stream_line(json.dumps({"type": "item.completed"})) == []
+    assert parse_codex_stream_line(json.dumps({"type": "item.completed", "item": {}})) == []
+    assert parse_codex_stream_line(
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message"}})
+    ) == []
+    assert parse_codex_stream_line(
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": ""}})
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_run_process_emits_structured_message_for_codex_agent_message_stdout() -> None:
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    assistant_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "agent_message", "text": "hello from codex"},
+        }
+    ).encode()
+    process = FakeProcess(stdout=[assistant_line + b"\n"], returncode=0)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert result.status == "completed"
+    assert [event.event for event in events] == [
+        "run.started",
+        "message.delta",
+        "message",
+        "run.completed",
+    ]
+    assert events[1].data == {"stream": "stdout", "text": assistant_line.decode()}
+    assert events[2].session_id == session.id
+    assert events[2].run_id == run.id
+    assert events[2].data["message"]["role"] == "assistant"
+    assert events[2].data["message"]["blocks"] == [{"type": "text", "text": "hello from codex"}]
+
+
+@pytest.mark.asyncio
+async def test_run_process_leaves_external_codex_stdout_delta_only() -> None:
+    bus = InMemoryEventBus()
+    session = make_session("codex").model_copy(update={"origin": "external", "id": "codex_external"})
+    run = make_run(session, origin="external")
+    assistant_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "agent_message", "text": "hello from codex"},
+        }
+    ).encode()
+    process = FakeProcess(stdout=[assistant_line + b"\n"], returncode=0)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "resume", "--json", "external", "hello")),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert [event.event for event in events] == ["run.started", "message.delta", "run.completed"]
 
 
 @pytest.mark.asyncio

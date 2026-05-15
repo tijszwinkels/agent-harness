@@ -459,6 +459,13 @@ class SQLiteRepository:
             self._insert_event(published)
             if published.event in RUN_LIFECYCLE_EVENTS:
                 self._materialize_run_lifecycle_event(published)
+            if (
+                published.event == "message"
+                and published.session_id
+                and published.data.get("origin") != "external"
+                and self._find_session_locked(published.session_id) is not None
+            ):
+                self._materialize_message_event(published, dedupe_by_content=False)
         return published.model_copy(deep=True)
 
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
@@ -489,25 +496,46 @@ class SQLiteRepository:
                 return
 
             if event.event == "message":
-                message_data = event.data.get("message")
-                if event.session_id and isinstance(message_data, dict):
-                    session = self._find_session_locked(event.session_id)
-                    if session is None:
-                        logger.warning(
-                            "SQLite event materialization skipped message because session was not found: %s",
-                            event.session_id,
-                        )
-                        raise SessionNotFoundError(event.session_id)
-                    message = Message.model_validate(message_data)
-                    if self._insert_message_if_new(event.session_id, message):
-                        self._upsert_session(
-                            session.model_copy(
-                                update={
-                                    "updated_at": utc_now(),
-                                    "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
-                                }
-                            )
-                        )
+                self._materialize_message_event(event)
+
+    def _materialize_message_event(self, event: Event, *, dedupe_by_content: bool = True) -> None:
+        message_data = event.data.get("message")
+        if not event.session_id or not isinstance(message_data, dict):
+            return
+
+        session = self._find_session_locked(event.session_id)
+        if session is None:
+            logger.warning(
+                "SQLite event materialization skipped message because session was not found: %s",
+                event.session_id,
+            )
+            raise SessionNotFoundError(event.session_id)
+
+        message = Message.model_validate(message_data)
+        inserted = (
+            self._insert_message_if_new(event.session_id, message)
+            if dedupe_by_content
+            else self._insert_message_without_content_dedupe(event.session_id, message)
+        )
+        if inserted:
+            self._upsert_session(
+                session.model_copy(
+                    update={
+                        "updated_at": utc_now(),
+                        "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
+                    }
+                )
+            )
+
+    def _insert_message_without_content_dedupe(self, session_id: str, message: Message) -> bool:
+        row = self._connection.execute(
+            "select 1 from messages where message_id = ?",
+            (message.id,),
+        ).fetchone()
+        if row is not None:
+            return False
+        self._insert_message(session_id, message)
+        return True
 
     def upsert_session(self, session: Session) -> None:
         with self._lock, self._connection:

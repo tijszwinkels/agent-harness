@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import deque
@@ -163,13 +164,41 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
 StdoutParser = Callable[[str], list[tuple[str, dict[str, Any]]]]
 
 
+def parse_codex_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
+    if not line:
+        return []
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(record, Mapping):
+        return []
+    if record.get("type") != "item.completed":
+        return []
+    item = record.get("item")
+    if not isinstance(item, Mapping) or item.get("type") != "agent_message":
+        return []
+    text = item.get("text")
+    if not isinstance(text, str) or not text:
+        return []
+
+    message = Message(role="assistant", blocks=[TextBlock(text=text)], model=None)
+    return [
+        (
+            "message",
+            {
+                "message": message.model_dump(mode="json"),
+                "source_type": "agent_message",
+            },
+        )
+    ]
+
+
 def default_stdout_parsers() -> dict[str, StdoutParser]:
-    # No structured stdout parsers: ``message`` events are published
-    # exclusively by ``ExternalTranscriptObserver`` from the backend's rollout
-    # JSONL. RunProcess still emits ``message.delta`` raw stdout lines and the
-    # ``run.*`` lifecycle events, which is enough for typing indicators and
-    # log streaming.
-    return {}
+    # Claude messages still come exclusively from ExternalTranscriptObserver,
+    # but codex exec --json cannot be pinned to the harness session id. Its
+    # assistant messages must be synthesized from stdout under the harness run.
+    return {"codex": parse_codex_stream_line}
 
 
 def validate_session_resume_target(session: Session) -> None:
@@ -307,7 +336,7 @@ class RunProcess:
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
         parser: StdoutParser | None = None
-        if stream_name == "stdout":
+        if stream_name == "stdout" and self.session.origin == "harness":
             parser = self._stdout_parsers.get(self.session.backend)
         while line := await stream.readline():
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")

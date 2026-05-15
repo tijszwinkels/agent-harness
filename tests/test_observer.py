@@ -373,6 +373,34 @@ async def test_observer_buffers_messages_until_external_session_exists(tmp_path)
     assert messages[0].blocks[0].text == "hello"
 
 
+@pytest.mark.asyncio
+async def test_durable_observer_buffers_messages_until_external_session_exists(tmp_path) -> None:
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "\n".join(
+            [
+                '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}',
+                '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    observer = ExternalTranscriptObserver(DurableEventBus(repository), repository=repository)
+
+    try:
+        await observer.tail_file(transcript)
+
+        messages = repository.list_messages("codex_123e4567-e89b-12d3-a456-426614174000")
+        assert [message.role for message in messages] == ["user"]
+        assert messages[0].blocks[0].text == "hello"
+    finally:
+        repository.close()
+
+
 def test_parser_skips_message_records_without_text() -> None:
     identity = transcript_identity_from_path(
         codex_transcript_path(

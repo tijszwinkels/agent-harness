@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
 TModel = TypeVar("TModel", bound=BaseModel)
+RUN_LIFECYCLE_EVENTS = {"run.started", "run.completed", "run.failed", "run.interrupted"}
+RUN_TERMINAL_EVENTS = RUN_LIFECYCLE_EVENTS - {"run.started"}
 
 _SCHEMA = """
 create table if not exists schema_migrations (
@@ -424,6 +426,8 @@ class SQLiteRepository:
         with self._lock, self._connection:
             published = event.with_sequence(self._next_event_sequence_locked())
             self._insert_event(published)
+            if published.event in RUN_LIFECYCLE_EVENTS:
+                self._materialize_run_lifecycle_event(published)
         return published.model_copy(deep=True)
 
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
@@ -449,7 +453,7 @@ class SQLiteRepository:
                         self._upsert_session(incoming)
                 return
 
-            if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
+            if event.event in RUN_LIFECYCLE_EVENTS:
                 self._materialize_run_lifecycle_event(event)
                 return
 
@@ -642,7 +646,7 @@ class SQLiteRepository:
         update: dict[str, object] = {"status": status_by_event[event.event]}
         if event.event == "run.started" and run.started_at is None:
             update["started_at"] = event.created_at
-        if event.event in {"run.completed", "run.failed", "run.interrupted"}:
+        if event.event in RUN_TERMINAL_EVENTS:
             update["completed_at"] = event.created_at
         if event.event == "run.interrupted":
             update["stop_reason"] = "interrupted"

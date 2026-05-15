@@ -4,7 +4,7 @@ import contextlib
 import pytest
 
 from agent_harness.events import DurableEventBus, InMemoryEventBus
-from agent_harness.models import Event
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
 from agent_harness.storage import open_sqlite_repository
 
 
@@ -148,6 +148,49 @@ async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> No
     assert second.sequence == 2
     assert [event.sequence for event in replayed] == [1, 2]
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_lifecycle_publish_rolls_back_when_materialization_fails(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="finish atomically"))
+    repository.start_run(session.id, run.id)
+    bus = DurableEventBus(repository)
+
+    def fail_materialization(event):
+        if event.event == "run.completed":
+            raise RuntimeError("simulated crash after append")
+        return original_materialize(event)
+
+    original_materialize = repository._materialize_run_lifecycle_event
+    monkeypatch.setattr(repository, "_materialize_run_lifecycle_event", fail_materialization)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await bus.publish(
+            Event(
+                event="run.completed",
+                session_id=session.id,
+                run_id=run.id,
+                data={"returncode": 0},
+            )
+        )
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        events = reopened.list_events(session_id=session.id, run_id=run.id)
+        assert [event.event for event in events] == []
+        assert reopened.get_run(session.id, run.id).status == "failed"
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio

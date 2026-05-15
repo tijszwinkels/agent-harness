@@ -3,12 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
-import logging
 from typing import Protocol
 
 from agent_harness.models import Event
-
-logger = logging.getLogger(__name__)
 
 
 class EventRepository(Protocol):
@@ -164,7 +161,6 @@ class DurableEventBus:
     async def publish(self, event: Event) -> Event:
         async with self._lock:
             published = self._repository.append_event(event)
-            self._materialize_lifecycle_event(published)
             subscribers = tuple(self._subscribers)
 
         for subscriber in subscribers:
@@ -238,21 +234,6 @@ class DurableEventBus:
         finally:
             with suppress(RuntimeError):
                 await self._unregister(queue)
-
-    def _materialize_lifecycle_event(self, event: Event) -> None:
-        if event.event not in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
-            return
-        try:
-            self._repository.materialize_event(event, store_event=False)
-        except Exception:
-            logger.exception(
-                "Failed to materialize durable run lifecycle event: event=%s session=%s run=%s sequence=%s",
-                event.event,
-                event.session_id,
-                event.run_id,
-                event.sequence,
-            )
-
 
 def _matches(event: Event, *, after: int, session_id: str | None) -> bool:
     if event.sequence is None or event.sequence <= after:

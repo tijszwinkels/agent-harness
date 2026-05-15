@@ -1063,6 +1063,53 @@ async def test_observer_freshness_tick_only_flips_silent_sessions(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_observer_seeds_last_event_at_from_existing_running_sessions() -> None:
+    """A fresh observer process (post-restart) must heal pre-existing stale
+    running sessions on its first freshness tick. The 2026-05-15 deployment
+    of #7 left 82 records stuck on running because the observer's
+    ``_last_event_at`` map only populated from NEW transcript events — old
+    sessions whose transcripts hadn't been written to since restart were
+    never tracked. Seed the map from the repository at construction."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    stale_external = Session(
+        id="codex_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+        updated_at=datetime(2026, 5, 11, 12, 0, 0, tzinfo=UTC),  # >1 week old
+    )
+    repository.upsert_session(stale_external)
+
+    # External-origin only — harness-origin sessions are managed by
+    # finish_run, not the observer freshness tick.
+    harness_running = Session(
+        id="ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        updated_at=datetime(2026, 5, 11, 12, 0, 0, tzinfo=UTC),
+    )
+    repository.upsert_session(harness_running)
+
+    bus = InMemoryEventBus()
+    now = datetime(2026, 5, 15, 21, 36, 30, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, idle_after_seconds=30.0, clock=lambda: now,
+    )
+
+    await observer.freshness_tick()
+
+    assert repository.get_session(stale_external.id).status == "idle"
+    assert repository.get_session(harness_running.id).status == "running"
+
+
+@pytest.mark.asyncio
 async def test_watch_service_runs_freshness_tick_alongside_watcher(tmp_path) -> None:
     """Integration: ``TranscriptWatchService`` must spawn the freshness loop
     while the file watcher is alive. A regression that drops the

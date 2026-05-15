@@ -152,6 +152,30 @@ class ExternalTranscriptObserver:
         # threshold flips silent sessions to idle; a fresh event on an idle
         # session kicks it back to running.
         self._last_event_at: dict[str, datetime] = {}
+        # Seed last-seen timestamps from the repository so freshness_tick
+        # can heal records that pre-date this process. Without this seed,
+        # restarts leave already-stale running sessions stranded — the
+        # observer offset persistence (d7658fd) means existing transcripts
+        # are not re-scanned, so _last_event_at would stay empty for them.
+        self._seed_last_event_at_from_repository()
+
+    def _seed_last_event_at_from_repository(self) -> None:
+        if self._repository is None:
+            return
+        try:
+            sessions = self._repository.list_sessions()
+        except Exception:
+            logger.exception("Failed to seed observer last-event map from repository")
+            return
+        for session in sessions:
+            if session.origin != "external":
+                continue
+            # Use the session's updated_at as a proxy for the last transcript
+            # event. It may be earlier than the actual rollout mtime, but the
+            # freshness tick only cares about the running→idle threshold —
+            # any timestamp older than the threshold flips the session
+            # exactly once, which is the desired migration behavior.
+            self._last_event_at[session.id] = session.updated_at
 
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)

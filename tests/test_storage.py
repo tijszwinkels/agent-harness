@@ -2,7 +2,7 @@ import sqlite3
 
 from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Project, Session
 from agent_harness.repository import InMemoryRepository
-from agent_harness.storage import open_sqlite_repository
+from agent_harness.storage import SCHEMA_VERSION, open_sqlite_repository
 
 
 def test_sqlite_repository_persists_sessions_runs_and_messages_after_reopen(tmp_path) -> None:
@@ -338,6 +338,65 @@ def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:
         }
 
     assert {"schema_migrations", "sessions", "runs", "messages", "events"} <= tables
+
+
+def test_open_sqlite_repository_records_current_schema_version(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+
+    repository = open_sqlite_repository(db_path)
+    repository.close()
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "select version from schema_migrations order by version"
+        ).fetchall()
+
+    assert rows == [(SCHEMA_VERSION,)]
+
+
+def test_open_sqlite_repository_bumps_legacy_schema_version(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "create table schema_migrations(version integer primary key, applied_at text not null)"
+        )
+        connection.execute(
+            "insert into schema_migrations(version, applied_at) values (?, ?)",
+            (SCHEMA_VERSION - 1, "2000-01-01T00:00:00+00:00"),
+        )
+
+    repository = open_sqlite_repository(db_path)
+    repository.close()
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute("select max(version) from schema_migrations").fetchone()
+
+    assert row == (SCHEMA_VERSION,)
+
+
+def test_open_sqlite_repository_replaces_schema_migration_metadata(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    stale_applied_at = "2000-01-01T00:00:00+00:00"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "create table schema_migrations(version integer primary key, applied_at text not null)"
+        )
+        connection.execute(
+            "insert into schema_migrations(version, applied_at) values (?, ?)",
+            (SCHEMA_VERSION, stale_applied_at),
+        )
+
+    repository = open_sqlite_repository(db_path)
+    repository.close()
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "select applied_at from schema_migrations where version = ?",
+            (SCHEMA_VERSION,),
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] != stale_applied_at
 
 
 def test_startup_reconciles_dangling_running_runs_and_sessions(tmp_path) -> None:

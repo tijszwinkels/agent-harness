@@ -499,7 +499,7 @@ class SQLiteRepository:
         with self._lock, self._connection:
             self._connection.executescript(_SCHEMA)
             self._connection.execute(
-                "insert or ignore into schema_migrations(version, applied_at) values (?, ?)",
+                "insert or replace into schema_migrations(version, applied_at) values (?, ?)",
                 (SCHEMA_VERSION, utc_now().isoformat()),
             )
 

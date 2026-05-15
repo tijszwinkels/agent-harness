@@ -167,6 +167,14 @@ class CreateSessionRequest(HarnessModel):
     bypass_permissions: bool = False
 
 
+class PatchSessionRequest(HarnessModel):
+    # Patch payload for ``PATCH /v1/sessions/{id}``. Only the listed fields
+    # are user-mutable; everything else on Session is either derived
+    # (status, stats, updated_at) or immutable (id, backend, origin,
+    # created_at). Unset fields are left untouched.
+    title: str | None = None
+
+
 class CreateRunRequest(HarnessModel):
     message: str = Field(min_length=1)
     model: str | None = None

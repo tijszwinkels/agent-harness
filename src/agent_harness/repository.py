@@ -69,6 +69,21 @@ class InMemoryRepository:
             self._sessions[session_id] = archived
             return archived.model_copy(deep=True)
 
+    def patch_session(self, session_id: str, fields: dict[str, object]) -> Session:
+        # Apply the given user-mutable fields to the session, bumping
+        # ``updated_at``. Unknown or empty payloads return the current
+        # session unchanged (no-op). Caller (api.py) is responsible for
+        # whitelisting fields against ``PatchSessionRequest``.
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            if not fields:
+                return session.model_copy(deep=True)
+            updated = session.model_copy(update={**fields, "updated_at": utc_now()})
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
         # Runs are born ``queued`` and stay that way until the orchestrator
         # actually spawns the subprocess (via ``start_run``). This lets the

@@ -136,6 +136,8 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
     get:
       tags: [Runs]
       operationId: listSessionRuns
@@ -186,7 +188,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Run"
+                $ref: "#/components/schemas/InterruptRunResponse"
         "404":
           $ref: "#/components/responses/Error"
         "409":
@@ -215,21 +217,6 @@ paths:
         "404":
           $ref: "#/components/responses/Error"
         "409":
-          $ref: "#/components/responses/Error"
-
-  /v1/sessions/{id}/runs/{run_id}/events:
-    parameters:
-      - $ref: "#/components/parameters/SessionId"
-      - $ref: "#/components/parameters/RunId"
-      - $ref: "#/components/parameters/EventFrom"
-    get:
-      tags: [Events, Runs]
-      operationId: streamRunEvents
-      summary: Stream events for one run.
-      responses:
-        "200":
-          $ref: "#/components/responses/EventStream"
-        "404":
           $ref: "#/components/responses/Error"
 
   /v1/sessions/{id}/events:
@@ -365,6 +352,9 @@ components:
           $ref: "#/components/schemas/Project"
         title:
           type: [string, "null"]
+        bypass_permissions:
+          type: boolean
+          default: false
         created_at:
           type: string
           format: date-time
@@ -586,6 +576,9 @@ components:
           $ref: "#/components/schemas/Project"
         title:
           type: [string, "null"]
+        bypass_permissions:
+          type: boolean
+          default: false
 
     CreateRunRequest:
       type: object
@@ -599,12 +592,26 @@ components:
 
     CreateRunResponse:
       type: object
-      required: [session_id, run_id]
+      required: [session_id, run_id, status]
       properties:
         session_id:
           type: string
         run_id:
           type: string
+        status:
+          type: string
+          enum: [queued, running, completed, failed, interrupted]
+
+    InterruptRunResponse:
+      type: object
+      required: [run, dropped_queued]
+      properties:
+        run:
+          $ref: "#/components/schemas/Run"
+        dropped_queued:
+          type: array
+          items:
+            $ref: "#/components/schemas/Run"
 
     ForkSessionRequest:
       type: object

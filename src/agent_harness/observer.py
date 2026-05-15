@@ -101,6 +101,14 @@ class ExternalTranscriptObserver:
             with transcript_path.open("rb") as transcript:
                 transcript.seek(self._state.next_offset(transcript_path))
                 while line := transcript.readline():
+                    # Lines without a trailing newline are partial flushes by
+                    # the writer — leave the offset put so the next tail_file
+                    # invocation re-reads from the start of the partial line
+                    # once the rest (and the newline) arrives. Without this,
+                    # the offset would advance past half a JSON object and
+                    # the assistant turn would be lost.
+                    if not line.endswith(b"\n"):
+                        break
                     start_offset = transcript.tell() - len(line)
                     end_offset = transcript.tell()
                     published.extend(
@@ -147,7 +155,7 @@ class ExternalTranscriptObserver:
             return
 
         try:
-            self._repository.materialize_event(event)
+            self._repository.materialize_event(event, store_event=not self._event_bus.stores_events)
         except SessionNotFoundError:
             if event.event == "message" and event.session_id:
                 self._buffer_materialization(event)
@@ -187,7 +195,7 @@ class ExternalTranscriptObserver:
         still_pending: list[Event] = []
         for event in pending:
             try:
-                self._repository.materialize_event(event)
+                self._repository.materialize_event(event, store_event=not self._event_bus.stores_events)
             except SessionNotFoundError:
                 still_pending.append(event)
 
@@ -254,10 +262,20 @@ def codex_transcript_path(
 
 
 def external_session_id_from_claude_path(path: str | Path) -> str:
+    # Canonical form: ``ses_<32hex>``. This matches the shape harness-origin
+    # claude sessions use (see ``_harness_session_id_as_uuid``), so an
+    # external observation and a harness spawn of the *same* claude session
+    # UUID produce the *same* session id — no more duplicate session
+    # records / duplicate MM channels per terminal session.
     transcript_path = Path(path)
     if transcript_path.suffix != ".jsonl" or not transcript_path.stem:
         raise ValueError(f"Not a Claude Code transcript path: {transcript_path}")
-    return f"claude_{transcript_path.stem}"
+    hex_part = transcript_path.stem.replace("-", "")
+    if len(hex_part) != 32 or not all(c in "0123456789abcdef" for c in hex_part.lower()):
+        raise ValueError(
+            f"Claude Code transcript stem is not a UUID: {transcript_path.stem!r}",
+        )
+    return f"ses_{hex_part.lower()}"
 
 
 def external_session_id_from_codex_path(path: str | Path) -> str:
@@ -537,8 +555,11 @@ def _message_event(
     return Event(event="message", session_id=identity.session_id, data=data)
 
 
-def _blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:
+def blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:
     return _blocks_from_content(message.get("content"))
+
+
+_blocks_from_claude_message = blocks_from_claude_message
 
 
 def _blocks_from_codex_payload(payload: Mapping[str, Any]) -> list[MessageBlock]:

@@ -13,8 +13,15 @@ from fastapi.encoders import jsonable_encoder
 from starlette.responses import StreamingResponse
 
 from agent_harness.backends import BackendRegistry, default_backend_registry
-from agent_harness.events import InMemoryEventBus
-from agent_harness.models import CreateRunRequest, CreateRunResponse, CreateSessionRequest, Event, StopReason
+from agent_harness.events import DurableEventBus, InMemoryEventBus
+from agent_harness.models import (
+    CreateRunRequest,
+    CreateRunResponse,
+    CreateSessionRequest,
+    Event,
+    InterruptRunResponse,
+    StopReason,
+)
 from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchService
 from agent_harness.orchestrator import (
     BackendCommandBuilder,
@@ -31,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 OBSERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
+# Idle interval after which `_sse_stream` injects an SSE comment (`:ka\n\n`)
+# so the wire never goes silent for too long. Without keepalives, a client
+# with a stale "future" cursor sees no events at all after a harness restart
+# (the in-memory bus filters them out by sequence), and httpx waits forever.
+# A 15s cadence pairs with a 45s client read timeout to recover from such
+# silent-stuck streams within ~one minute.
+SSE_KEEPALIVE_SECONDS = 15.0
+
 
 class WatchService(Protocol):
     async def watch_forever(self, *, stop_event: object | None = None) -> None:
@@ -44,7 +59,7 @@ TaskFactory = Callable[[Awaitable[None]], asyncio.Task[None]]
 def create_app(
     *,
     repository: InMemoryRepository | None = None,
-    event_bus: InMemoryEventBus | None = None,
+    event_bus: InMemoryEventBus | DurableEventBus | None = None,
     backend_registry: BackendRegistry | None = None,
     observer_settings: ObserverSettings | None = None,
     watch_service_factory: WatchServiceFactory | None = None,
@@ -53,7 +68,7 @@ def create_app(
     command_builders: Mapping[str, BackendCommandBuilder] | None = None,
 ) -> FastAPI:
     repo = repository or InMemoryRepository()
-    events = event_bus or InMemoryEventBus()
+    events = event_bus or _event_bus_for_repository(repo)
     backends = backend_registry or default_backend_registry()
     settings = observer_settings or ObserverSettings()
     builders = command_builders or default_command_builders()
@@ -167,25 +182,91 @@ def create_app(
             logger.warning("Run create failed because session was not found: %s", session_id)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
 
+        run_status = run.status
         if run_manager is not None:
             try:
                 session = preflight_session or repo.get_session(session_id)
                 message = _input_message_for_run(repo.list_messages(session_id), run.input_message_id)
                 builder = builders[session.backend]
-                run_manager.start(session=session, run=run, command=builder.build(session=session, run=run, message=message))
-                _schedule_run_result_materialization(run_manager, repo, session_id=session_id, run_id=run.id)
+                # repo.create_run already inserted ``run``; if it's the only
+                # row, this is the session's first run and the builder may
+                # need a creation flag instead of a resume flag.
+                is_first_run = len(repo.list_runs(session_id)) <= 1
+                command = builder.build(
+                    session=session,
+                    run=run,
+                    message=message,
+                    is_first_run=is_first_run,
+                )
             except KeyError as exc:
                 logger.warning("No command builder configured for backend: %s", session.backend)
+                # The run is in the repo but cannot be launched — leaving it
+                # ``queued`` forever would deadlock the session. Flip it to
+                # ``failed`` so the user-visible state matches what happened.
+                repo.finish_run(session_id, run.id, status="failed")
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Backend cannot launch runs") from exc
             except CommandBuildError as exc:
                 logger.warning("Run command build failed: session=%s run=%s error=%s", session_id, run.id, exc)
+                repo.finish_run(session_id, run.id, status="failed")
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
             except ValueError as exc:
                 logger.warning("Run command build failed: session=%s run=%s error=%s", session_id, run.id, exc)
+                repo.finish_run(session_id, run.id, status="failed")
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+            # ``on_start`` is invoked by the RunManager at the exact moment
+            # the subprocess actually spawns — that may be right now (no
+            # active run for this session) or arbitrarily later (after the
+            # current run for this session finishes draining the queue).
+            # Coupling repo.start_run + materialization scheduling to that
+            # moment keeps the repo's lifecycle aligned with the orchestrator.
+            #
+            # The two operations are isolated: if ``start_run`` raises
+            # (e.g. the run was already finalized via a concurrent path),
+            # the materializer must still be scheduled — otherwise the run
+            # would stay stuck at ``queued`` in the repo forever even after
+            # the subprocess completes.
+            def on_start(_session_id: str = session_id, _run_id: str = run.id) -> None:
+                try:
+                    repo.start_run(_session_id, _run_id)
+                except Exception:
+                    logger.exception(
+                        "on_start: repo.start_run raised — proceeding with materializer scheduling: session=%s run=%s",
+                        _session_id, _run_id,
+                    )
+                _schedule_run_result_materialization(
+                    run_manager, repo, session_id=_session_id, run_id=_run_id,
+                )
+
+            result = run_manager.submit(
+                session=session,
+                run=run,
+                command=command,
+                on_start=on_start,
+            )
+            if not result.accepted:
+                logger.warning(
+                    "Run rejected: session=%s run=%s reason=%s", session_id, run.id, result.reason,
+                )
+                repo.finish_run(session_id, run.id, status="failed")
+                if result.reason == "queue_full":
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Per-session run queue is full; retry after the active run completes.",
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Run rejected: {result.reason}",
+                )
+            run_status = result.status or run.status
         else:
             await events.publish(Event(event="run.started", session_id=session_id, run_id=run.id, data={}))
-        return CreateRunResponse(session_id=session_id, run_id=run.id)
+            # The no-run_manager path is used by tests that just want repo
+            # bookkeeping without a real subprocess; mark the run "running"
+            # to mirror pre-queue semantics.
+            repo.start_run(session_id, run.id)
+            run_status = "running"
+        return CreateRunResponse(session_id=session_id, run_id=run.id, status=run_status)
 
     @app.get("/v1/sessions/{session_id}/runs")
     async def list_runs(session_id: str) -> dict[str, object]:
@@ -207,9 +288,11 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found") from exc
 
     @app.delete("/v1/sessions/{session_id}/runs/{run_id}")
-    async def interrupt_run(session_id: str, run_id: str) -> object:
+    async def interrupt_run(session_id: str, run_id: str) -> InterruptRunResponse:
+        # Confirm the target exists up-front so we never empty the queue for
+        # a 404 request.
         try:
-            run = repo.interrupt_run(session_id, run_id)
+            repo.get_run(session_id, run_id)
         except SessionNotFoundError as exc:
             logger.warning("Run interrupt failed because session was not found: %s", session_id)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
@@ -217,15 +300,45 @@ def create_app(
             logger.warning("Run interrupt failed: session=%s run=%s", session_id, run_id)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found") from exc
 
-        await events.publish(Event(event="run.interrupted", session_id=session_id, run_id=run.id, data={}))
-        return run
+        # Drop the orchestrator queue first so the in-flight run's
+        # ``_run_and_forget`` finally-block doesn't immediately spawn a
+        # follow-up that's about to be cancelled in the repo. ``run_manager``
+        # is the source of truth for "what's queued to spawn"; the repo only
+        # records the resulting status flips.
+        if run_manager is not None:
+            run_manager.drop_queued(session_id)
+        dropped_in_repo = repo.drop_queued_runs(session_id)
+
+        # Terminate the subprocess if the target is currently running. Safe
+        # no-op when the target was queued (already handled by drop above).
+        if run_manager is not None:
+            await run_manager.interrupt(session_id, run_id)
+
+        # Mark the target as interrupted. Idempotent against drop_queued_runs
+        # for queued targets — the second flip is a no-op state-wise.
+        try:
+            target = repo.interrupt_run(session_id, run_id)
+        except RunNotFoundError as exc:  # pragma: no cover - shouldn't happen
+            logger.warning("Run vanished between preflight and interrupt: %s", run_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found") from exc
+
+        other_dropped = [r for r in dropped_in_repo if r.id != run_id]
+        await events.publish(
+            Event(
+                event="run.interrupted",
+                session_id=session_id,
+                run_id=run_id,
+                data={"dropped_queued_run_ids": [r.id for r in other_dropped]},
+            )
+        )
+        return InterruptRunResponse(run=target, dropped_queued=other_dropped)
 
     @app.get("/v1/events")
     async def stream_events(
         after: int = Query(default=0, ge=0),
         from_: str = Query(default="now", alias="from"),
     ) -> StreamingResponse:
-        replay_after = 0 if from_ == "beginning" else after
+        replay_after = await _replay_after(events, after=after, from_=from_)
         return StreamingResponse(_sse_stream(events, after=replay_after), media_type="text/event-stream")
 
     @app.get("/v1/sessions/{session_id}/events")
@@ -234,22 +347,9 @@ def create_app(
         after: int = Query(default=0, ge=0),
         from_: str = Query(default="now", alias="from"),
     ) -> StreamingResponse:
-        replay_after = 0 if from_ == "beginning" else after
+        replay_after = await _replay_after(events, after=after, from_=from_, session_id=session_id)
         return StreamingResponse(
             _sse_stream(events, after=replay_after, session_id=session_id),
-            media_type="text/event-stream",
-        )
-
-    @app.get("/v1/sessions/{session_id}/runs/{run_id}/events")
-    async def stream_run_events(
-        session_id: str,
-        run_id: str,
-        after: int = Query(default=0, ge=0),
-        from_: str = Query(default="now", alias="from"),
-    ) -> StreamingResponse:
-        replay_after = 0 if from_ == "beginning" else after
-        return StreamingResponse(
-            _sse_stream(events, after=replay_after, session_id=session_id, run_id=run_id),
             media_type="text/event-stream",
         )
 
@@ -259,7 +359,7 @@ def create_app(
 def _lifespan(
     *,
     repository: InMemoryRepository,
-    event_bus: InMemoryEventBus,
+    event_bus: InMemoryEventBus | DurableEventBus,
     observer_settings: ObserverSettings,
     watch_service_factory: WatchServiceFactory | None,
     task_factory: TaskFactory | None,
@@ -303,6 +403,14 @@ def _lifespan(
                 await _stop_observer_task(observer_task, stop_event)
 
     return lifespan
+
+
+def _event_bus_for_repository(repository: InMemoryRepository) -> InMemoryEventBus | DurableEventBus:
+    append_event = getattr(repository, "append_event", None)
+    list_events = getattr(repository, "list_events", None)
+    if callable(append_event) and callable(list_events):
+        return DurableEventBus(repository)
+    return InMemoryEventBus()
 
 
 def _create_watch_service(
@@ -402,14 +510,39 @@ def _log_observer_task_result(task: asyncio.Task[None]) -> None:
 
 
 async def _sse_stream(
-    event_bus: InMemoryEventBus,
+    event_bus: InMemoryEventBus | DurableEventBus,
     *,
     after: int = 0,
     session_id: str | None = None,
-    run_id: str | None = None,
+    keepalive_seconds: float = SSE_KEEPALIVE_SECONDS,
 ) -> AsyncIterator[str]:
-    async for event in event_bus.subscribe(after=after, session_id=session_id, run_id=run_id):
+    # ``subscribe`` yields ``None`` after each silent ``keepalive_seconds``
+    # window; surface those as SSE comment frames so clients never see the
+    # wire go quiet for longer than the interval. Real events round-trip
+    # unchanged.
+    async for event in event_bus.subscribe(
+        after=after,
+        session_id=session_id,
+        keepalive_seconds=keepalive_seconds,
+    ):
+        if event is None:
+            yield ": ka\n\n"
+            continue
         yield _format_sse(event)
+
+
+async def _replay_after(
+    event_bus: InMemoryEventBus | DurableEventBus,
+    *,
+    after: int,
+    from_: str,
+    session_id: str | None = None,
+) -> int:
+    if after > 0:
+        return after
+    if from_ == "beginning":
+        return 0
+    return await event_bus.max_sequence(session_id=session_id)
 
 
 def _format_sse(event: Event) -> str:

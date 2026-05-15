@@ -1,3 +1,4 @@
+from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.cli import main
 
 
@@ -39,6 +40,43 @@ def test_serve_command_builds_app_for_database(monkeypatch, tmp_path) -> None:
 
     assert opened == [str(database)]
     assert calls[0][0][0] != "agent_harness.api:app"
+
+
+def test_serve_command_uses_durable_bus_for_database_and_execute_runs(monkeypatch, tmp_path) -> None:
+    calls = []
+    repository = object()
+    app = object()
+
+    def fake_create_app(**kwargs):
+        calls.append(kwargs)
+        return app
+
+    monkeypatch.setattr("agent_harness.cli.create_app", fake_create_app)
+    monkeypatch.setattr("agent_harness.cli.open_sqlite_repository", lambda _path: repository)
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", lambda *_args, **_kwargs: None)
+
+    assert main(["serve", "--database", str(tmp_path / "harness.db"), "--execute-runs"]) == 0
+
+    event_bus = calls[0]["event_bus"]
+    assert calls[0]["repository"] is repository
+    assert isinstance(event_bus, DurableEventBus)
+    assert calls[0]["run_manager"]._event_bus is event_bus
+
+
+def test_serve_command_keeps_in_memory_bus_for_execute_runs_without_database(monkeypatch) -> None:
+    calls = []
+    app = object()
+
+    def fake_create_app(**kwargs):
+        calls.append(kwargs)
+        return app
+
+    monkeypatch.setattr("agent_harness.cli.create_app", fake_create_app)
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", lambda *_args, **_kwargs: None)
+
+    assert main(["serve", "--execute-runs"]) == 0
+
+    assert isinstance(calls[0]["event_bus"], InMemoryEventBus)
 
 
 def test_serve_command_builds_app_for_real_run_execution(monkeypatch) -> None:

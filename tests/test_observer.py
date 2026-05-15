@@ -15,7 +15,7 @@ from agent_harness.observer import (
     parse_transcript_line,
     transcript_identity_from_path,
 )
-from agent_harness.models import Message, Session
+from agent_harness.models import Event, Message, Project, Session
 from agent_harness.repository import InMemoryRepository
 
 
@@ -26,8 +26,12 @@ def test_claude_transcript_path_and_external_id_helpers() -> None:
         "/tmp/home/.claude/projects/-home-me-project/123e4567-e89b-12d3-a456-426614174000.jsonl"
     )
     assert claude_project_dir_name("/home/me/project") == "-home-me-project"
-    assert external_session_id_from_claude_path(path) == "claude_123e4567-e89b-12d3-a456-426614174000"
-    assert transcript_identity_from_path(path).session_id == "claude_123e4567-e89b-12d3-a456-426614174000"
+    # Canonical form: ses_<32hex>. Same shape as harness-origin session ids,
+    # so the external observer and harness-spawn paths produce equivalent ids
+    # for the same underlying claude session UUID (no more dual session records
+    # / duplicate MM channels for one terminal claude session).
+    assert external_session_id_from_claude_path(path) == "ses_123e4567e89b12d3a456426614174000"
+    assert transcript_identity_from_path(path).session_id == "ses_123e4567e89b12d3a456426614174000"
 
 
 def test_codex_transcript_path_and_external_id_helpers() -> None:
@@ -209,6 +213,41 @@ async def test_observer_deduplicates_by_file_offset(tmp_path) -> None:
 
     assert len(first) == 1
     assert second == []
+
+
+@pytest.mark.asyncio
+async def test_observer_holds_offset_until_partial_line_completes(tmp_path) -> None:
+    """Regression: ``tail_file`` used to advance ``next_offset`` past a
+    line that was only partially flushed by the writer, which caused the
+    next read to start mid-record and lose the assistant turn.
+
+    Now: a line without a trailing newline is treated as incomplete; the
+    offset is held until the rest of the line (with newline) lands, and
+    the complete line is then published exactly once.
+    """
+    path = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = path / "rollout-2026-05-08T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    transcript.parent.mkdir(parents=True)
+    # First flush: one complete record + the first half of a second record.
+    full_first = '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n'
+    partial_second = '{"type":"event_msg","payload":{"type":"user_message","message":"hal'
+    transcript.write_bytes((full_first + partial_second).encode("utf-8"))
+    observer = ExternalTranscriptObserver(InMemoryEventBus())
+
+    first = await observer.tail_file(transcript)
+    # Only the complete record is published; the partial tail is held.
+    assert len(first) == 1
+    assert first[0].event == "message"
+
+    # Writer flushes the rest of the second record with a final newline.
+    with transcript.open("ab") as f:
+        f.write(b'f-finished"}}\n')
+
+    second = await observer.tail_file(transcript)
+    # The second record is delivered exactly once, with its content intact.
+    assert len(second) == 1, "partial line was skipped or duplicated"
+    assert second[0].event == "message"
+    assert second[0].data["message"]["blocks"][0]["text"] == "half-finished"
 
 
 @pytest.mark.asyncio
@@ -646,3 +685,94 @@ async def test_watch_service_uses_changed_jsonl_paths(tmp_path) -> None:
     await service.watch_forever()
 
     assert [event.event for event in await bus.replay()] == ["session.updated"]
+
+
+def test_inmemory_repo_materialize_preserves_harness_origin() -> None:
+    """Mirror of the storage.py test for the in-memory path: observer's
+    session.updated event must not downgrade a harness-origin session to
+    external (otherwise the bridge replaces it on the next MM post)."""
+    repository = InMemoryRepository()
+    from agent_harness.models import CreateSessionRequest
+
+    harness_session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+            bypass_permissions=True,
+        )
+    )
+    assert harness_session.origin == "harness"
+
+    observer_payload = harness_session.model_copy(
+        update={"origin": "external", "bypass_permissions": False}
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=harness_session.id,
+            data={"session": observer_payload.model_dump(mode="json")},
+        )
+    )
+
+    after = repository.get_session(harness_session.id)
+    assert after.origin == "harness"
+    assert after.bypass_permissions is True
+
+
+def test_inmemory_repo_materialize_creates_when_absent() -> None:
+    repository = InMemoryRepository()
+    external = Session(
+        id="ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=external.id,
+            data={"session": external.model_dump(mode="json")},
+        )
+    )
+    after = repository.get_session(external.id)
+    assert after.origin == "external"
+
+
+def test_inmemory_repo_materialize_allows_updates_to_external() -> None:
+    repository = InMemoryRepository()
+    initial = Session(
+        id="ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+        backend="claude-code",
+        model="claude-opus-4-6",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="external",
+    )
+    repository.materialize_event(
+        Event(
+            sequence=1,
+            event="session.updated",
+            session_id=initial.id,
+            data={"session": initial.model_dump(mode="json")},
+        )
+    )
+    repository.materialize_event(
+        Event(
+            sequence=2,
+            event="session.updated",
+            session_id=initial.id,
+            data={
+                "session": initial.model_copy(
+                    update={"model": "claude-opus-4-7"}
+                ).model_dump(mode="json")
+            },
+        )
+    )
+    after = repository.get_session(initial.id)
+    assert after.model == "claude-opus-4-7"
+    assert after.origin == "external"

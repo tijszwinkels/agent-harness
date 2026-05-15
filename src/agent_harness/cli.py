@@ -6,7 +6,7 @@ from collections.abc import Sequence
 import uvicorn
 
 from agent_harness.api import create_app
-from agent_harness.events import InMemoryEventBus
+from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.orchestrator import RunManager
 from agent_harness.settings import ObserverSettings
 from agent_harness.storage import open_sqlite_repository
@@ -78,10 +78,11 @@ def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings
 
     kwargs = {"observer_settings": observer_settings}
     repository = open_sqlite_repository(args.database) if args.database else None
+    event_bus = DurableEventBus(repository) if repository is not None else InMemoryEventBus()
     if repository is not None:
         kwargs["repository"] = repository
+        kwargs["event_bus"] = event_bus
     if args.execute_runs:
-        event_bus = InMemoryEventBus()
         kwargs["event_bus"] = event_bus
         kwargs["run_manager"] = RunManager(event_bus=event_bus)
     return create_app(**kwargs)

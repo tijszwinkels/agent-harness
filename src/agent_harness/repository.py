@@ -2,7 +2,18 @@ from __future__ import annotations
 
 from threading import RLock
 
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Run, RunStatus, Session, StopReason, utc_now
+from agent_harness.models import (
+    CreateRunRequest,
+    CreateSessionRequest,
+    Event,
+    Message,
+    RUN_TERMINAL_STATUSES,
+    Run,
+    RunStatus,
+    Session,
+    StopReason,
+    utc_now,
+)
 
 
 class SessionNotFoundError(KeyError):
@@ -26,6 +37,7 @@ class InMemoryRepository:
             model=request.model,
             project=request.project,
             title=request.title,
+            bypass_permissions=request.bypass_permissions,
         )
         with self._lock:
             self._sessions[session.id] = session
@@ -58,6 +70,10 @@ class InMemoryRepository:
             return archived.model_copy(deep=True)
 
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
+        # Runs are born ``queued`` and stay that way until the orchestrator
+        # actually spawns the subprocess (via ``start_run``). This lets the
+        # RunManager serialize concurrent ``POST /runs`` calls on the same
+        # session without lying about lifecycle state in the repo.
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -66,8 +82,8 @@ class InMemoryRepository:
             input_message = Message.user(request.message)
             run = Run(
                 session_id=session.id,
-                status="running",
-                started_at=utc_now(),
+                status="queued",
+                started_at=None,
                 input_message_id=input_message.id,
                 origin="harness",
             )
@@ -82,6 +98,44 @@ class InMemoryRepository:
             self._runs[run.id] = run
             self._messages.setdefault(session_id, []).append(input_message)
             return run.model_copy(deep=True)
+
+    def start_run(self, session_id: str, run_id: str) -> Run:
+        # Flip a queued run to ``running``, stamping ``started_at``. Idempotent:
+        # calling on an already-running run just refreshes the timestamp.
+        with self._lock:
+            if session_id not in self._sessions:
+                raise SessionNotFoundError(session_id)
+            run = self._runs.get(run_id)
+            if run is None or run.session_id != session_id:
+                raise RunNotFoundError(run_id)
+
+            started = run.model_copy(update={"status": "running", "started_at": utc_now()})
+            self._runs[run_id] = started
+            return started.model_copy(deep=True)
+
+    def drop_queued_runs(self, session_id: str) -> list[Run]:
+        # Mark every still-queued run for this session as ``interrupted`` and
+        # return the resulting Run records. Used by ``interrupt_run`` flow so
+        # callers can observe (and surface to clients) which queued follow-ups
+        # were cancelled as a side-effect of cancelling the active run.
+        with self._lock:
+            if session_id not in self._sessions:
+                raise SessionNotFoundError(session_id)
+            dropped: list[Run] = []
+            now = utc_now()
+            for run_id, run in list(self._runs.items()):
+                if run.session_id != session_id or run.status != "queued":
+                    continue
+                interrupted = run.model_copy(
+                    update={
+                        "status": "interrupted",
+                        "completed_at": now,
+                        "stop_reason": "interrupted",
+                    }
+                )
+                self._runs[run_id] = interrupted
+                dropped.append(interrupted.model_copy(deep=True))
+            return dropped
 
     def list_runs(self, session_id: str) -> list[Run]:
         with self._lock:
@@ -105,6 +159,13 @@ class InMemoryRepository:
             run = self._runs.get(run_id)
             if run is None or run.session_id != session_id:
                 raise RunNotFoundError(run_id)
+
+            # First-terminal-wins: a late DELETE on an already-completed
+            # run must not rewrite its outcome (see investigation
+            # 2026-05-15 where an 11-min-late interrupt corrupted the
+            # historical record).
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run.model_copy(deep=True)
 
             interrupted = run.model_copy(
                 update={
@@ -140,7 +201,21 @@ class InMemoryRepository:
                 }
             )
             self._runs[run_id] = finished
-            self._sessions[session_id] = session.model_copy(update={"status": "idle", "updated_at": utc_now()})
+            # Only flip the session to idle if no other run for this
+            # session is still queued or running. A successor may have
+            # been promoted from the per-session FIFO queue before this
+            # finish_run was scheduled — if so, leaving the session at
+            # idle would contradict the repo's actual state.
+            other_active = any(
+                r.session_id == session_id
+                and r.id != run_id
+                and r.status in ("queued", "running")
+                for r in self._runs.values()
+            )
+            if not other_active:
+                self._sessions[session_id] = session.model_copy(
+                    update={"status": "idle", "updated_at": utc_now()}
+                )
             return finished.model_copy(deep=True)
 
     def list_messages(self, session_id: str) -> list[Message]:
@@ -149,17 +224,64 @@ class InMemoryRepository:
                 raise SessionNotFoundError(session_id)
             return [message.model_copy(deep=True) for message in self._messages.get(session_id, [])]
 
-    def materialize_event(self, event: Event) -> None:
+    def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
+        del store_event
         if event.event == "session.updated":
             session_data = event.data.get("session")
             if isinstance(session_data, dict):
-                self.upsert_session(Session.model_validate(session_data))
+                incoming = Session.model_validate(session_data)
+                with self._lock:
+                    existing = self._sessions.get(incoming.id)
+                # The external transcript observer always emits payloads
+                # with origin="external"; if a harness-spawned record
+                # already exists under the canonical ses_<hex> id, skip
+                # the upsert so we don't downgrade its origin /
+                # bypass_permissions / etc. See test_storage.py for the
+                # rationale (a downgrade causes the bridge to adopt the
+                # channel away from the live session on next MM post).
+                if existing is None or existing.origin == "external":
+                    self.upsert_session(incoming)
+            return
+
+        if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
+            self._materialize_run_lifecycle_event(event)
             return
 
         if event.event == "message":
             message_data = event.data.get("message")
             if event.session_id and isinstance(message_data, dict):
                 self.add_message(event.session_id, Message.model_validate(message_data))
+
+    def _materialize_run_lifecycle_event(self, event: Event) -> None:
+        if event.session_id is None or event.run_id is None:
+            return
+        with self._lock:
+            run = self._runs.get(event.run_id)
+            if run is None or run.session_id != event.session_id:
+                return
+
+            # First-terminal-wins (see ``interrupt_run``): once a run is
+            # in a terminal status, a later lifecycle event from a
+            # different source (e.g. API-published ``run.interrupted``
+            # for an already-completed run) must not overwrite it.
+            if run.status in RUN_TERMINAL_STATUSES:
+                return
+
+            status_by_event: dict[str, RunStatus] = {
+                "run.started": "running",
+                "run.completed": "completed",
+                "run.failed": "failed",
+                "run.interrupted": "interrupted",
+            }
+            update: dict[str, object] = {"status": status_by_event[event.event]}
+            if event.event == "run.started" and run.started_at is None:
+                update["started_at"] = event.created_at
+            if event.event in {"run.completed", "run.failed", "run.interrupted"}:
+                update["completed_at"] = event.created_at
+            if event.event == "run.interrupted":
+                update["stop_reason"] = "interrupted"
+
+            self._runs[event.run_id] = run.model_copy(update=update)
 
     def upsert_session(self, session: Session) -> None:
         with self._lock:

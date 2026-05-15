@@ -10,6 +10,7 @@ BackendName = Literal["claude-code", "codex"]
 Origin = Literal["harness", "external"]
 SessionStatus = Literal["idle", "running", "waiting_for_input", "archived"]
 RunStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
+RUN_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "interrupted"})
 StopReason = Literal["end_turn", "tool_use", "max_tokens", "interrupted"]
 MessageRole = Literal["user", "assistant"]
 ToolMode = Literal["granular", "name-list", "none"]
@@ -140,6 +141,10 @@ class Session(HarnessModel):
     status: SessionStatus = "idle"
     origin: Origin = "harness"
     stats: SessionStats = Field(default_factory=SessionStats)
+    # When True, builders pass the backend's permission-bypass flag
+    # (`--dangerously-skip-permissions` for claude-code,
+    # `--dangerously-bypass-approvals-and-sandbox` for codex).
+    bypass_permissions: bool = False
 
 
 class Event(HarnessModel):
@@ -159,6 +164,7 @@ class CreateSessionRequest(HarnessModel):
     model: str = Field(min_length=1)
     project: Project
     title: str | None = None
+    bypass_permissions: bool = False
 
 
 class CreateRunRequest(HarnessModel):
@@ -169,6 +175,19 @@ class CreateRunRequest(HarnessModel):
 class CreateRunResponse(HarnessModel):
     session_id: str
     run_id: str
+    # "running" when the harness spawned the subprocess immediately, "queued"
+    # when the session already had an in-flight run and this one is waiting.
+    status: RunStatus = "running"
+
+
+class InterruptRunResponse(HarnessModel):
+    # ``run`` is the run targeted by the DELETE — interrupted whether it was
+    # actively running or merely queued. ``dropped_queued`` lists *other*
+    # runs that were sitting in the session's queue and got dropped as a
+    # side-effect (a DELETE on any run empties the per-session queue, since
+    # the user is signalling they want this conversation flow stopped).
+    run: Run
+    dropped_queued: list[Run] = Field(default_factory=list)
 
 
 class DataList(HarnessModel):

@@ -13,6 +13,7 @@ from agent_harness.models import (
     CreateSessionRequest,
     Event,
     Message,
+    RUN_TERMINAL_STATUSES,
     Run,
     RunStatus,
     Session,
@@ -23,8 +24,10 @@ from agent_harness.repository import RunNotFoundError, SessionNotFoundError
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TModel = TypeVar("TModel", bound=BaseModel)
+RUN_LIFECYCLE_EVENTS = {"run.started", "run.completed", "run.failed", "run.interrupted"}
+RUN_TERMINAL_EVENTS = RUN_LIFECYCLE_EVENTS - {"run.started"}
 
 _SCHEMA = """
 create table if not exists schema_migrations (
@@ -86,6 +89,78 @@ class SQLiteRepository:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("pragma foreign_keys = on")
         self._initialize_schema()
+        self._reconcile_dangling_state()
+
+    def _reconcile_dangling_state(self) -> None:
+        # Run/session liveness lives in the in-memory ``RunManager``; on a
+        # harness restart that state is gone but the SQLite rows persist.
+        # Without this sweep, runs left at ``running`` / ``queued`` and
+        # harness-owned sessions stuck at ``running`` would lie about their
+        # state forever (the orchestrator never re-attaches to a dead
+        # subprocess). Flip them to terminal/idle so a fresh process can
+        # resume cleanly.
+        #
+        # External sessions (``origin == "external"``) are excluded: their
+        # lifecycle is owned by the transcript observer + the actual CLI
+        # process (claude-code / codex), not by the in-memory RunManager.
+        # A live external session legitimately stays ``running`` across
+        # harness restarts; idling it here would lie in the other direction.
+        with self._lock, self._connection:
+            run_rows = self._connection.execute(
+                """
+                select id, session_id, payload
+                from runs
+                where json_extract(payload, '$.status') in ('queued', 'running')
+                """,
+            ).fetchall()
+            now = utc_now()
+            failed_runs = 0
+            for row in run_rows:
+                try:
+                    run = _model_from_row(row, "payload", Run)
+                except Exception:
+                    logger.exception(
+                        "Skipping run during startup reconcile: id=%s",
+                        row["id"],
+                    )
+                    continue
+                reconciled = run.model_copy(
+                    update={"status": "failed", "completed_at": now},
+                )
+                self._upsert_run(reconciled)
+                failed_runs += 1
+
+            session_rows = self._connection.execute(
+                """
+                select id, payload
+                from sessions
+                where json_extract(payload, '$.status') = 'running'
+                  and json_extract(payload, '$.origin') = 'harness'
+                """,
+            ).fetchall()
+            idle_sessions = 0
+            for row in session_rows:
+                try:
+                    session = _model_from_row(row, "payload", Session)
+                except Exception:
+                    logger.exception(
+                        "Skipping session during startup reconcile: id=%s",
+                        row["id"],
+                    )
+                    continue
+                self._upsert_session(
+                    session.model_copy(
+                        update={"status": "idle", "updated_at": now},
+                    )
+                )
+                idle_sessions += 1
+
+        if failed_runs or idle_sessions:
+            logger.info(
+                "Startup reconcile: marked %d run(s) failed, %d session(s) idle",
+                failed_runs,
+                idle_sessions,
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -97,6 +172,7 @@ class SQLiteRepository:
             model=request.model,
             project=request.project,
             title=request.title,
+            bypass_permissions=request.bypass_permissions,
         )
         with self._lock, self._connection:
             self._upsert_session(session)
@@ -130,6 +206,8 @@ class SQLiteRepository:
         return archived.model_copy(deep=True)
 
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
+        # Runs are born ``queued`` and stay that way until the orchestrator
+        # spawns the subprocess (see ``start_run``). Mirrors InMemoryRepository.
         with self._lock, self._connection:
             session = self._find_session_locked(session_id)
             if session is None:
@@ -139,8 +217,8 @@ class SQLiteRepository:
             input_message = Message.user(request.message)
             run = Run(
                 session_id=session.id,
-                status="running",
-                started_at=utc_now(),
+                status="queued",
+                started_at=None,
                 input_message_id=input_message.id,
                 origin="harness",
             )
@@ -155,6 +233,50 @@ class SQLiteRepository:
             self._upsert_run(run)
             self._insert_message(session_id, input_message)
         return run.model_copy(deep=True)
+
+    def start_run(self, session_id: str, run_id: str) -> Run:
+        with self._lock, self._connection:
+            if self._find_session_locked(session_id) is None:
+                logger.warning("SQLite run start failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            row = self._connection.execute(
+                "select payload from runs where id = ? and session_id = ?",
+                (run_id, session_id),
+            ).fetchone()
+            if row is None:
+                logger.warning("SQLite run start failed: session=%s run=%s", session_id, run_id)
+                raise RunNotFoundError(run_id)
+
+            run = _model_from_row(row, "payload", Run)
+            started = run.model_copy(update={"status": "running", "started_at": utc_now()})
+            self._upsert_run(started)
+        return started.model_copy(deep=True)
+
+    def drop_queued_runs(self, session_id: str) -> list[Run]:
+        with self._lock, self._connection:
+            if self._find_session_locked(session_id) is None:
+                logger.warning("SQLite drop_queued_runs failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            rows = self._connection.execute(
+                "select payload from runs where session_id = ?",
+                (session_id,),
+            ).fetchall()
+            dropped: list[Run] = []
+            now = utc_now()
+            for row in rows:
+                run = _model_from_row(row, "payload", Run)
+                if run.status != "queued":
+                    continue
+                interrupted = run.model_copy(
+                    update={
+                        "status": "interrupted",
+                        "completed_at": now,
+                        "stop_reason": "interrupted",
+                    }
+                )
+                self._upsert_run(interrupted)
+                dropped.append(interrupted.model_copy(deep=True))
+        return dropped
 
     def list_runs(self, session_id: str) -> list[Run]:
         with self._lock:
@@ -195,6 +317,10 @@ class SQLiteRepository:
                 raise RunNotFoundError(run_id)
 
             run = _model_from_row(row, "payload", Run)
+            # First-terminal-wins: see ``InMemoryRepository.interrupt_run``.
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run.model_copy(deep=True)
+
             interrupted = run.model_copy(
                 update={
                     "status": "interrupted",
@@ -235,7 +361,25 @@ class SQLiteRepository:
                 }
             )
             self._upsert_run(finished)
-            self._upsert_session(session.model_copy(update={"status": "idle", "updated_at": utc_now()}))
+            # Only flip the session to idle if no other run for this
+            # session is still queued or running. See the matching
+            # InMemoryRepository.finish_run comment — a successor may
+            # already be running by the time this completion is
+            # materialized.
+            other_active = self._connection.execute(
+                """
+                select 1 from runs
+                where session_id = ?
+                  and id != ?
+                  and json_extract(payload, '$.status') in ('queued', 'running')
+                limit 1
+                """,
+                (session_id, run_id),
+            ).fetchone()
+            if other_active is None:
+                self._upsert_session(
+                    session.model_copy(update={"status": "idle", "updated_at": utc_now()})
+                )
         return finished.model_copy(deep=True)
 
     def list_messages(self, session_id: str) -> list[Message]:
@@ -264,20 +408,58 @@ class SQLiteRepository:
         if run_id is not None:
             query += " and run_id = ?"
             parameters.append(run_id)
-        query += " order by row_id"
+        query += " order by sequence"
 
         with self._lock:
             rows = self._connection.execute(query, parameters).fetchall()
         return [_model_from_row(row, "payload", Event) for row in rows]
 
-    def materialize_event(self, event: Event) -> None:
+    def max_sequence(self, *, session_id: str | None = None) -> int:
+        query = "select max(sequence) from events"
+        parameters: list[object] = []
+        if session_id is not None:
+            query += " where session_id = ?"
+            parameters.append(session_id)
+
+        with self._lock:
+            row = self._connection.execute(query, parameters).fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
+    def append_event(self, event: Event) -> Event:
         with self._lock, self._connection:
-            self._insert_event(event)
+            published = event.with_sequence(self._next_event_sequence_locked())
+            self._insert_event(published)
+            if published.event in RUN_LIFECYCLE_EVENTS:
+                self._materialize_run_lifecycle_event(published)
+        return published.model_copy(deep=True)
+
+    def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
+        with self._lock, self._connection:
+            if store_event:
+                self._insert_event(event)
 
             if event.event == "session.updated":
                 session_data = event.data.get("session")
                 if isinstance(session_data, dict):
-                    self._upsert_session(Session.model_validate(session_data))
+                    incoming = Session.model_validate(session_data)
+                    existing = self._find_session_locked(incoming.id)
+                    # The external transcript observer always emits payloads
+                    # with origin="external". If a harness-spawned session
+                    # already exists under this canonical id, the observer
+                    # is not authoritative — letting the upsert run would
+                    # downgrade origin to "external", and the next bridge
+                    # restart would re-derive _external_sessions and adopt
+                    # the channel away from the live harness session. Skip
+                    # the upsert in that case; for absent or already-external
+                    # records the observer remains the source of truth.
+                    if existing is None or existing.origin == "external":
+                        self._upsert_session(incoming)
+                return
+
+            if event.event in RUN_LIFECYCLE_EVENTS:
+                self._materialize_run_lifecycle_event(event)
                 return
 
             if event.event == "message":
@@ -326,7 +508,7 @@ class SQLiteRepository:
         with self._lock, self._connection:
             self._connection.executescript(_SCHEMA)
             self._connection.execute(
-                "insert or ignore into schema_migrations(version, applied_at) values (?, ?)",
+                "insert or replace into schema_migrations(version, applied_at) values (?, ?)",
                 (SCHEMA_VERSION, utc_now().isoformat()),
             )
 
@@ -412,25 +594,79 @@ class SQLiteRepository:
         return True
 
     def _insert_event(self, event: Event) -> None:
+        stored = event
+        if stored.sequence is None:
+            stored = event.with_sequence(self._next_event_sequence_locked())
         self._connection.execute(
             """
             insert into events(sequence, event, session_id, run_id, payload, created_at)
             values (?, ?, ?, ?, ?, ?)
             """,
             (
+                stored.sequence,
+                stored.event,
+                stored.session_id,
+                stored.run_id,
+                stored.model_dump_json(),
+                stored.created_at.isoformat(),
+            ),
+        )
+
+    def _next_event_sequence_locked(self) -> int:
+        row = self._connection.execute("select coalesce(max(sequence), 0) + 1 from events").fetchone()
+        if row is None:
+            logger.error("SQLite event sequence lookup returned no row")
+            raise RuntimeError("Failed to allocate event sequence")
+        return int(row[0])
+
+    def _materialize_run_lifecycle_event(self, event: Event) -> None:
+        if event.session_id is None or event.run_id is None:
+            logger.warning(
+                "SQLite run lifecycle materialization skipped event without ids: event=%s sequence=%s",
+                event.event,
                 event.sequence,
+            )
+            return
+
+        row = self._connection.execute(
+            "select payload from runs where id = ? and session_id = ?",
+            (event.run_id, event.session_id),
+        ).fetchone()
+        if row is None:
+            logger.warning(
+                "SQLite run lifecycle materialization skipped missing run: event=%s session=%s run=%s",
                 event.event,
                 event.session_id,
                 event.run_id,
-                event.model_dump_json(),
-                event.created_at.isoformat(),
-            ),
-        )
+            )
+            return
+
+        run = _model_from_row(row, "payload", Run)
+        # First-terminal-wins (see ``interrupt_run``): once a run is in
+        # a terminal status, a later lifecycle event from a different
+        # source must not overwrite its outcome.
+        if run.status in RUN_TERMINAL_STATUSES:
+            return
+        status_by_event: dict[str, RunStatus] = {
+            "run.started": "running",
+            "run.completed": "completed",
+            "run.failed": "failed",
+            "run.interrupted": "interrupted",
+        }
+        update: dict[str, object] = {"status": status_by_event[event.event]}
+        if event.event == "run.started" and run.started_at is None:
+            update["started_at"] = event.created_at
+        if event.event in RUN_TERMINAL_EVENTS:
+            update["completed_at"] = event.created_at
+        if event.event == "run.interrupted":
+            update["stop_reason"] = "interrupted"
+
+        self._upsert_run(run.model_copy(update=update))
 
 
 def open_sqlite_repository(database_path: str | Path) -> SQLiteRepository:
     try:
-        connection = sqlite3.connect(database_path)
+        connection = sqlite3.connect(database_path, check_same_thread=False)
     except sqlite3.Error:
         logger.exception("Failed to open SQLite repository: %s", database_path)
         raise

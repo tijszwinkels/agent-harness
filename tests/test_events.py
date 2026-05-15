@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 
 import pytest
 
-from agent_harness.events import InMemoryEventBus
-from agent_harness.models import Event
+from agent_harness.events import DurableEventBus, InMemoryEventBus
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+from agent_harness.storage import open_sqlite_repository
 
 
 @pytest.mark.asyncio
@@ -44,14 +46,186 @@ async def test_subscribe_receives_live_events_after_replay() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replay_can_filter_by_session_and_run() -> None:
+async def test_subscribe_emits_keepalive_under_filtered_traffic() -> None:
+    """Regression: the keepalive deadline must track the SUBSCRIBER's
+    last yield, not the bus's last publish. Otherwise high-volume traffic
+    that ``_matches`` filters out (events for other sessions, or whose
+    sequence is at/below ``after``) keeps ``queue.get`` returning before
+    the timeout, and the keepalive never fires — the exact stale-cursor
+    failure mode we're trying to surface."""
+    bus = InMemoryEventBus()
+    # ``after=100`` means every published event will be filtered out
+    # (sequences start at 1). Pair with a tight keepalive window so the
+    # test runs in well under a second.
+    subscription = bus.subscribe(after=100, keepalive_seconds=0.05)
+
+    async def flood_other_session():
+        for _ in range(20):
+            await bus.publish(
+                Event(event="message", session_id="other", run_id="r", data={}),
+            )
+            await asyncio.sleep(0.01)
+
+    flooder = asyncio.create_task(flood_other_session())
+    try:
+        sentinel = await asyncio.wait_for(subscription.__anext__(), timeout=1.0)
+        assert sentinel is None
+    finally:
+        flooder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await flooder
+        await subscription.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_emits_none_sentinel_on_keepalive_window() -> None:
+    """``keepalive_seconds=N`` makes ``subscribe`` yield ``None`` whenever
+    the bus stays silent for the interval. The SSE layer renders those
+    as comment frames so clients can detect a dead/stuck stream within
+    one missed-keepalive window."""
+    bus = InMemoryEventBus()
+    subscription = bus.subscribe(after=0, keepalive_seconds=0.01)
+    try:
+        # No events published — first pull should time out and yield None.
+        sentinel = await asyncio.wait_for(subscription.__anext__(), timeout=1.0)
+        assert sentinel is None
+
+        # The subscription must survive the timeout and still deliver real
+        # events (regression guard: an earlier draft cancelled __anext__
+        # from outside, tearing down the queue via the generator's finally).
+        published = await bus.publish(
+            Event(event="run.started", session_id="ses_a", run_id="run_a", data={}),
+        )
+        delivered = await asyncio.wait_for(subscription.__anext__(), timeout=1.0)
+        assert delivered == published
+    finally:
+        await subscription.aclose()
+
+
+@pytest.mark.asyncio
+async def test_replay_can_filter_by_session() -> None:
     bus = InMemoryEventBus()
     await bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
     await bus.publish(Event(event="run.started", session_id="ses_b", run_id="run_b", data={}))
     await bus.publish(Event(event="message", session_id="ses_a", run_id="run_a", data={}))
 
     session_events = await bus.replay(session_id="ses_a")
-    run_events = await bus.replay(run_id="run_b")
 
     assert [event.sequence for event in session_events] == [1, 3]
-    assert [event.sequence for event in run_events] == [2]
+
+
+@pytest.mark.asyncio
+async def test_inmemory_event_bus_reports_max_sequence() -> None:
+    bus = InMemoryEventBus()
+
+    assert await bus.max_sequence() == 0
+    assert await bus.max_sequence(session_id="ses_a") == 0
+
+    await bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    await bus.publish(Event(event="run.started", session_id="ses_b", run_id="run_b", data={}))
+    await bus.publish(Event(event="message", session_id="ses_a", run_id="run_a", data={}))
+
+    assert await bus.max_sequence() == 3
+    assert await bus.max_sequence(session_id="ses_a") == 3
+    assert await bus.max_sequence(session_id="ses_b") == 2
+    assert await bus.max_sequence(session_id="ses_missing") == 0
+
+
+@pytest.mark.asyncio
+async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    first_bus = DurableEventBus(repository)
+    first = await first_bus.publish(Event(event="session.updated", session_id="ses_a", data={}))
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    second_bus = DurableEventBus(reopened)
+    second = await second_bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    replayed = await second_bus.replay()
+
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert [event.sequence for event in replayed] == [1, 2]
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_lifecycle_publish_rolls_back_when_materialization_fails(tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="finish atomically"))
+    repository.start_run(session.id, run.id)
+    bus = DurableEventBus(repository)
+
+    def fail_materialization(event):
+        if event.event == "run.completed":
+            raise RuntimeError("simulated crash after append")
+        return original_materialize(event)
+
+    original_materialize = repository._materialize_run_lifecycle_event
+    monkeypatch.setattr(repository, "_materialize_run_lifecycle_event", fail_materialization)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await bus.publish(
+            Event(
+                event="run.completed",
+                session_id=session.id,
+                run_id=run.id,
+                data={"returncode": 0},
+            )
+        )
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    try:
+        events = reopened.list_events(session_id=session.id, run_id=run.id)
+        assert [event.event for event in events] == []
+        assert reopened.get_run(session.id, run.id).status == "failed"
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_event_bus_reports_max_sequence(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+
+    assert await bus.max_sequence() == 0
+    assert await bus.max_sequence(session_id="ses_a") == 0
+
+    await bus.publish(Event(event="run.started", session_id="ses_a", run_id="run_a", data={}))
+    await bus.publish(Event(event="run.started", session_id="ses_b", run_id="run_b", data={}))
+    await bus.publish(Event(event="message", session_id="ses_a", run_id="run_a", data={}))
+
+    assert await bus.max_sequence() == 3
+    assert await bus.max_sequence(session_id="ses_a") == 3
+    assert await bus.max_sequence(session_id="ses_b") == 2
+    assert await bus.max_sequence(session_id="ses_missing") == 0
+    repository.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_subscribe_has_no_gap_between_replay_and_live(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+    await bus.publish(Event(event="session.updated", session_id="ses_a", data={}))
+
+    subscription = bus.subscribe(after=0, session_id="ses_a")
+    replayed = await subscription.__anext__()
+    live_event = asyncio.create_task(subscription.__anext__())
+    published = await bus.publish(Event(event="message", session_id="ses_a", data={}))
+
+    try:
+        assert replayed.sequence == 1
+        assert await asyncio.wait_for(live_event, timeout=1) == published
+    finally:
+        await subscription.aclose()
+        repository.close()

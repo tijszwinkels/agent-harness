@@ -2,7 +2,18 @@ from __future__ import annotations
 
 from threading import RLock
 
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Run, RunStatus, Session, StopReason, utc_now
+from agent_harness.models import (
+    CreateRunRequest,
+    CreateSessionRequest,
+    Event,
+    Message,
+    RUN_TERMINAL_STATUSES,
+    Run,
+    RunStatus,
+    Session,
+    StopReason,
+    utc_now,
+)
 
 
 class SessionNotFoundError(KeyError):
@@ -149,6 +160,13 @@ class InMemoryRepository:
             if run is None or run.session_id != session_id:
                 raise RunNotFoundError(run_id)
 
+            # First-terminal-wins: a late DELETE on an already-completed
+            # run must not rewrite its outcome (see investigation
+            # 2026-05-15 where an 11-min-late interrupt corrupted the
+            # historical record).
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run.model_copy(deep=True)
+
             interrupted = run.model_copy(
                 update={
                     "status": "interrupted",
@@ -240,6 +258,13 @@ class InMemoryRepository:
         with self._lock:
             run = self._runs.get(event.run_id)
             if run is None or run.session_id != event.session_id:
+                return
+
+            # First-terminal-wins (see ``interrupt_run``): once a run is
+            # in a terminal status, a later lifecycle event from a
+            # different source (e.g. API-published ``run.interrupted``
+            # for an already-completed run) must not overwrite it.
+            if run.status in RUN_TERMINAL_STATUSES:
                 return
 
             status_by_event: dict[str, RunStatus] = {

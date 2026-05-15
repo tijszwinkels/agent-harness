@@ -13,6 +13,7 @@ from agent_harness.models import (
     CreateSessionRequest,
     Event,
     Message,
+    RUN_TERMINAL_STATUSES,
     Run,
     RunStatus,
     Session,
@@ -316,6 +317,10 @@ class SQLiteRepository:
                 raise RunNotFoundError(run_id)
 
             run = _model_from_row(row, "payload", Run)
+            # First-terminal-wins: see ``InMemoryRepository.interrupt_run``.
+            if run.status in RUN_TERMINAL_STATUSES:
+                return run.model_copy(deep=True)
+
             interrupted = run.model_copy(
                 update={
                     "status": "interrupted",
@@ -637,6 +642,11 @@ class SQLiteRepository:
             return
 
         run = _model_from_row(row, "payload", Run)
+        # First-terminal-wins (see ``interrupt_run``): once a run is in
+        # a terminal status, a later lifecycle event from a different
+        # source must not overwrite its outcome.
+        if run.status in RUN_TERMINAL_STATUSES:
+            return
         status_by_event: dict[str, RunStatus] = {
             "run.started": "running",
             "run.completed": "completed",

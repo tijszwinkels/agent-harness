@@ -10,6 +10,7 @@ BackendName = Literal["claude-code", "codex"]
 Origin = Literal["harness", "external"]
 SessionStatus = Literal["idle", "running", "waiting_for_input", "archived"]
 RunStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
+RUN_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "interrupted"})
 StopReason = Literal["end_turn", "tool_use", "max_tokens", "interrupted"]
 MessageRole = Literal["user", "assistant"]
 ToolMode = Literal["granular", "name-list", "none"]

@@ -323,6 +323,111 @@ def test_finish_run_does_not_set_session_idle_when_another_run_is_active_sqlite(
         repo.close()
 
 
+def test_interrupt_run_is_noop_on_terminal_inmemory() -> None:
+    """Once a run reaches a terminal state (completed/failed/interrupted),
+    a later ``interrupt_run`` must not rewrite its status, stop_reason,
+    or completed_at — first terminal wins.
+
+    Regression: a late DELETE /runs/<id> on an already-completed run was
+    flipping ``status=completed stop_reason=end_turn`` to
+    ``status=interrupted stop_reason=interrupted``, corrupting the
+    historical record (see investigation 2026-05-15)."""
+    repo = InMemoryRepository()
+    session, run_a, _run_b = _seed_session_with_runs(repo)
+
+    completed = repo.finish_run(
+        session.id, run_a.id, status="completed", stop_reason="end_turn",
+    )
+
+    returned = repo.interrupt_run(session.id, run_a.id)
+
+    # Unchanged on disk + in the return value.
+    assert returned.status == "completed"
+    assert returned.stop_reason == "end_turn"
+    assert returned.completed_at == completed.completed_at
+    refreshed = repo.get_run(session.id, run_a.id)
+    assert refreshed.status == "completed"
+    assert refreshed.stop_reason == "end_turn"
+
+
+def test_interrupt_run_is_noop_on_terminal_sqlite(tmp_path) -> None:
+    """SQLite counterpart — same first-terminal-wins invariant."""
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+    try:
+        session, run_a, _run_b = _seed_session_with_runs(repo)
+
+        completed = repo.finish_run(
+            session.id, run_a.id, status="completed", stop_reason="end_turn",
+        )
+
+        returned = repo.interrupt_run(session.id, run_a.id)
+
+        assert returned.status == "completed"
+        assert returned.stop_reason == "end_turn"
+        assert returned.completed_at == completed.completed_at
+        refreshed = repo.get_run(session.id, run_a.id)
+        assert refreshed.status == "completed"
+        assert refreshed.stop_reason == "end_turn"
+    finally:
+        repo.close()
+
+
+def test_materialize_run_interrupted_event_skips_terminal_inmemory() -> None:
+    """When the API endpoint publishes ``run.interrupted`` for a target
+    that the repo already marked terminal, the materializer must NOT
+    rewrite its status. Same first-terminal-wins invariant via the
+    materialization path."""
+    from agent_harness.models import utc_now
+
+    repo = InMemoryRepository()
+    session, run_a, _run_b = _seed_session_with_runs(repo)
+    repo.finish_run(session.id, run_a.id, status="completed", stop_reason="end_turn")
+
+    repo.materialize_event(
+        Event(
+            event="run.interrupted",
+            session_id=session.id,
+            run_id=run_a.id,
+            sequence=999,
+            created_at=utc_now(),
+        ),
+        store_event=False,
+    )
+
+    refreshed = repo.get_run(session.id, run_a.id)
+    assert refreshed.status == "completed"
+    assert refreshed.stop_reason == "end_turn"
+
+
+def test_materialize_run_interrupted_event_skips_terminal_sqlite(tmp_path) -> None:
+    """SQLite counterpart."""
+    from agent_harness.models import utc_now
+
+    db_path = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db_path)
+    try:
+        session, run_a, _run_b = _seed_session_with_runs(repo)
+        repo.finish_run(session.id, run_a.id, status="completed", stop_reason="end_turn")
+
+        repo.materialize_event(
+            Event(
+                event="run.interrupted",
+                session_id=session.id,
+                run_id=run_a.id,
+                sequence=999,
+                created_at=utc_now(),
+            ),
+            store_event=False,
+        )
+
+        refreshed = repo.get_run(session.id, run_a.id)
+        assert refreshed.status == "completed"
+        assert refreshed.stop_reason == "end_turn"
+    finally:
+        repo.close()
+
+
 def test_open_sqlite_repository_initializes_schema(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
 

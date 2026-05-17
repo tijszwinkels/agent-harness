@@ -4,15 +4,26 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock
+from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock, utc_now
 
 logger = logging.getLogger(__name__)
+
+END_TURN_GRACE_SECONDS = 20.0
+END_TURN_HARD_KILL_AFTER_SECONDS = 40.0
+IDLE_TIMEOUT_SECONDS = 30 * 60
+IDLE_HARD_KILL_GRACE_SECONDS = 30.0
+IDLE_CHECK_INTERVAL_SECONDS = 60.0
+
+_END_TURN_EVENT = "__end_turn__"
+_ACTIVITY_EVENTS = frozenset({"message", "message.delta", "tool_use"})
 
 
 class CommandBuildError(ValueError):
@@ -173,6 +184,8 @@ def parse_codex_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
         return []
     if not isinstance(record, Mapping):
         return []
+    if record.get("type") == "turn.completed":
+        return [(_END_TURN_EVENT, {})]
     if record.get("type") != "item.completed":
         return []
     item = record.get("item")
@@ -194,11 +207,25 @@ def parse_codex_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
     ]
 
 
+def parse_claude_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
+    if not line:
+        return []
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(record, Mapping):
+        return []
+    if record.get("type") == "result" and record.get("stop_reason") == "end_turn":
+        return [(_END_TURN_EVENT, {})]
+    return []
+
+
 def default_stdout_parsers() -> dict[str, StdoutParser]:
     # Claude messages still come exclusively from ExternalTranscriptObserver,
     # but codex exec --json cannot be pinned to the harness session id. Its
     # assistant messages must be synthesized from stdout under the harness run.
-    return {"codex": parse_codex_stream_line}
+    return {"codex": parse_codex_stream_line, "claude-code": parse_claude_stream_line}
 
 
 def validate_session_resume_target(session: Session) -> None:
@@ -224,6 +251,7 @@ class ManagedProcess(Protocol):
     stdout: AsyncLineReader | None
     stderr: AsyncLineReader | None
     returncode: int | None
+    pid: int
 
     async def wait(self) -> int:
         pass
@@ -246,6 +274,7 @@ class AsyncioProcessFactory:
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
 
 
@@ -267,6 +296,8 @@ class RunProcess:
         event_bus: InMemoryEventBus,
         process_factory: ProcessFactory | None = None,
         stdout_parsers: Mapping[str, StdoutParser] | None = None,
+        clock: Callable[[], datetime] = utc_now,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.session = session
         self.run_record = run
@@ -278,6 +309,13 @@ class RunProcess:
         )
         self._process: ManagedProcess | None = None
         self._interrupted = False
+        self._clock = clock
+        self._sleep = sleep
+        self._end_turn_event = asyncio.Event()
+        self._last_activity_at = self._clock()
+        self._last_activity_event: str | None = None
+        self._watchdog_termination_in_progress = False
+        self._watchdog_termination_task: asyncio.Task[None] | None = None
 
     async def run(self) -> RunProcessResult:
         await self._publish("run.started", {})
@@ -290,14 +328,22 @@ class RunProcess:
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
 
         stream_tasks = self._stream_tasks(self._process)
+        wait_task = asyncio.create_task(self._process.wait())
+        watchdog_tasks = [
+            asyncio.create_task(self._watch_end_turn_cleanup(wait_task)),
+            asyncio.create_task(self._watch_idle_timeout(wait_task)),
+        ]
         try:
-            returncode = await self._process.wait()
+            returncode = await wait_task
             await self._finish_streams(stream_tasks)
         except Exception as exc:
             logger.exception("Run process failed while active: session=%s run=%s", self.session.id, self.run_record.id)
             await self._cancel_streams(stream_tasks)
+            await self._cancel_watchdogs(watchdog_tasks)
             await self._publish("run.failed", {"error": str(exc), "error_type": type(exc).__name__})
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
+        finally:
+            await self._finish_watchdogs(watchdog_tasks)
 
         if self._interrupted:
             await self._publish("run.interrupted", {"returncode": returncode})
@@ -336,7 +382,7 @@ class RunProcess:
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
         parser: StdoutParser | None = None
-        if stream_name == "stdout" and self.session.origin == "harness":
+        if stream_name == "stdout":
             parser = self._stdout_parsers.get(self.session.backend)
         while line := await stream.readline():
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -356,6 +402,11 @@ class RunProcess:
                 )
                 continue
             for event_name, data in events:
+                if event_name == _END_TURN_EVENT:
+                    self._end_turn_event.set()
+                    continue
+                if self.session.origin != "harness":
+                    continue
                 await self._publish(event_name, data)
 
     async def _finish_streams(self, tasks: list[asyncio.Task[None]]) -> None:
@@ -376,7 +427,153 @@ class RunProcess:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _finish_watchdogs(self, tasks: list[asyncio.Task[None]]) -> None:
+        if self._watchdog_termination_in_progress:
+            terminator = self._watchdog_termination_task
+            to_cancel = [task for task in tasks if task is not terminator]
+            await self._cancel_watchdogs(to_cancel)
+            if terminator is not None:
+                await asyncio.gather(terminator, return_exceptions=True)
+            return
+        await self._cancel_watchdogs(tasks)
+
+    async def _cancel_watchdogs(self, tasks: list[asyncio.Task[None]]) -> None:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _watch_end_turn_cleanup(self, wait_task: asyncio.Task[int]) -> None:
+        await self._end_turn_event.wait()
+        if self._process_exited(wait_task):
+            return
+
+        await self._sleep(END_TURN_GRACE_SECONDS)
+        if self._process_exited(wait_task):
+            return
+
+        self._watchdog_termination_in_progress = True
+        self._watchdog_termination_task = asyncio.current_task()
+        self._interrupted = True
+        if not self._signal_process_group(signal.SIGTERM):
+            return
+
+        hard_kill = False
+        remaining = max(0.0, END_TURN_HARD_KILL_AFTER_SECONDS - END_TURN_GRACE_SECONDS)
+        if remaining:
+            await self._wait_for_process_or_sleep(wait_task, remaining)
+
+        if not self._process_exited(wait_task):
+            hard_kill = self._signal_process_group(signal.SIGKILL)
+            if hard_kill:
+                await wait_task
+
+        await self._publish(
+            "run.terminated_after_end_turn",
+            {
+                "grace_seconds": int(END_TURN_GRACE_SECONDS),
+                "hard_kill": hard_kill,
+                "returncode": self._returncode(wait_task),
+                "reason": "subprocess_did_not_exit_after_end_turn",
+            },
+        )
+
+    async def _watch_idle_timeout(self, wait_task: asyncio.Task[int]) -> None:
+        while True:
+            await self._sleep(IDLE_CHECK_INTERVAL_SECONDS)
+            if self._process_exited(wait_task):
+                return
+
+            idle_seconds = (self._clock() - self._last_activity_at).total_seconds()
+            if idle_seconds <= IDLE_TIMEOUT_SECONDS:
+                continue
+
+            self._watchdog_termination_in_progress = True
+            self._watchdog_termination_task = asyncio.current_task()
+            self._interrupted = True
+            if not self._signal_process_group(signal.SIGTERM):
+                return
+
+            hard_kill = False
+            await self._wait_for_process_or_sleep(wait_task, IDLE_HARD_KILL_GRACE_SECONDS)
+            if not self._process_exited(wait_task):
+                hard_kill = self._signal_process_group(signal.SIGKILL)
+                if hard_kill:
+                    await wait_task
+
+            await self._publish(
+                "run.timed_out_idle",
+                {
+                    "idle_seconds": int(IDLE_TIMEOUT_SECONDS),
+                    "last_activity_event": self._last_activity_event,
+                    "last_activity_at": _format_timestamp(self._last_activity_at),
+                    "hard_kill": hard_kill,
+                    "reason": "no_activity_within_threshold",
+                },
+            )
+            return
+
+    async def _wait_for_process_or_sleep(self, wait_task: asyncio.Task[int], seconds: float) -> None:
+        if wait_task.done():
+            return
+        sleep_task = asyncio.create_task(self._sleep(seconds))
+        done, pending = await asyncio.wait({wait_task, sleep_task}, return_when=asyncio.FIRST_COMPLETED)
+        del done
+        if sleep_task in pending:
+            sleep_task.cancel()
+            await asyncio.gather(sleep_task, return_exceptions=True)
+
+    def _process_exited(self, wait_task: asyncio.Task[int]) -> bool:
+        process = self._process
+        return wait_task.done() or process is None or process.returncode is not None
+
+    def _returncode(self, wait_task: asyncio.Task[int]) -> int | None:
+        if wait_task.done() and not wait_task.cancelled():
+            try:
+                return wait_task.result()
+            except Exception:
+                logger.exception(
+                    "Run process wait task failed while reading returncode: session=%s run=%s",
+                    self.session.id,
+                    self.run_record.id,
+                )
+        if self._process is not None:
+            return self._process.returncode
+        return None
+
+    def _signal_process_group(self, sig: signal.Signals) -> bool:
+        process = self._process
+        if process is None or process.returncode is not None:
+            return False
+        try:
+            # POSIX-only by design: production harness runs on Linux, and the
+            # subprocess is launched with start_new_session=True to isolate a
+            # process group for watchdog cleanup.
+            pgid = os.getpgid(process.pid)
+            os.killpg(pgid, sig)
+            return True
+        except ProcessLookupError:
+            logger.info(
+                "Run process group no longer exists before watchdog signal: session=%s run=%s pid=%s signal=%s",
+                self.session.id,
+                self.run_record.id,
+                process.pid,
+                sig.name,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Failed to signal run process group: session=%s run=%s pid=%s signal=%s",
+                self.session.id,
+                self.run_record.id,
+                process.pid,
+                sig.name,
+            )
+            return False
+
     async def _publish(self, event: str, data: dict[str, object]) -> Event:
+        if event in _ACTIVITY_EVENTS:
+            self._last_activity_at = self._clock()
+            self._last_activity_event = event
         return await self._event_bus.publish(
             Event(event=event, session_id=self.session.id, run_id=self.run_record.id, data=data)
         )
@@ -558,3 +755,7 @@ def _external_resume_id(session: Session, *, prefix: str) -> str:
 
     backend = "claude" if prefix == "claude_" else prefix.rstrip("_")
     raise CommandBuildError(f"Cannot resume external {backend} session from id {session.id}")
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")

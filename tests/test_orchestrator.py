@@ -501,6 +501,12 @@ def test_parse_codex_stream_line_extracts_agent_message() -> None:
     assert data["message"]["blocks"] == [{"type": "text", "text": "hello from codex"}]
 
 
+def test_parse_codex_stream_line_emits_end_turn_sentinel() -> None:
+    events = parse_codex_stream_line(json.dumps({"type": "turn.completed"}))
+
+    assert events == [(orchestrator._END_TURN_EVENT, {})]
+
+
 def test_parse_codex_stream_line_ignores_tool_use_records() -> None:
     for record in (
         {"type": "thread.started", "thread_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4"},
@@ -597,6 +603,51 @@ async def test_run_process_leaves_external_codex_stdout_delta_only() -> None:
     await asyncio.wait_for(task, timeout=1)
 
     events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert [event.event for event in events] == ["run.started", "message.delta", "run.completed"]
+
+
+@pytest.mark.asyncio
+async def test_external_codex_turn_completed_does_not_arm_end_turn_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("codex").model_copy(
+        update={"origin": "external", "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4"}
+    )
+    run = make_run(session, origin="external")
+    clock = FakeClock()
+    process = FakeProcess(stdout=[b'{"type":"turn.completed"}\n'])
+    install_fake_process_group(monkeypatch, process)
+    run_process = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "resume", "--json", "external", "hello")),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    task = asyncio.create_task(run_process.run())
+    await flush_asyncio()
+
+    assert run_process._end_turn_event.is_set() is False
+
+    clock.advance(60)
+    await flush_asyncio()
+    clock.advance(60)
+    await flush_asyncio()
+
+    assert process.group_signals == []
+    assert run_process._end_turn_event.is_set() is False
+
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert result.status == "completed"
     assert [event.event for event in events] == ["run.started", "message.delta", "run.completed"]
 
 

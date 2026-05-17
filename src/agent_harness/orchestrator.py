@@ -23,7 +23,12 @@ IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
 
 _END_TURN_EVENT = "__end_turn__"
-_ACTIVITY_EVENTS = frozenset({"message", "message.delta", "tool_use"})
+_ACTIVITY_EVENTS = frozenset({
+    "message",
+    "message.delta",
+    # Reserved for future stdout parsers; activity tracking already handles it.
+    "tool_use",
+})
 
 
 class CommandBuildError(ValueError):
@@ -339,7 +344,6 @@ class RunProcess:
         except Exception as exc:
             logger.exception("Run process failed while active: session=%s run=%s", self.session.id, self.run_record.id)
             await self._cancel_streams(stream_tasks)
-            await self._cancel_watchdogs(watchdog_tasks)
             await self._publish("run.failed", {"error": str(exc), "error_type": type(exc).__name__})
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
         finally:
@@ -382,7 +386,7 @@ class RunProcess:
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
         parser: StdoutParser | None = None
-        if stream_name == "stdout":
+        if stream_name == "stdout" and self.session.origin == "harness":
             parser = self._stdout_parsers.get(self.session.backend)
         while line := await stream.readline():
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -404,8 +408,6 @@ class RunProcess:
             for event_name, data in events:
                 if event_name == _END_TURN_EVENT:
                     self._end_turn_event.set()
-                    continue
-                if self.session.origin != "harness":
                     continue
                 await self._publish(event_name, data)
 
@@ -464,8 +466,8 @@ class RunProcess:
 
         if not self._process_exited(wait_task):
             hard_kill = self._signal_process_group(signal.SIGKILL)
-            if hard_kill:
-                await wait_task
+        if hard_kill:
+            await wait_task
 
         await self._publish(
             "run.terminated_after_end_turn",

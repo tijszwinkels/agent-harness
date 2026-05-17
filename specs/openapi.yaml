@@ -84,6 +84,34 @@ paths:
                 $ref: "#/components/schemas/Session"
         "404":
           $ref: "#/components/responses/Error"
+    patch:
+      tags: [Sessions]
+      operationId: patchSession
+      summary: Patch user-mutable session fields.
+      description: |
+        Updates the listed user-mutable fields and bumps `updated_at`.
+        Absent fields are left untouched (set-if-present semantics via
+        `model_dump(exclude_unset=True)`). Explicit `null` for any field
+        is rejected with 422 — there is no "clear field" path. Empty
+        payload `{}` is a 200 noop that returns the session unchanged.
+        Publishes a `session.updated` event listing the changed fields.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchSessionRequest"
+      responses:
+        "200":
+          description: Updated session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
 
   /v1/sessions/{id}/messages:
     parameters:
@@ -579,6 +607,19 @@ components:
         bypass_permissions:
           type: boolean
           default: false
+
+    PatchSessionRequest:
+      type: object
+      description: |
+        Patch payload for `PATCH /v1/sessions/{id}`. Only user-mutable
+        fields are listed; everything else on Session is derived
+        (status, stats, updated_at) or immutable (id, backend, origin,
+        created_at). Omit a field to leave it unchanged; explicit `null`
+        is rejected with 422.
+      properties:
+        title:
+          type: string
+          minLength: 1
 
     CreateRunRequest:
       type: object

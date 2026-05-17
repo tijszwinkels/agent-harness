@@ -1,8 +1,11 @@
 import asyncio
 import json
+import signal
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import agent_harness.orchestrator as orchestrator
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Message, Project, Run, Session
 from agent_harness.orchestrator import (
@@ -14,19 +17,27 @@ from agent_harness.orchestrator import (
     RunProcess,
     SubmitResult,
     default_stdout_parsers,
+    parse_claude_stream_line,
     parse_codex_stream_line,
 )
 
 
 class FakeStream:
-    def __init__(self, lines: list[bytes]) -> None:
+    def __init__(self, lines: list[bytes], *, close: bool = True) -> None:
         self._lines = asyncio.Queue()
         for line in lines:
             self._lines.put_nowait(line)
-        self._lines.put_nowait(b"")
+        if close:
+            self.close()
 
     async def readline(self) -> bytes:
         return await self._lines.get()
+
+    def push(self, line: bytes) -> None:
+        self._lines.put_nowait(line)
+
+    def close(self) -> None:
+        self._lines.put_nowait(b"")
 
 
 class FakeProcess:
@@ -36,13 +47,20 @@ class FakeProcess:
         stdout: list[bytes] | None = None,
         stderr: list[bytes] | None = None,
         returncode: int = 0,
+        pid: int = 12345,
+        close_stdout: bool = True,
+        close_stderr: bool = True,
+        exit_on_sigterm: bool = False,
     ) -> None:
-        self.stdout = FakeStream(stdout or [])
-        self.stderr = FakeStream(stderr or [])
+        self.stdout = FakeStream(stdout or [], close=close_stdout)
+        self.stderr = FakeStream(stderr or [], close=close_stderr)
         self.returncode: int | None = None
         self._final_returncode = returncode
         self._done = asyncio.Event()
         self.terminated = False
+        self.pid = pid
+        self.group_signals: list[signal.Signals] = []
+        self.exit_on_sigterm = exit_on_sigterm
 
     async def wait(self) -> int:
         await self._done.wait()
@@ -57,6 +75,15 @@ class FakeProcess:
         self.returncode = -15
         self._done.set()
 
+    def signal_group(self, sig: signal.Signals) -> None:
+        self.group_signals.append(sig)
+        if sig == signal.SIGTERM and self.exit_on_sigterm:
+            self.returncode = -signal.SIGTERM
+            self._done.set()
+        elif sig == signal.SIGKILL:
+            self.returncode = -signal.SIGKILL
+            self._done.set()
+
 
 class FakeFactory:
     def __init__(self, process: FakeProcess) -> None:
@@ -66,6 +93,53 @@ class FakeFactory:
     async def __call__(self, command: ProcessCommand) -> FakeProcess:
         self.commands.append(command)
         return self.process
+
+
+class FakeClock:
+    def __init__(self, start: datetime | None = None) -> None:
+        self._now = start or datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
+        self._sleepers: list[tuple[datetime, asyncio.Future[None]]] = []
+
+    def __call__(self) -> datetime:
+        return self._now
+
+    async def sleep(self, delay: float) -> None:
+        if delay <= 0:
+            await asyncio.sleep(0)
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._sleepers.append((self._now + timedelta(seconds=delay), future))
+        await future
+
+    def advance(self, seconds: float) -> None:
+        self._now += timedelta(seconds=seconds)
+        ready = [item for item in self._sleepers if item[0] <= self._now]
+        self._sleepers = [item for item in self._sleepers if item[0] > self._now]
+        for _, future in ready:
+            if not future.done():
+                future.set_result(None)
+
+
+def install_fake_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    process: FakeProcess,
+    *,
+    pgid: int = 67890,
+) -> list[tuple[int, signal.Signals]]:
+    calls: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr(orchestrator.os, "getpgid", lambda pid: pgid)
+
+    def fake_killpg(observed_pgid: int, sig: signal.Signals) -> None:
+        calls.append((observed_pgid, sig))
+        process.signal_group(sig)
+
+    monkeypatch.setattr(orchestrator.os, "killpg", fake_killpg)
+    return calls
+
+
+async def flush_asyncio() -> None:
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
 
 def make_session(backend: str = "codex") -> Session:
@@ -401,10 +475,13 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
 
 
 def test_default_stdout_parsers_registers_codex_only() -> None:
-    # Claude stdout remains delta-only because the transcript observer can
-    # tag claude events with the harness session id. Codex needs a stdout
-    # parser because codex exec --json uses an independent rollout UUID.
-    assert default_stdout_parsers() == {"codex": parse_codex_stream_line}
+    # Claude stdout remains delta-only for message events because the
+    # transcript observer can tag claude events with the harness session id.
+    # It still needs a stdout parser for the result/end_turn lifecycle hook.
+    assert default_stdout_parsers() == {
+        "codex": parse_codex_stream_line,
+        "claude-code": parse_claude_stream_line,
+    }
 
 
 def test_parse_codex_stream_line_extracts_agent_message() -> None:
@@ -424,11 +501,16 @@ def test_parse_codex_stream_line_extracts_agent_message() -> None:
     assert data["message"]["blocks"] == [{"type": "text", "text": "hello from codex"}]
 
 
+def test_parse_codex_stream_line_emits_end_turn_sentinel() -> None:
+    events = parse_codex_stream_line(json.dumps({"type": "turn.completed"}))
+
+    assert events == [(orchestrator._END_TURN_EVENT, {})]
+
+
 def test_parse_codex_stream_line_ignores_tool_use_records() -> None:
     for record in (
         {"type": "thread.started", "thread_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4"},
         {"type": "turn.started"},
-        {"type": "turn.completed"},
         {
             "type": "item.completed",
             "item": {"type": "command_execution", "command": "true", "status": "completed"},
@@ -525,6 +607,51 @@ async def test_run_process_leaves_external_codex_stdout_delta_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_external_codex_turn_completed_does_not_arm_end_turn_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("codex").model_copy(
+        update={"origin": "external", "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4"}
+    )
+    run = make_run(session, origin="external")
+    clock = FakeClock()
+    process = FakeProcess(stdout=[b'{"type":"turn.completed"}\n'])
+    install_fake_process_group(monkeypatch, process)
+    run_process = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "resume", "--json", "external", "hello")),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    task = asyncio.create_task(run_process.run())
+    await flush_asyncio()
+
+    assert run_process._end_turn_event.is_set() is False
+
+    clock.advance(60)
+    await flush_asyncio()
+    clock.advance(60)
+    await flush_asyncio()
+
+    assert process.group_signals == []
+    assert run_process._end_turn_event.is_set() is False
+
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert result.status == "completed"
+    assert [event.event for event in events] == ["run.started", "message.delta", "run.completed"]
+
+
+@pytest.mark.asyncio
 async def test_run_process_does_not_emit_message_event_for_claude_stdout() -> None:
     # Claude --print stdout is mirrored as message.delta lines but must NOT
     # publish "message" events: the file-watching observer is the single
@@ -566,6 +693,266 @@ async def test_run_process_does_not_emit_message_event_for_claude_stdout() -> No
         f"RunProcess must not emit message events from stdout (got {event_names})"
     )
     assert event_names == ["run.started", "message.delta", "run.completed"]
+
+
+@pytest.mark.asyncio
+async def test_run_process_kills_after_end_turn_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    end_turn_line = json.dumps(
+        {"type": "result", "subtype": "success", "stop_reason": "end_turn"}
+    ).encode()
+    process = FakeProcess(stdout=[end_turn_line + b"\n"])
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+
+    clock.advance(20)
+    await flush_asyncio()
+    assert process.group_signals == [signal.SIGTERM]
+
+    clock.advance(20)
+    await flush_asyncio()
+    result = await asyncio.wait_for(task, timeout=1)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    watchdog_event = next(e for e in events if e.event == "run.terminated_after_end_turn")
+
+    assert result.status == "interrupted"
+    assert process.group_signals == [signal.SIGTERM, signal.SIGKILL]
+    assert watchdog_event.data == {
+        "grace_seconds": 20,
+        "hard_kill": True,
+        "returncode": -signal.SIGKILL,
+        "reason": "subprocess_did_not_exit_after_end_turn",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_process_end_turn_does_not_kill_when_subprocess_exits_naturally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    end_turn_line = json.dumps(
+        {"type": "result", "subtype": "success", "stop_reason": "end_turn"}
+    ).encode()
+    process = FakeProcess(stdout=[end_turn_line + b"\n"], returncode=0)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+    clock.advance(5)
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert result.status == "completed"
+    assert process.group_signals == []
+    assert "run.terminated_after_end_turn" not in [event.event for event in events]
+
+
+@pytest.mark.asyncio
+async def test_run_process_kill_only_on_end_turn_not_tool_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    tool_use_line = json.dumps(
+        {"type": "result", "subtype": "success", "stop_reason": "tool_use"}
+    ).encode()
+    process = FakeProcess(stdout=[tool_use_line + b"\n"])
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+    clock.advance(60)
+    await flush_asyncio()
+
+    assert process.group_signals == []
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_run_process_idle_timeout_fires_after_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "IDLE_TIMEOUT_SECONDS", 30 * 60, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_HARD_KILL_GRACE_SECONDS", 30.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess()
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+
+    clock.advance(31 * 60)
+    await flush_asyncio()
+    assert process.group_signals == [signal.SIGTERM]
+
+    clock.advance(30)
+    await flush_asyncio()
+    result = await asyncio.wait_for(task, timeout=1)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    timeout_event = next(e for e in events if e.event == "run.timed_out_idle")
+
+    assert result.status == "interrupted"
+    assert process.group_signals == [signal.SIGTERM, signal.SIGKILL]
+    assert timeout_event.data == {
+        "idle_seconds": 1800,
+        "last_activity_event": None,
+        "last_activity_at": "2026-05-17T12:00:00Z",
+        "hard_kill": True,
+        "reason": "no_activity_within_threshold",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_process_idle_timeout_resets_on_activity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "IDLE_TIMEOUT_SECONDS", 30 * 60, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], close_stdout=False)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+
+    clock.advance(25 * 60)
+    process.stdout.push(b"still working\n")
+    await flush_asyncio()
+    clock.advance(25 * 60)
+    process.stdout.push(b"still working again\n")
+    await flush_asyncio()
+
+    assert process.group_signals == []
+    process.finish()
+    process.stdout.close()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_run_process_uses_process_group_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    end_turn_line = json.dumps(
+        {"type": "result", "subtype": "success", "stop_reason": "end_turn"}
+    ).encode()
+    process = FakeProcess(stdout=[end_turn_line + b"\n"], pid=24680, exit_on_sigterm=True)
+    calls = install_fake_process_group(monkeypatch, process, pgid=13579)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+    clock.advance(20)
+    await asyncio.wait_for(task, timeout=1)
+
+    assert calls == [(13579, signal.SIGTERM)]
+
+
+@pytest.mark.asyncio
+async def test_codex_end_turn_stop_signal_is_turn_completed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[b'{"type":"turn.completed"}\n'], exit_on_sigterm=True)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+    clock.advance(20)
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result.status == "interrupted"
+    assert process.group_signals == [signal.SIGTERM]
 
 
 class FakeFactoryQueue:

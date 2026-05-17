@@ -231,6 +231,20 @@ class SQLiteRepository:
             self._upsert_session(archived)
         return archived.model_copy(deep=True)
 
+    def patch_session(self, session_id: str, fields: dict[str, object]) -> Session:
+        # Mirror of InMemoryRepository.patch_session. Whitelisting is the
+        # caller's responsibility (api.py uses PatchSessionRequest).
+        with self._lock, self._connection:
+            session = self._find_session_locked(session_id)
+            if session is None:
+                logger.warning("SQLite session patch failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            if not fields:
+                return session.model_copy(deep=True)
+            updated = session.model_copy(update={**fields, "updated_at": utc_now()})
+            self._upsert_session(updated)
+        return updated.model_copy(deep=True)
+
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
         # Runs are born ``queued`` and stay that way until the orchestrator
         # spawns the subprocess (see ``start_run``). Mirrors InMemoryRepository.

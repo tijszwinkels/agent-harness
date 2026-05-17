@@ -717,6 +717,93 @@ def test_missing_session_returns_404() -> None:
     assert response.status_code == 404
 
 
+def _create_session(client: TestClient, **overrides) -> dict:
+    payload = {
+        "backend": "codex",
+        "model": "gpt-5.4",
+        "project": {"path": "/tmp/proj", "name": "proj"},
+        **overrides,
+    }
+    response = client.post("/v1/sessions", json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_patch_session_updates_title_and_returns_session() -> None:
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+    original_updated_at = session["updated_at"]
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"title": "renamed"})
+
+    assert response.status_code == 200
+    patched = response.json()
+    assert patched["title"] == "renamed"
+    assert patched["updated_at"] >= original_updated_at
+    # Re-fetch to confirm persistence.
+    fresh = client.get(f"/v1/sessions/{session['id']}").json()
+    assert fresh["title"] == "renamed"
+
+
+def test_patch_session_with_empty_body_is_a_noop_returning_session() -> None:
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={})
+
+    assert response.status_code == 200
+    # Title unchanged, updated_at NOT bumped (no fields touched).
+    assert response.json()["title"] == "initial"
+    assert response.json()["updated_at"] == session["updated_at"]
+
+
+def test_patch_session_returns_404_for_unknown_session() -> None:
+    client = TestClient(create_app())
+
+    response = client.patch("/v1/sessions/ses_missing", json={"title": "x"})
+
+    assert response.status_code == 404
+
+
+def test_patch_session_rejects_unknown_fields() -> None:
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+
+    # Pydantic v2 with model_config extra="forbid" (HarnessModel default)
+    # should reject unrecognized keys with 422.
+    response = client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"status": "archived", "title": "renamed"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_patch_session_rejects_explicit_null_title() -> None:
+    # ``{"title": null}`` would otherwise silently clear the title. No
+    # documented consumer wants that today; require an explicit omission
+    # for "leave unchanged".
+    client = TestClient(create_app())
+    session = _create_session(client, title="keep me")
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"title": None})
+
+    assert response.status_code == 422
+    assert client.get(f"/v1/sessions/{session['id']}").json()["title"] == "keep me"
+
+
+def test_patch_session_rejects_empty_title() -> None:
+    # ``min_length=1`` on the model field catches empty strings before
+    # they reach the route. Same intent as the null guard.
+    client = TestClient(create_app())
+    session = _create_session(client, title="keep me")
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"title": ""})
+
+    assert response.status_code == 422
+    assert client.get(f"/v1/sessions/{session['id']}").json()["title"] == "keep me"
+
+
 def test_observer_service_starts_and_stops_with_lifespan(tmp_path) -> None:
     root = tmp_path / "transcripts"
     root.mkdir()

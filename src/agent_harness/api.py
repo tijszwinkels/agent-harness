@@ -20,6 +20,7 @@ from agent_harness.models import (
     CreateSessionRequest,
     Event,
     InterruptRunResponse,
+    PatchSessionRequest,
     StopReason,
 )
 from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchService
@@ -156,6 +157,37 @@ def create_app(
                 data={"fields_changed": ["status", "updated_at"]},
             )
         )
+        return session
+
+    @app.patch("/v1/sessions/{session_id}")
+    async def patch_session(session_id: str, request: PatchSessionRequest) -> object:
+        # ``exclude_unset`` so callers can patch a single field without
+        # having to round-trip every other value — and so an absent field
+        # stays at its current repo value. Explicit ``null`` for an
+        # optional field is rejected here rather than silently clearing
+        # the underlying value: the only documented use case (mm-bridge
+        # title sync) never sends null, and a "clear field" path can be
+        # added explicitly later if needed.
+        fields = request.model_dump(exclude_unset=True)
+        if any(v is None for v in fields.values()):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="patch field cannot be null; omit the field to leave it unchanged",
+            )
+        try:
+            session = repo.patch_session(session_id, fields)
+        except SessionNotFoundError as exc:
+            logger.warning("Session patch failed because session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+
+        if fields:
+            await events.publish(
+                Event(
+                    event="session.updated",
+                    session_id=session.id,
+                    data={"fields_changed": sorted([*fields.keys(), "updated_at"])},
+                )
+            )
         return session
 
     @app.post("/v1/sessions/{session_id}/runs", status_code=status.HTTP_202_ACCEPTED)

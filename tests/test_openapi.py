@@ -35,3 +35,28 @@ def test_openapi_documents_current_run_contracts() -> None:
 
     create_run_responses = spec["paths"]["/v1/sessions/{id}/runs"]["post"]["responses"]
     assert create_run_responses["429"] == {"$ref": "#/components/responses/Error"}
+
+
+def test_openapi_documents_patch_session() -> None:
+    spec = _openapi_spec()
+
+    patch = spec["paths"]["/v1/sessions/{id}"]["patch"]
+    assert patch["operationId"] == "patchSession"
+    assert patch["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/PatchSessionRequest",
+    }
+    responses = patch["responses"]
+    assert responses["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Session",
+    }
+    for code in ("404", "422"):
+        assert responses[code] == {"$ref": "#/components/responses/Error"}
+
+    patch_request = spec["components"]["schemas"]["PatchSessionRequest"]
+    # title is optional (omit to leave unchanged) but must be a non-empty
+    # string when supplied.
+    assert "required" not in patch_request or patch_request["required"] == []
+    assert patch_request["properties"]["title"] == {
+        "type": "string",
+        "minLength": 1,
+    }

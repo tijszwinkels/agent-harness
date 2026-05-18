@@ -9,10 +9,12 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock, utc_now
+from agent_harness.usage import parse_claude_usage, parse_codex_token_count, parse_codex_usage
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,7 @@ _END_TURN_EVENT = "__end_turn__"
 _ACTIVITY_EVENTS = frozenset({
     "message",
     "message.delta",
+    "run.usage",
     # Reserved for future stdout parsers; activity tracking already handles it.
     "tool_use",
 })
@@ -190,7 +193,30 @@ def parse_codex_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
     if not isinstance(record, Mapping):
         return []
     if record.get("type") == "turn.completed":
-        return [(_END_TURN_EVENT, {})]
+        events: list[tuple[str, dict[str, Any]]] = []
+        usage = parse_codex_usage(record.get("usage"))
+        if usage is not None:
+            events.append(
+                (
+                    "run.usage",
+                    {
+                        "usage": usage.model_dump(mode="json"),
+                        "source_type": "turn.completed",
+                    },
+                )
+            )
+        events.append((_END_TURN_EVENT, {}))
+        return events
+    payload = record.get("payload")
+    if record.get("type") == "event_msg" and isinstance(payload, Mapping) and payload.get("type") == "token_count":
+        usage, context_window = parse_codex_token_count(payload)
+        data: dict[str, Any] = {}
+        if usage is not None:
+            data["usage"] = usage.model_dump(mode="json")
+            data["source_type"] = "token_count"
+        if context_window is not None:
+            data["context_window"] = context_window
+        return [("run.usage", data)] if data else []
     if record.get("type") != "item.completed":
         return []
     item = record.get("item")
@@ -222,7 +248,12 @@ def parse_claude_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
     if not isinstance(record, Mapping):
         return []
     if record.get("type") == "result" and record.get("stop_reason") == "end_turn":
-        return [(_END_TURN_EVENT, {})]
+        events: list[tuple[str, dict[str, Any]]] = []
+        usage = parse_claude_usage(record.get("usage"), cost_usd=record.get("total_cost_usd"))
+        if usage is not None:
+            events.append(("run.usage", {"usage": usage.model_dump(mode="json")}))
+        events.append((_END_TURN_EVENT, {}))
+        return events
     return []
 
 
@@ -303,6 +334,7 @@ class RunProcess:
         stdout_parsers: Mapping[str, StdoutParser] | None = None,
         clock: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        codex_sessions_root: Path | None = None,
     ) -> None:
         self.session = session
         self.run_record = run
@@ -321,6 +353,9 @@ class RunProcess:
         self._last_activity_event: str | None = None
         self._watchdog_termination_in_progress = False
         self._watchdog_termination_task: asyncio.Task[None] | None = None
+        self._codex_thread_id: str | None = None
+        self._codex_token_count_usage_seen = False
+        self._codex_sessions_root = codex_sessions_root
 
     async def run(self) -> RunProcessResult:
         await self._publish("run.started", {})
@@ -341,6 +376,7 @@ class RunProcess:
         try:
             returncode = await wait_task
             await self._finish_streams(stream_tasks)
+            await self._publish_codex_context_window()
         except Exception as exc:
             logger.exception("Run process failed while active: session=%s run=%s", self.session.id, self.run_record.id)
             await self._cancel_streams(stream_tasks)
@@ -392,6 +428,7 @@ class RunProcess:
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not text:
                 continue
+            self._capture_codex_thread_id(stream_name, text)
             await self._publish("message.delta", {"stream": stream_name, "text": text})
             if parser is None:
                 continue
@@ -408,6 +445,8 @@ class RunProcess:
             for event_name, data in events:
                 if event_name == _END_TURN_EVENT:
                     self._end_turn_event.set()
+                    continue
+                if self._should_skip_parsed_event(event_name, data):
                     continue
                 await self._publish(event_name, data)
 
@@ -579,6 +618,47 @@ class RunProcess:
         return await self._event_bus.publish(
             Event(event=event, session_id=self.session.id, run_id=self.run_record.id, data=data)
         )
+
+    def _capture_codex_thread_id(self, stream_name: str, text: str) -> None:
+        if stream_name != "stdout" or self.session.backend != "codex" or self.session.origin != "harness":
+            return
+        if self._codex_thread_id is not None:
+            return
+        try:
+            record = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(record, Mapping) or record.get("type") != "thread.started":
+            return
+        thread_id = record.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            self._codex_thread_id = thread_id
+
+    def _should_skip_parsed_event(self, event_name: str, data: dict[str, Any]) -> bool:
+        if event_name != "run.usage" or self.session.backend != "codex":
+            return False
+        if "usage" not in data:
+            return False
+        source_type = data.get("source_type")
+        if source_type == "token_count":
+            self._codex_token_count_usage_seen = True
+            return False
+        return source_type == "turn.completed" and self._codex_token_count_usage_seen
+
+    async def _publish_codex_context_window(self) -> None:
+        if self.session.backend != "codex" or self.session.origin != "harness":
+            return
+        thread_id = self._codex_thread_id
+        if thread_id is None:
+            return
+        context_window = await asyncio.to_thread(
+            _context_window_from_codex_rollout,
+            thread_id,
+            self._codex_sessions_root,
+        )
+        if context_window is None:
+            return
+        await self._publish("run.usage", {"context_window": context_window})
 
 
 RUN_QUEUE_MAX_PER_SESSION = 16
@@ -757,6 +837,56 @@ def _external_resume_id(session: Session, *, prefix: str) -> str:
 
     backend = "claude" if prefix == "claude_" else prefix.rstrip("_")
     raise CommandBuildError(f"Cannot resume external {backend} session from id {session.id}")
+
+
+def _context_window_from_codex_rollout(thread_id: str, sessions_root: Path | None = None) -> int | None:
+    root = sessions_root or Path.home() / ".codex" / "sessions"
+    try:
+        candidates = sorted(
+            root.rglob(f"rollout-*-{thread_id}.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        logger.exception("Failed to search Codex rollout root for thread context window: root=%s", root)
+        return None
+
+    if not candidates:
+        logger.debug("No Codex rollout found for thread id: %s", thread_id)
+        return None
+
+    path = candidates[0]
+    try:
+        with path.open("r", encoding="utf-8") as transcript:
+            for line in transcript:
+                context_window = _context_window_from_codex_rollout_line(line)
+                if context_window is not None:
+                    return context_window
+    except OSError:
+        logger.exception("Failed to read Codex rollout for context window: path=%s", path)
+    return None
+
+
+def _context_window_from_codex_rollout_line(line: str) -> int | None:
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(record, Mapping) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    context_window = payload.get("model_context_window")
+    if isinstance(context_window, int) and context_window >= 1:
+        return context_window
+    if payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    if not isinstance(info, Mapping):
+        return None
+    context_window = info.get("model_context_window")
+    return context_window if isinstance(context_window, int) and context_window >= 1 else None
 
 
 def _format_timestamp(value: datetime) -> str:

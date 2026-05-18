@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import agent_harness.orchestrator as orchestrator
-from agent_harness.events import InMemoryEventBus
-from agent_harness.models import Message, Project, Run, Session
+from agent_harness.events import DurableEventBus, InMemoryEventBus
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Message, Project, Run, Session, Usage
 from agent_harness.orchestrator import (
     ClaudeCodeCommandBuilder,
     CommandBuildError,
@@ -20,6 +20,7 @@ from agent_harness.orchestrator import (
     parse_claude_stream_line,
     parse_codex_stream_line,
 )
+from agent_harness.storage import open_sqlite_repository
 
 
 class FakeStream:
@@ -531,6 +532,309 @@ def test_parse_codex_stream_line_ignores_malformed_json_and_empty_messages() -> 
     assert parse_codex_stream_line(
         json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": ""}})
     ) == []
+
+
+def test_parse_codex_stream_line_emits_usage_for_token_count() -> None:
+    events = parse_codex_stream_line(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 500,
+                            "output_tokens": 300,
+                            "total_tokens": 1300,
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 4,
+                            "output_tokens": 3,
+                            "reasoning_output_tokens": 1,
+                            "total_tokens": 13,
+                        },
+                        "model_context_window": 258400,
+                    },
+                },
+            }
+        )
+    )
+
+    assert events == [
+        (
+            "run.usage",
+            {
+                "usage": {
+                    "input": 10,
+                    "output": 3,
+                    "cache_read": 4,
+                    "cache_creation": 0,
+                    "cost_usd": 0.0,
+                },
+                "source_type": "token_count",
+                "context_window": 258400,
+            },
+        )
+    ]
+
+
+def test_parse_codex_stream_line_emits_usage_for_turn_completed() -> None:
+    events = parse_codex_stream_line(
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 18327,
+                    "cached_input_tokens": 3456,
+                    "output_tokens": 28,
+                    "reasoning_output_tokens": 21,
+                },
+            }
+        )
+    )
+
+    assert events == [
+        (
+            "run.usage",
+            {
+                "usage": {
+                    "input": 18327,
+                    "output": 28,
+                    "cache_read": 3456,
+                    "cache_creation": 0,
+                    "cost_usd": 0.0,
+                },
+                "source_type": "turn.completed",
+            },
+        ),
+        ("__end_turn__", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_claude_stream_json_result_usage(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus",
+            project=Project(path="/workspace/project", name="project"),
+        )
+    )
+    run = repository.start_run(
+        session.id,
+        repository.create_run(session.id, CreateRunRequest(message="hello")).id,
+    )
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 6,
+                "cache_creation_input_tokens": 21,
+                "cache_read_input_tokens": 18,
+                "output_tokens": 4,
+            },
+            "total_cost_usd": 0.123,
+        }
+    ).encode()
+    process = FakeProcess(stdout=[result_line + b"\n"], returncode=0)
+
+    try:
+        task = asyncio.create_task(
+            RunProcess(
+                session=session,
+                run=run,
+                command=ProcessCommand(argv=("claude", "--print")),
+                event_bus=DurableEventBus(repository),
+                process_factory=FakeFactory(process),
+            ).run()
+        )
+        await asyncio.sleep(0)
+        process.finish()
+        result = await asyncio.wait_for(task, timeout=1)
+
+        assert result.status == "completed"
+        assert repository.get_run(session.id, run.id).usage == Usage(
+            input=6,
+            output=4,
+            cache_read=18,
+            cache_creation=21,
+            cost_usd=0.123,
+        )
+        assert repository.get_session(session.id).stats.tokens == {
+            "input": 6,
+            "output": 4,
+            "cache_read": 18,
+            "cache_creation": 21,
+        }
+        assert repository.get_session(session.id).stats.cost_usd == 0.123
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_codex_rollout_context_window_from_thread_id(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/workspace/project", name="project"),
+        )
+    )
+    run = repository.start_run(
+        session.id,
+        repository.create_run(session.id, CreateRunRequest(message="hello")).id,
+    )
+    thread_id = "019e3d08-f804-74f3-8e02-94cc8750baba"
+    sessions_root = tmp_path / "codex-sessions"
+    rollout_dir = sessions_root / "2026" / "05" / "18"
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / f"rollout-2026-05-18T23-40-58-{thread_id}.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "model_context_window": 258400,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 999,
+                                    "cached_input_tokens": 1,
+                                    "output_tokens": 1,
+                                },
+                                "model_context_window": 258400,
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stdout = [
+        json.dumps({"type": "thread.started", "thread_id": thread_id}).encode() + b"\n",
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 12,
+                    "cached_input_tokens": 3,
+                    "output_tokens": 4,
+                },
+            }
+        ).encode()
+        + b"\n",
+    ]
+    process = FakeProcess(stdout=stdout, returncode=0)
+
+    try:
+        task = asyncio.create_task(
+            RunProcess(
+                session=session,
+                run=run,
+                command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
+                event_bus=DurableEventBus(repository),
+                process_factory=FakeFactory(process),
+                codex_sessions_root=sessions_root,
+            ).run()
+        )
+        await asyncio.sleep(0)
+        process.finish()
+        result = await asyncio.wait_for(task, timeout=1)
+
+        assert result.status == "completed"
+        assert repository.get_run(session.id, run.id).usage == Usage(
+            input=12,
+            output=4,
+            cache_read=3,
+        )
+        assert repository.get_session(session.id).stats.context_window == 258400
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_codex_does_not_double_count_turn_completed_after_token_count(tmp_path) -> None:
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/workspace/project", name="project"),
+        )
+    )
+    run = repository.start_run(
+        session.id,
+        repository.create_run(session.id, CreateRunRequest(message="hello")).id,
+    )
+    token_count = {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 12,
+                    "cached_input_tokens": 3,
+                    "output_tokens": 4,
+                },
+                "model_context_window": 258400,
+            },
+        },
+    }
+    turn_completed = {
+        "type": "turn.completed",
+        "usage": {
+            "input_tokens": 12,
+            "cached_input_tokens": 3,
+            "output_tokens": 4,
+        },
+    }
+    process = FakeProcess(
+        stdout=[
+            json.dumps(token_count).encode() + b"\n",
+            json.dumps(turn_completed).encode() + b"\n",
+        ],
+        returncode=0,
+    )
+
+    try:
+        task = asyncio.create_task(
+            RunProcess(
+                session=session,
+                run=run,
+                command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
+                event_bus=DurableEventBus(repository),
+                process_factory=FakeFactory(process),
+            ).run()
+        )
+        await asyncio.sleep(0)
+        process.finish()
+        await asyncio.wait_for(task, timeout=1)
+
+        assert repository.get_run(session.id, run.id).usage == Usage(
+            input=12,
+            output=4,
+            cache_read=3,
+        )
+        assert repository.get_session(session.id).stats.context_window == 258400
+    finally:
+        repository.close()
 
 
 @pytest.mark.asyncio

@@ -60,3 +60,15 @@ def test_openapi_documents_patch_session() -> None:
         "type": "string",
         "minLength": 1,
     }
+
+
+def test_openapi_documents_session_codex_internal_id() -> None:
+    spec = _openapi_spec()
+    session = spec["components"]["schemas"]["Session"]
+    # Nullable string, optional (only set after the observer binds a codex
+    # rollout to the harness session via the reconcile pre-check).
+    assert session["properties"]["codex_internal_id"] == {
+        "type": ["string", "null"],
+        "minLength": 1,
+    }
+    assert "codex_internal_id" not in session.get("required", [])

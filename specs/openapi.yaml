@@ -383,6 +383,12 @@ components:
         bypass_permissions:
           type: boolean
           default: false
+        codex_internal_id:
+          # Codex rollout UUID once the harness session has been bound to
+          # a specific rollout file by the observer's reconcile pre-check.
+          # Only set for harness-origin codex sessions; null otherwise.
+          type: [string, "null"]
+          minLength: 1
         created_at:
           type: string
           format: date-time

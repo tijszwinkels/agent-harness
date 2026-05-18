@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from agent_harness.observer import (
     parse_transcript_line,
     transcript_identity_from_path,
 )
-from agent_harness.models import Event, Message, Project, Session
+from agent_harness.models import CreateRunRequest, Event, Message, Project, Session, Usage
 from agent_harness.repository import InMemoryRepository
 from agent_harness.storage import open_sqlite_repository
 
@@ -104,6 +105,207 @@ def test_parser_materializes_external_session_for_supported_claude_line() -> Non
     assert observations[0].session_id == identity.session_id
     assert observations[1].data["message"]["role"] == "assistant"
     assert observations[1].data["message"]["blocks"][0]["text"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_observer_claude_usage_from_rollout(tmp_path) -> None:
+    transcript = claude_transcript_path(
+        "/repo",
+        "123e4567-e89b-12d3-a456-426614174000",
+        home=tmp_path,
+    )
+    identity = transcript_identity_from_path(transcript)
+    repository = InMemoryRepository()
+    repository.upsert_session(
+        Session(
+            id=identity.session_id,
+            backend="claude-code",
+            model="claude-opus",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.start_run(
+        identity.session_id,
+        repository.create_run(identity.session_id, CreateRunRequest(message="hello")).id,
+    )
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+
+    for offset, usage in enumerate(
+        [
+            {
+                "input_tokens": 6,
+                "cache_creation_input_tokens": 21,
+                "cache_read_input_tokens": 18,
+                "output_tokens": 4,
+            },
+            {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 2,
+            },
+        ]
+    ):
+        await observer.publish_line(
+            transcript,
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "cwd": "/repo",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-opus",
+                        "content": [{"type": "text", "text": f"done {offset}"}],
+                        "usage": usage,
+                    },
+                }
+            ),
+            offset=offset,
+            identity=identity,
+        )
+
+    assert repository.get_run(identity.session_id, run.id).usage == Usage(
+        input=9,
+        output=6,
+        cache_read=25,
+        cache_creation=26,
+    )
+    assert repository.get_session(identity.session_id).stats.tokens == {
+        "input": 9,
+        "output": 6,
+        "cache_read": 25,
+        "cache_creation": 26,
+    }
+
+
+@pytest.mark.asyncio
+async def test_observer_codex_token_count(tmp_path) -> None:
+    transcript = codex_transcript_path(
+        year=2026,
+        month=5,
+        day=18,
+        timestamp="2026-05-18T10-30-00",
+        rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+        home=tmp_path,
+    )
+    identity = transcript_identity_from_path(transcript)
+    repository = InMemoryRepository()
+    repository.upsert_session(
+        Session(
+            id=identity.session_id,
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.start_run(
+        identity.session_id,
+        repository.create_run(identity.session_id, CreateRunRequest(message="hello")).id,
+    )
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+
+    records = [
+        {"type": "event_msg", "payload": {"type": "token_count", "info": None}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 500,
+                        "output_tokens": 300,
+                        "total_tokens": 1300,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 4,
+                        "output_tokens": 3,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 13,
+                    },
+                    "model_context_window": 200000,
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 7,
+                        "cached_input_tokens": 8,
+                        "output_tokens": 5,
+                        "reasoning_output_tokens": 2,
+                        "total_tokens": 12,
+                    },
+                    "model_context_window": 258400,
+                },
+            },
+        },
+    ]
+    for offset, record in enumerate(records):
+        await observer.publish_line(
+            transcript,
+            json.dumps(record),
+            offset=offset,
+            identity=identity,
+        )
+
+    assert repository.get_run(identity.session_id, run.id).usage == Usage(
+        input=17,
+        output=8,
+        cache_read=12,
+    )
+    stats = repository.get_session(identity.session_id).stats
+    assert stats.tokens == {
+        "input": 17,
+        "output": 8,
+        "cache_read": 12,
+        "cache_creation": 0,
+    }
+    assert stats.context_window == 258400
+
+
+@pytest.mark.asyncio
+async def test_observer_token_count_does_not_emit_message(tmp_path) -> None:
+    transcript = codex_transcript_path(
+        year=2026,
+        month=5,
+        day=18,
+        timestamp="2026-05-18T10-30-00",
+        rollout_uuid="123e4567-e89b-12d3-a456-426614174000",
+        home=tmp_path,
+    )
+    identity = transcript_identity_from_path(transcript)
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus)
+
+    published = await observer.publish_line(
+        transcript,
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 10,
+                            "cached_input_tokens": 4,
+                            "output_tokens": 3,
+                        },
+                        "model_context_window": 258400,
+                    },
+                },
+            }
+        ),
+        offset=0,
+        identity=identity,
+    )
+
+    assert all(event.event != "message" for event in published)
+    assert all(event.event != "message" for event in await bus.replay())
 
 
 def test_parser_extracts_text_from_supported_claude_user_line() -> None:

@@ -25,9 +25,11 @@ from agent_harness.models import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    Usage,
     utc_now,
 )
 from agent_harness.repository import InMemoryRepository, SessionNotFoundError
+from agent_harness.usage import parse_claude_usage, parse_codex_token_count
 
 try:
     from watchfiles import awatch
@@ -47,7 +49,6 @@ _IGNORED_CODEX_PAYLOAD_TYPES = {
     "context_compacted",
     "task_complete",
     "task_started",
-    "token_count",
     "web_search_call",
 }
 
@@ -558,6 +559,15 @@ def _parse_claude_record(
         )
         if message_event is not None:
             events.append(message_event)
+        if record_type == "assistant":
+            usage_event = _usage_event(
+                identity=identity,
+                usage=parse_claude_usage(message.get("usage")),
+                context_window=None,
+                offset=offset,
+            )
+            if usage_event is not None:
+                events.append(usage_event)
         return events
 
     logger.warning(
@@ -585,6 +595,18 @@ def _parse_codex_record(
     )
 
     payload_type = _string_value(payload.get("type"))
+    if record_type == "event_msg" and payload_type == "token_count":
+        usage, context_window = parse_codex_token_count(payload)
+        usage_event = _usage_event(
+            identity=identity,
+            usage=usage,
+            context_window=context_window,
+            offset=offset,
+        )
+        if usage_event is not None:
+            events.append(usage_event)
+        return events
+
     if record_type in _IGNORED_CODEX_RECORD_TYPES or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES:
         logger.debug(
             "Ignoring Codex transcript metadata: path=%s type=%s payload_type=%s",
@@ -734,6 +756,25 @@ def _message_event(
         "source_type": source_type,
     }
     return Event(event="message", session_id=identity.session_id, data=data)
+
+
+def _usage_event(
+    *,
+    identity: TranscriptIdentity,
+    usage: Usage | None,
+    context_window: int | None,
+    offset: int | None,
+) -> Event | None:
+    if usage is None and context_window is None:
+        return None
+    data: dict[str, Any] = {
+        **_source_data(identity, offset=offset),
+    }
+    if usage is not None:
+        data["usage"] = usage.model_dump(mode="json")
+    if context_window is not None:
+        data["context_window"] = context_window
+    return Event(event="run.usage", session_id=identity.session_id, data=data)
 
 
 def blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:

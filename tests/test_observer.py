@@ -1158,3 +1158,282 @@ async def test_watch_service_runs_freshness_tick_alongside_watcher(tmp_path) -> 
     finally:
         watcher_done.set()
         await asyncio.wait_for(task, timeout=1.0)
+
+
+def _write_codex_rollout(
+    *,
+    base_dir: Path,
+    rollout_uuid: str,
+    cwd: str,
+    session_meta_ts: str,
+    model: str = "gpt-5.4",
+    extra_lines: list[str] | None = None,
+) -> Path:
+    """Write a fixture codex rollout file with a realistic ``session_meta``
+    record at index 0 and one user message. Returns the rollout path.
+    """
+    transcript_dir = base_dir / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = transcript_dir / f"rollout-2026-05-08T10-30-00-{rollout_uuid}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    session_meta = (
+        '{"timestamp":"' + session_meta_ts + '","type":"session_meta",'
+        '"payload":{"id":"' + rollout_uuid + '","timestamp":"' + session_meta_ts + '",'
+        '"cwd":"' + cwd + '","originator":"codex_exec","cli_version":"0.128.0"}}'
+    )
+    turn_context = (
+        '{"type":"turn_context","payload":{"cwd":"' + cwd + '","model":"' + model + '"}}'
+    )
+    user_msg = (
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}'
+    )
+    lines = [session_meta, turn_context, user_msg] + (extra_lines or [])
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return transcript
+
+
+@pytest.mark.asyncio
+async def test_observer_reconciles_codex_rollout_to_harness_session(tmp_path) -> None:
+    """Reconcile pre-check: when a codex rollout appears whose cwd matches a
+    non-terminal harness codex session created within the 30s window, the
+    observer must NOT register a new ``codex_<uuid>`` row. Subsequent message
+    events from the rollout must attach to the harness session id.
+    """
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    harness_session = Session(
+        id="ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        created_at=datetime(2026, 5, 11, 12, 22, 30, tzinfo=UTC),
+    )
+    repository.upsert_session(harness_session)
+
+    rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+    transcript = _write_codex_rollout(
+        base_dir=tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-11T12:22:34.777Z",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(transcript)
+
+    # The phantom external row must NOT exist.
+    assert not repository.has_session(f"codex_{rollout_uuid}")
+
+    # The harness session keeps its origin/title and now has the rollout's
+    # message events attached.
+    after = repository.get_session(harness_session.id)
+    assert after.origin == "harness"
+    assert after.backend == "codex"
+    assert after.codex_internal_id == rollout_uuid
+
+    messages = repository.list_messages(harness_session.id)
+    assert any(message.blocks[0].text == "hello" for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_reconcile_when_cwd_differs(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    harness_session = Session(
+        id="ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/other-repo", name="other-repo"),
+        status="running",
+        origin="harness",
+        created_at=datetime(2026, 5, 11, 12, 22, 30, tzinfo=UTC),
+    )
+    repository.upsert_session(harness_session)
+
+    rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+    transcript = _write_codex_rollout(
+        base_dir=tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",  # mismatched
+        session_meta_ts="2026-05-11T12:22:34.777Z",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(transcript)
+
+    # External row registered as today.
+    assert repository.has_session(f"codex_{rollout_uuid}")
+    assert repository.get_session(harness_session.id).codex_internal_id is None
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_reconcile_outside_time_window(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    # Harness session was created 60s *before* the rollout's session_meta ts —
+    # outside the 30s window.
+    harness_session = Session(
+        id="ses_cccccccccccccccccccccccccccccccc",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        created_at=datetime(2026, 5, 11, 12, 21, 34, tzinfo=UTC),  # 60s earlier
+    )
+    repository.upsert_session(harness_session)
+
+    rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+    transcript = _write_codex_rollout(
+        base_dir=tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-11T12:22:34.777Z",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(transcript)
+
+    assert repository.has_session(f"codex_{rollout_uuid}")
+    assert repository.get_session(harness_session.id).codex_internal_id is None
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_reconcile_terminal_session(tmp_path) -> None:
+    """Post-mortem replay of a completed (``archived``) harness session is a
+    legitimate independent observation, not a duplicate."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    harness_session = Session(
+        id="ses_dddddddddddddddddddddddddddddddd",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="archived",
+        origin="harness",
+        created_at=datetime(2026, 5, 11, 12, 22, 30, tzinfo=UTC),
+    )
+    repository.upsert_session(harness_session)
+
+    rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+    transcript = _write_codex_rollout(
+        base_dir=tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-11T12:22:34.777Z",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(transcript)
+
+    assert repository.has_session(f"codex_{rollout_uuid}")
+    assert repository.get_session(harness_session.id).codex_internal_id is None
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_reconcile_claude(tmp_path) -> None:
+    """Reconcile is codex-only: a claude rollout that happens to share a
+    cwd with a non-terminal harness codex session must still go through the
+    existing ``ses_<hex>`` exact-id match path (handled by the rollout
+    filename = harness session id contract), not the codex reconcile."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    harness_codex = Session(
+        id="ses_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        created_at=datetime(2026, 5, 11, 12, 22, 30, tzinfo=UTC),
+    )
+    repository.upsert_session(harness_codex)
+
+    claude_uuid = "123e4567-e89b-12d3-a456-426614174000"
+    claude_transcript = claude_transcript_path("/repo", claude_uuid, home=tmp_path)
+    claude_transcript.parent.mkdir(parents=True, exist_ok=True)
+    claude_transcript.write_text(
+        '{"type":"user","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+        '"message":{"role":"user","model":"claude-opus","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(claude_transcript)
+
+    # Claude path is keyed by ses_<hex from filename>, not by reconcile.
+    claude_session_id = external_session_id_from_claude_path(claude_transcript)
+    assert claude_session_id != harness_codex.id
+    assert repository.has_session(claude_session_id)
+    # Harness codex session is untouched.
+    assert repository.get_session(harness_codex.id).codex_internal_id is None
+
+
+@pytest.mark.asyncio
+async def test_observer_codex_internal_id_persists_across_restart(tmp_path) -> None:
+    """Once the binding is persisted on the harness session, a fresh
+    observer (post-restart) must continue to route this rollout's events
+    to the harness session — without re-running the time-window reconcile
+    (which might fail if the session has since been archived)."""
+    from datetime import UTC, datetime
+
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    try:
+        harness_session = Session(
+            id="ses_ffffffffffffffffffffffffffffffff",
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+            status="running",
+            origin="harness",
+            created_at=datetime(2026, 5, 11, 12, 22, 30, tzinfo=UTC),
+        )
+        repository.upsert_session(harness_session)
+
+        rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+        transcript = _write_codex_rollout(
+            base_dir=tmp_path,
+            rollout_uuid=rollout_uuid,
+            cwd="/repo",
+            session_meta_ts="2026-05-11T12:22:34.777Z",
+        )
+
+        bus = DurableEventBus(repository)
+        observer = ExternalTranscriptObserver(bus, repository=repository)
+        await observer.tail_file(transcript)
+
+        after_bind = repository.get_session(harness_session.id)
+        assert after_bind.codex_internal_id == rollout_uuid
+    finally:
+        repository.close()
+
+    # Reopen — simulate observer restart. Append one more rollout line; the
+    # fresh observer must route it to the harness session.
+    repository = open_sqlite_repository(db_path)
+    try:
+        # Append a new event line; offset persistence means the observer
+        # only re-reads from here.
+        with transcript.open("a", encoding="utf-8") as fh:
+            fh.write(
+                '{"type":"event_msg","payload":{"type":"user_message","message":"resumed"}}\n'
+            )
+
+        bus = DurableEventBus(repository)
+        observer = ExternalTranscriptObserver(bus, repository=repository)
+        await observer.tail_file(transcript)
+
+        # No phantom codex_ row created post-restart either.
+        assert not repository.has_session(f"codex_{rollout_uuid}")
+
+        # The harness session received the resumed event.
+        messages = repository.list_messages(harness_session.id)
+        assert any(message.blocks[0].text == "resumed" for message in messages)
+    finally:
+        repository.close()

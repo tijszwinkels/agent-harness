@@ -17,10 +17,13 @@ from agent_harness.models import (
     Run,
     RunStatus,
     Session,
+    SessionStats,
     StopReason,
+    Usage,
     utc_now,
 )
 from agent_harness.repository import RunNotFoundError, SessionNotFoundError
+from agent_harness.usage import apply_run_usage
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +248,16 @@ class SQLiteRepository:
             self._upsert_session(updated)
         return updated.model_copy(deep=True)
 
+    def update_session_stats(self, session_id: str, stats: SessionStats) -> Session:
+        with self._lock, self._connection:
+            session = self._find_session_locked(session_id)
+            if session is None:
+                logger.warning("SQLite stats update failed because session was not found: %s", session_id)
+                raise SessionNotFoundError(session_id)
+            updated = session.model_copy(update={"stats": stats, "updated_at": utc_now()})
+            self._upsert_session(updated)
+        return updated.model_copy(deep=True)
+
     def create_run(self, session_id: str, request: CreateRunRequest) -> Run:
         # Runs are born ``queued`` and stay that way until the orchestrator
         # spawns the subprocess (see ``start_run``). Mirrors InMemoryRepository.
@@ -342,6 +355,20 @@ class SQLiteRepository:
             logger.warning("SQLite run lookup failed: session=%s run=%s", session_id, run_id)
             raise RunNotFoundError(run_id)
         return _model_from_row(row, "payload", Run)
+
+    def update_run_usage(self, run_id: str, usage: Usage) -> Run:
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "select payload from runs where id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                logger.warning("SQLite usage update failed because run was not found: %s", run_id)
+                raise RunNotFoundError(run_id)
+            run = _model_from_row(row, "payload", Run)
+            updated = run.model_copy(update={"usage": usage})
+            self._upsert_run(updated)
+        return updated.model_copy(deep=True)
 
     def interrupt_run(self, session_id: str, run_id: str) -> Run:
         with self._lock, self._connection:
@@ -473,6 +500,8 @@ class SQLiteRepository:
             self._insert_event(published)
             if published.event in RUN_LIFECYCLE_EVENTS:
                 self._materialize_run_lifecycle_event(published)
+            if published.event == "run.usage":
+                self._materialize_run_usage_event(published)
             if (
                 published.event == "message"
                 and published.session_id
@@ -502,11 +531,17 @@ class SQLiteRepository:
                     # the upsert in that case; for absent or already-external
                     # records the observer remains the source of truth.
                     if existing is None or existing.origin == "external":
+                        if existing is not None:
+                            incoming = incoming.model_copy(update={"stats": existing.stats})
                         self._upsert_session(incoming)
                 return
 
             if event.event in RUN_LIFECYCLE_EVENTS:
                 self._materialize_run_lifecycle_event(event)
+                return
+
+            if event.event == "run.usage":
+                self._materialize_run_usage_event(event)
                 return
 
             if event.event == "message":
@@ -643,6 +678,63 @@ class SQLiteRepository:
             ),
         )
         self._message_keys.setdefault(session_id, set()).add(_message_key(message))
+
+    def _materialize_run_usage_event(self, event: Event) -> None:
+        if event.session_id is None:
+            logger.warning(
+                "SQLite usage materialization skipped event without session id: sequence=%s",
+                event.sequence,
+            )
+            return
+        usage_data = event.data.get("usage")
+        context_window = event.data.get("context_window")
+        if not isinstance(context_window, int):
+            context_window = None
+        if not isinstance(usage_data, dict) and context_window is None:
+            logger.warning(
+                "SQLite usage materialization skipped event without usage payload: session=%s run=%s sequence=%s",
+                event.session_id,
+                event.run_id,
+                event.sequence,
+            )
+            return
+        try:
+            usage = Usage.model_validate(usage_data) if isinstance(usage_data, dict) else Usage()
+        except ValueError:
+            logger.exception(
+                "SQLite usage materialization skipped invalid usage: session=%s run=%s sequence=%s",
+                event.session_id,
+                event.run_id,
+                event.sequence,
+            )
+            return
+        run_id = event.run_id or self._active_run_id_locked(event.session_id)
+        if run_id is None:
+            logger.warning(
+                "SQLite usage materialization skipped because no run exists: session=%s sequence=%s",
+                event.session_id,
+                event.sequence,
+            )
+            return
+        apply_run_usage(
+            self,
+            session_id=event.session_id,
+            run_id=run_id,
+            usage=usage,
+            context_window=context_window,
+        )
+
+    def _active_run_id_locked(self, session_id: str) -> str | None:
+        rows = self._connection.execute(
+            "select payload from runs where session_id = ? order by rowid",
+            (session_id,),
+        ).fetchall()
+        runs = [_model_from_row(row, "payload", Run) for row in rows]
+        for status in ("running", "queued"):
+            for run in reversed(runs):
+                if run.status == status:
+                    return run.id
+        return runs[-1].id if runs else None
 
     def _insert_message_if_new(self, session_id: str, message: Message) -> bool:
         keys = self._message_keys.get(session_id)

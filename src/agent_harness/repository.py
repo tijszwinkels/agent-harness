@@ -11,9 +11,12 @@ from agent_harness.models import (
     Run,
     RunStatus,
     Session,
+    SessionStats,
     StopReason,
+    Usage,
     utc_now,
 )
+from agent_harness.usage import apply_run_usage
 
 
 class SessionNotFoundError(KeyError):
@@ -81,6 +84,15 @@ class InMemoryRepository:
             if not fields:
                 return session.model_copy(deep=True)
             updated = session.model_copy(update={**fields, "updated_at": utc_now()})
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
+    def update_session_stats(self, session_id: str, stats: SessionStats) -> Session:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            updated = session.model_copy(update={"stats": stats, "updated_at": utc_now()})
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
@@ -166,6 +178,15 @@ class InMemoryRepository:
         if run is None or run.session_id != session_id:
             raise RunNotFoundError(run_id)
         return run.model_copy(deep=True)
+
+    def update_run_usage(self, run_id: str, usage: Usage) -> Run:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise RunNotFoundError(run_id)
+            updated = run.model_copy(update={"usage": usage})
+            self._runs[run_id] = updated
+            return updated.model_copy(deep=True)
 
     def interrupt_run(self, session_id: str, run_id: str) -> Run:
         with self._lock:
@@ -255,11 +276,17 @@ class InMemoryRepository:
                 # rationale (a downgrade causes the bridge to adopt the
                 # channel away from the live session on next MM post).
                 if existing is None or existing.origin == "external":
+                    if existing is not None:
+                        incoming = incoming.model_copy(update={"stats": existing.stats})
                     self.upsert_session(incoming)
             return
 
         if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
             self._materialize_run_lifecycle_event(event)
+            return
+
+        if event.event == "run.usage":
+            self._materialize_run_usage_event(event)
             return
 
         if event.event == "message":
@@ -318,6 +345,35 @@ class InMemoryRepository:
                     "stats": session.stats.model_copy(update={"messages": session.stats.messages + 1}),
                 }
             )
+
+    def _materialize_run_usage_event(self, event: Event) -> None:
+        if event.session_id is None:
+            return
+        usage_data = event.data.get("usage")
+        context_window = event.data.get("context_window")
+        if not isinstance(context_window, int):
+            context_window = None
+        if not isinstance(usage_data, dict) and context_window is None:
+            return
+        usage = Usage.model_validate(usage_data) if isinstance(usage_data, dict) else Usage()
+        run_id = event.run_id or self._active_run_id(event.session_id)
+        if run_id is None:
+            return
+        apply_run_usage(
+            self,
+            session_id=event.session_id,
+            run_id=run_id,
+            usage=usage,
+            context_window=context_window,
+        )
+
+    def _active_run_id(self, session_id: str) -> str | None:
+        runs = [run for run in self._runs.values() if run.session_id == session_id]
+        for status in ("running", "queued"):
+            for run in reversed(runs):
+                if run.status == status:
+                    return run.id
+        return runs[-1].id if runs else None
 
 
 def _messages_equivalent(left: Message, right: Message) -> bool:

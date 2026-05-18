@@ -1,8 +1,9 @@
 import sqlite3
 
-from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Project, Session
+from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Message, Project, Session, Usage
 from agent_harness.repository import InMemoryRepository
 from agent_harness.storage import SCHEMA_VERSION, open_sqlite_repository
+from agent_harness.usage import apply_run_usage
 
 
 def test_sqlite_repository_persists_sessions_runs_and_messages_after_reopen(tmp_path) -> None:
@@ -65,6 +66,56 @@ def test_sqlite_repository_persists_materialized_external_events_after_reopen(tm
     assert [item.id for item in reopened.list_messages(session.id)] == [message.id]
     assert [event.sequence for event in reopened.list_events(session_id=session.id)] == [1, 2]
     reopened.close()
+
+
+def test_session_stats_aggregation() -> None:
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run_a = repository.create_run(session.id, CreateRunRequest(message="first"))
+    run_b = repository.create_run(session.id, CreateRunRequest(message="second"))
+
+    apply_run_usage(
+        repository,
+        session_id=session.id,
+        run_id=run_a.id,
+        usage=Usage(input=10, output=2, cache_read=7, cache_creation=0),
+        context_window=258400,
+    )
+    apply_run_usage(
+        repository,
+        session_id=session.id,
+        run_id=run_b.id,
+        usage=Usage(input=5, output=3, cache_read=11, cache_creation=13, cost_usd=0.25),
+    )
+
+    assert repository.get_run(session.id, run_a.id).usage == Usage(
+        input=10,
+        output=2,
+        cache_read=7,
+        cache_creation=0,
+    )
+    assert repository.get_run(session.id, run_b.id).usage == Usage(
+        input=5,
+        output=3,
+        cache_read=11,
+        cache_creation=13,
+        cost_usd=0.25,
+    )
+    stats = repository.get_session(session.id).stats
+    assert stats.tokens == {
+        "input": 15,
+        "output": 5,
+        "cache_read": 18,
+        "cache_creation": 13,
+    }
+    assert stats.cost_usd == 0.25
+    assert stats.context_window == 258400
 
 
 def test_sqlite_repository_append_event_materializes_messages(tmp_path) -> None:

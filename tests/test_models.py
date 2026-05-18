@@ -10,6 +10,7 @@ from agent_harness.models import (
     Project,
     Run,
     Session,
+    SessionStats,
     TextBlock,
     ToolUseBlock,
 )
@@ -103,3 +104,11 @@ def test_run_model_defaults_to_queued_lifecycle() -> None:
 def test_create_run_request_requires_message_text() -> None:
     with pytest.raises(ValidationError):
         CreateRunRequest(message="")
+
+
+def test_models_session_stats_context_window_field() -> None:
+    assert SessionStats().context_window is None
+    assert SessionStats(context_window=258400).context_window == 258400
+
+    with pytest.raises(ValidationError):
+        SessionStats(context_window=0)

@@ -318,14 +318,19 @@ class InMemoryRepository:
         earliest_event_at: datetime,
         window_seconds: float = 30.0,
     ) -> Session | None:
-        # Return the most recently-created non-terminal harness codex session
-        # whose project.path matches ``cwd`` and whose ``created_at`` lies
-        # within ``window_seconds`` of the rollout's earliest event timestamp.
-        # Sessions already bound to a different rollout (``codex_internal_id``
-        # set) are excluded so a second rollout in the same cwd can't steal
-        # the first rollout's session.
+        # Return the non-terminal harness codex session in ``cwd`` whose
+        # ``created_at`` is CLOSEST in time to ``earliest_event_at``, within
+        # ``window_seconds``. Sessions already bound to a different rollout
+        # (``codex_internal_id`` set) are excluded so a second rollout in
+        # the same cwd can't steal the first rollout's session.
+        #
+        # The "closest" tiebreaker matters when two harness codex sessions
+        # are spawned back-to-back in the same cwd: picking "most recently
+        # created" would mis-bind the first rollout to the second session,
+        # because the second session's ``created_at`` is the larger value.
         window = timedelta(seconds=window_seconds)
         best: Session | None = None
+        best_delta: timedelta | None = None
         with self._lock:
             for session in self._sessions.values():
                 if session.backend != "codex":
@@ -338,10 +343,12 @@ class InMemoryRepository:
                     continue
                 if session.project.path != cwd:
                     continue
-                if abs(session.created_at - earliest_event_at) > window:
+                delta = abs(session.created_at - earliest_event_at)
+                if delta > window:
                     continue
-                if best is None or session.created_at > best.created_at:
+                if best_delta is None or delta < best_delta:
                     best = session
+                    best_delta = delta
         return best.model_copy(deep=True) if best is not None else None
 
     def find_session_by_codex_internal_id(self, internal_id: str) -> Session | None:

@@ -568,9 +568,9 @@ class SQLiteRepository:
         window_seconds: float = 30.0,
     ) -> Session | None:
         # See ``InMemoryRepository.find_recent_codex_harness_session`` for the
-        # match criteria. The SQL filters the obvious dimensions; Python does
-        # the time-window comparison so we don't have to teach SQLite to
-        # parse pydantic-stored ISO timestamps.
+        # match criteria. The SQL filters the cheap dimensions; Python picks
+        # the closest-in-time candidate (rather than "most recently created")
+        # so back-to-back harness sessions in the same cwd bind correctly.
         window = timedelta(seconds=window_seconds)
         with self._lock:
             rows = self._connection.execute(
@@ -580,18 +580,22 @@ class SQLiteRepository:
                   and json_extract(payload, '$.origin') = 'harness'
                   and json_extract(payload, '$.project.path') = ?
                   and json_extract(payload, '$.codex_internal_id') is null
-                order by created_at desc
                 """,
                 (cwd,),
             ).fetchall()
+        best: Session | None = None
+        best_delta: timedelta | None = None
         for row in rows:
             session = _model_from_row(row, "payload", Session)
             if session.status in _RECONCILE_TERMINAL_SESSION_STATUSES:
                 continue
-            if abs(session.created_at - earliest_event_at) > window:
+            delta = abs(session.created_at - earliest_event_at)
+            if delta > window:
                 continue
-            return session
-        return None
+            if best_delta is None or delta < best_delta:
+                best = session
+                best_delta = delta
+        return best
 
     def find_session_by_codex_internal_id(self, internal_id: str) -> Session | None:
         with self._lock:

@@ -57,6 +57,14 @@ class TranscriptIdentity:
     backend: BackendName
     path: Path
     session_id: str
+    # True when ``session_id`` has been rebound to an existing harness
+    # session id (instead of the synthesized ``codex_<uuid>`` form), via
+    # the observer's codex reconcile pre-check. Suppresses the synthetic
+    # ``session.updated`` (origin=external) event the parser would
+    # otherwise emit — that session already exists and is harness-owned;
+    # emitting it would be a redundant noop at materialize_event time
+    # but still travels the event bus and confuses bridge subscribers.
+    is_rebound: bool = False
 
 
 class ObserverOffsetStore(Protocol):
@@ -123,6 +131,78 @@ class ObserverState:
 
 DEFAULT_IDLE_AFTER_SECONDS = 30.0
 
+# Sentinel: ``None`` is a real cache value ("we checked, no rebind"), so we
+# need a distinct sentinel for "not yet in cache".
+_UNSET: object = object()
+
+
+def _rebind_identity(identity: TranscriptIdentity, session_id: str) -> TranscriptIdentity:
+    return TranscriptIdentity(
+        backend=identity.backend,
+        path=identity.path,
+        session_id=session_id,
+        is_rebound=True,
+    )
+
+
+def _codex_rollout_uuid_from_path(path: Path) -> str | None:
+    match = _CODEX_ROLLOUT_RE.match(path.name)
+    if match is None:
+        return None
+    return match.group("uuid")
+
+
+def _peek_codex_session_meta(path: Path) -> tuple[str | None, datetime | None]:
+    """Read the first ``session_meta`` record from a codex rollout file and
+    return ``(cwd, earliest_event_at)``. Returns ``(None, None)`` if the
+    file cannot be opened, the first complete line isn't ``session_meta``,
+    or the payload is missing fields.
+
+    Only the first complete line is inspected — codex rollouts emit
+    ``session_meta`` at index 0, and we don't want this peek to drift if
+    the file grows during inspection.
+    """
+    try:
+        with path.open("rb") as fh:
+            first = fh.readline()
+    except OSError:
+        logger.exception("Codex reconcile: failed to peek rollout file: %s", path)
+        return None, None
+    if not first.endswith(b"\n"):
+        # Partial flush — caller will retry next tail.
+        return None, None
+    try:
+        record = json.loads(first.decode("utf-8", errors="replace").strip())
+    except JSONDecodeError:
+        logger.warning("Codex reconcile: malformed first record in %s", path)
+        return None, None
+    if not isinstance(record, Mapping):
+        return None, None
+    if record.get("type") != "session_meta":
+        return None, None
+    payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
+    cwd = _string_value(payload.get("cwd"))
+    # Prefer the OUTER timestamp on the session_meta record — it's the
+    # rollout's earliest event timestamp. Fall back to the inner payload
+    # timestamp if absent (older codex versions may not have stamped the
+    # outer record).
+    ts_str = _string_value(record.get("timestamp")) or _string_value(payload.get("timestamp"))
+    if not ts_str:
+        return cwd, None
+    try:
+        # ``datetime.fromisoformat`` handles trailing ``Z`` only from 3.11+;
+        # normalize to ``+00:00`` to stay backwards compatible.
+        normalized = ts_str.replace("Z", "+00:00")
+        ts = datetime.fromisoformat(normalized)
+    except ValueError:
+        logger.warning(
+            "Codex reconcile: unparseable session_meta timestamp: %s in %s",
+            ts_str,
+            path,
+        )
+        return cwd, None
+    return cwd, ts
+
 
 class ExternalTranscriptObserver:
     def __init__(
@@ -152,6 +232,12 @@ class ExternalTranscriptObserver:
         # threshold flips silent sessions to idle; a fresh event on an idle
         # session kicks it back to running.
         self._last_event_at: dict[str, datetime] = {}
+        # Per-path codex reconcile cache. Maps a rollout path to the
+        # harness session id its events should route to. ``None`` records
+        # "we already checked, no match" so we don't re-scan on every
+        # ``tail_file`` invocation. Seeded at __init__ from sessions whose
+        # ``codex_internal_id`` has been persisted by a previous bind.
+        self._codex_rebind_cache: dict[Path, str | None] = {}
         # Seed last-seen timestamps from the repository so freshness_tick
         # can heal records that pre-date this process. Without this seed,
         # restarts leave already-stale running sessions stranded — the
@@ -177,6 +263,108 @@ class ExternalTranscriptObserver:
             # exactly once, which is the desired migration behavior.
             self._last_event_at[session.id] = session.updated_at
 
+    def _resolve_codex_identity(
+        self, transcript_path: Path, identity: TranscriptIdentity
+    ) -> TranscriptIdentity:
+        """Codex reconcile pre-check.
+
+        For a freshly-discovered codex rollout, look for a non-terminal
+        harness codex session that this rollout almost certainly belongs
+        to (cwd match + time window). On match, rebind the identity so
+        downstream events route to the harness session id; persist the
+        binding on the harness session so it survives observer restart.
+
+        Non-codex backends are returned unchanged. The rebind cache makes
+        this a no-op after the first call for a given path.
+        """
+        if identity.backend != "codex" or self._repository is None:
+            return identity
+
+        cached = self._codex_rebind_cache.get(transcript_path, _UNSET)
+        if cached is not _UNSET:
+            if cached is None:
+                return identity
+            return _rebind_identity(identity, cached)
+
+        rollout_uuid = _codex_rollout_uuid_from_path(transcript_path)
+        if rollout_uuid is None:
+            self._codex_rebind_cache[transcript_path] = None
+            return identity
+
+        # Restart path: a previous observer process may have already bound
+        # this rollout to a harness session — re-derive without re-running
+        # the time-window match (the session may have been archived since).
+        try:
+            prior = self._find_session_by_codex_internal_id(rollout_uuid)
+        except Exception:
+            logger.exception(
+                "Codex reconcile lookup-by-uuid failed: rollout=%s", rollout_uuid
+            )
+            prior = None
+        if prior is not None:
+            self._codex_rebind_cache[transcript_path] = prior.id
+            return _rebind_identity(identity, prior.id)
+
+        # Fresh path: peek the rollout's first ``session_meta`` record for
+        # cwd + earliest_event_at and run the 30s window match.
+        rollout_cwd, earliest_ts = _peek_codex_session_meta(transcript_path)
+        if rollout_cwd is None or earliest_ts is None:
+            self._codex_rebind_cache[transcript_path] = None
+            return identity
+
+        try:
+            harness_session = self._find_recent_codex_harness_session(
+                cwd=rollout_cwd, earliest_event_at=earliest_ts
+            )
+        except Exception:
+            logger.exception(
+                "Codex reconcile lookup failed: cwd=%s ts=%s", rollout_cwd, earliest_ts
+            )
+            harness_session = None
+
+        if harness_session is None:
+            self._codex_rebind_cache[transcript_path] = None
+            return identity
+
+        try:
+            self._repository.bind_codex_rollout(harness_session.id, rollout_uuid)
+        except Exception:
+            logger.exception(
+                "Codex reconcile persist failed; falling back to external row: "
+                "session=%s rollout=%s",
+                harness_session.id,
+                rollout_uuid,
+            )
+            self._codex_rebind_cache[transcript_path] = None
+            return identity
+
+        logger.info(
+            "Codex rollout reconciled to harness session: rollout=%s session=%s cwd=%s",
+            rollout_uuid,
+            harness_session.id,
+            rollout_cwd,
+        )
+        self._codex_rebind_cache[transcript_path] = harness_session.id
+        return _rebind_identity(identity, harness_session.id)
+
+    def _find_session_by_codex_internal_id(self, internal_id: str) -> Session | None:
+        if self._repository is None:
+            return None
+        lookup = getattr(self._repository, "find_session_by_codex_internal_id", None)
+        if callable(lookup):
+            return lookup(internal_id)
+        return None
+
+    def _find_recent_codex_harness_session(
+        self, *, cwd: str, earliest_event_at: datetime
+    ) -> Session | None:
+        if self._repository is None:
+            return None
+        finder = getattr(self._repository, "find_recent_codex_harness_session", None)
+        if callable(finder):
+            return finder(cwd=cwd, earliest_event_at=earliest_event_at)
+        return None
+
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)
         try:
@@ -184,6 +372,8 @@ class ExternalTranscriptObserver:
         except ValueError:
             logger.warning("Unsupported transcript path: %s", transcript_path)
             return []
+
+        identity = self._resolve_codex_identity(transcript_path, identity)
 
         published: list[Event] = []
         try:
@@ -683,6 +873,13 @@ def _session_event_if_complete(
     offset: int | None,
 ) -> list[Event]:
     if not cwd or not model:
+        return []
+    # When the identity has been rebound to a harness session id via the
+    # observer's reconcile pre-check, the harness session already exists —
+    # synthesizing a fresh ``session.updated`` with ``origin=external``
+    # would be a redundant write at materialize time (the origin-downgrade
+    # guard skips it) but the event still flows through the bus. Skip it.
+    if identity.is_rebound:
         return []
 
     session = Session(

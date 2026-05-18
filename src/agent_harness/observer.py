@@ -152,11 +152,24 @@ def _codex_rollout_uuid_from_path(path: Path) -> str | None:
     return match.group("uuid")
 
 
-def _peek_codex_session_meta(path: Path) -> tuple[str | None, datetime | None]:
-    """Read the first ``session_meta`` record from a codex rollout file and
-    return ``(cwd, earliest_event_at)``. Returns ``(None, None)`` if the
-    file cannot be opened, the first complete line isn't ``session_meta``,
-    or the payload is missing fields.
+@dataclass(frozen=True, slots=True)
+class _SessionMetaPeek:
+    """Outcome of peeking a codex rollout's first record.
+
+    ``retry`` distinguishes "file isn't fully flushed yet, try again" from
+    "we have read enough to know this rollout will never reconcile". The
+    observer caches the latter as ``None`` but must NOT cache the former,
+    otherwise a rollout observed during its initial partial flush would
+    permanently lose its chance to reconcile.
+    """
+
+    cwd: str | None
+    earliest_event_at: datetime | None
+    retry: bool = False
+
+
+def _peek_codex_session_meta(path: Path) -> _SessionMetaPeek:
+    """Read the first ``session_meta`` record from a codex rollout file.
 
     Only the first complete line is inspected — codex rollouts emit
     ``session_meta`` at index 0, and we don't want this peek to drift if
@@ -167,19 +180,21 @@ def _peek_codex_session_meta(path: Path) -> tuple[str | None, datetime | None]:
             first = fh.readline()
     except OSError:
         logger.exception("Codex reconcile: failed to peek rollout file: %s", path)
-        return None, None
+        return _SessionMetaPeek(cwd=None, earliest_event_at=None, retry=True)
     if not first.endswith(b"\n"):
-        # Partial flush — caller will retry next tail.
-        return None, None
+        # Partial flush — caller will retry next tail. Distinguished from
+        # the "we read a full line but it doesn't qualify" terminal cases
+        # below so the rebind cache doesn't latch a premature "no match".
+        return _SessionMetaPeek(cwd=None, earliest_event_at=None, retry=True)
     try:
         record = json.loads(first.decode("utf-8", errors="replace").strip())
     except JSONDecodeError:
         logger.warning("Codex reconcile: malformed first record in %s", path)
-        return None, None
+        return _SessionMetaPeek(cwd=None, earliest_event_at=None)
     if not isinstance(record, Mapping):
-        return None, None
+        return _SessionMetaPeek(cwd=None, earliest_event_at=None)
     if record.get("type") != "session_meta":
-        return None, None
+        return _SessionMetaPeek(cwd=None, earliest_event_at=None)
     payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
     cwd = _string_value(payload.get("cwd"))
     # Prefer the OUTER timestamp on the session_meta record — it's the
@@ -188,7 +203,7 @@ def _peek_codex_session_meta(path: Path) -> tuple[str | None, datetime | None]:
     # outer record).
     ts_str = _string_value(record.get("timestamp")) or _string_value(payload.get("timestamp"))
     if not ts_str:
-        return cwd, None
+        return _SessionMetaPeek(cwd=cwd, earliest_event_at=None)
     try:
         # ``datetime.fromisoformat`` handles trailing ``Z`` only from 3.11+;
         # normalize to ``+00:00`` to stay backwards compatible.
@@ -200,8 +215,8 @@ def _peek_codex_session_meta(path: Path) -> tuple[str | None, datetime | None]:
             ts_str,
             path,
         )
-        return cwd, None
-    return cwd, ts
+        return _SessionMetaPeek(cwd=cwd, earliest_event_at=None)
+    return _SessionMetaPeek(cwd=cwd, earliest_event_at=ts)
 
 
 class ExternalTranscriptObserver:
@@ -307,10 +322,17 @@ class ExternalTranscriptObserver:
 
         # Fresh path: peek the rollout's first ``session_meta`` record for
         # cwd + earliest_event_at and run the 30s window match.
-        rollout_cwd, earliest_ts = _peek_codex_session_meta(transcript_path)
-        if rollout_cwd is None or earliest_ts is None:
+        peek = _peek_codex_session_meta(transcript_path)
+        if peek.retry:
+            # File hasn't fully flushed yet (no trailing newline on the
+            # first record, or OSError). Do NOT cache — next tail will
+            # retry the peek and may then have enough data to reconcile.
+            return identity
+        if peek.cwd is None or peek.earliest_event_at is None:
             self._codex_rebind_cache[transcript_path] = None
             return identity
+        rollout_cwd = peek.cwd
+        earliest_ts = peek.earliest_event_at
 
         try:
             harness_session = self._find_recent_codex_harness_session(

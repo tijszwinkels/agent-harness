@@ -1376,6 +1376,110 @@ async def test_observer_does_not_reconcile_claude(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_observer_reconcile_retries_after_partial_flush(tmp_path) -> None:
+    """If the rollout file is observed during its initial partial flush
+    (the first line hasn't been newline-terminated yet), the reconcile
+    pre-check must NOT latch a permanent "no rebind" decision. The next
+    tail call — after the file is fully flushed — should still be able
+    to bind."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    harness_session = Session(
+        id="ses_aaaaaaaabbbbccccddddeeeeffff0000",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        created_at=datetime(2026, 5, 11, 12, 22, 30, tzinfo=UTC),
+    )
+    repository.upsert_session(harness_session)
+
+    rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+    transcript_dir = tmp_path / ".codex" / "sessions" / "2026" / "05" / "08"
+    transcript = transcript_dir / f"rollout-2026-05-08T10-30-00-{rollout_uuid}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    # Write a partial first line (no trailing newline) — simulates the
+    # writer mid-flush.
+    transcript.write_text(
+        '{"timestamp":"2026-05-11T12:22:34.777Z","type":"session_meta","payload":'
+        '{"id":"' + rollout_uuid + '","timestamp":"2026-05-11T12:22:34.777Z",'
+        '"cwd":"/repo"',
+        encoding="utf-8",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(transcript)
+    # Partial flush: no rebind yet, but importantly the cache must NOT have
+    # latched a permanent "no match".
+    assert repository.get_session(harness_session.id).codex_internal_id is None
+
+    # Now complete the file (newline + valid second/third records).
+    transcript.write_text(
+        '{"timestamp":"2026-05-11T12:22:34.777Z","type":"session_meta","payload":'
+        '{"id":"' + rollout_uuid + '","timestamp":"2026-05-11T12:22:34.777Z",'
+        '"cwd":"/repo"}}\n'
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n',
+        encoding="utf-8",
+    )
+    await observer.tail_file(transcript)
+
+    # Reconcile fires on the retry — no phantom external row, binding set.
+    assert not repository.has_session(f"codex_{rollout_uuid}")
+    assert repository.get_session(harness_session.id).codex_internal_id == rollout_uuid
+
+
+@pytest.mark.asyncio
+async def test_observer_reconcile_picks_closest_in_time_session(tmp_path) -> None:
+    """Two harness codex sessions in the same cwd within 30s. The first
+    rollout must bind to the session whose ``created_at`` is closest to
+    its earliest event, not the most-recently-created one."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    older = Session(
+        id="ses_oooooooooooooooooooooooooooooooo",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        # The first rollout's session_meta will be at 12:22:34, so this
+        # session is the close match (1s away).
+        created_at=datetime(2026, 5, 11, 12, 22, 33, tzinfo=UTC),
+    )
+    newer = Session(
+        id="ses_nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        # Created 8s later than the older one, both within the 30s window.
+        created_at=datetime(2026, 5, 11, 12, 22, 41, tzinfo=UTC),
+    )
+    repository.upsert_session(older)
+    repository.upsert_session(newer)
+
+    rollout_uuid = "019e16fd-39c8-7e81-9954-b842b44511c9"
+    transcript = _write_codex_rollout(
+        base_dir=tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-11T12:22:34.000Z",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    await observer.tail_file(transcript)
+
+    assert repository.get_session(older.id).codex_internal_id == rollout_uuid
+    assert repository.get_session(newer.id).codex_internal_id is None
+    assert not repository.has_session(f"codex_{rollout_uuid}")
+
+
+@pytest.mark.asyncio
 async def test_observer_codex_internal_id_persists_across_restart(tmp_path) -> None:
     """Once the binding is persisted on the harness session, a fresh
     observer (post-restart) must continue to route this rollout's events

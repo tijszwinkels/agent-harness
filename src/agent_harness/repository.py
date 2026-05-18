@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from threading import RLock
 
 from agent_harness.models import (
@@ -14,6 +15,13 @@ from agent_harness.models import (
     StopReason,
     utc_now,
 )
+
+# Session statuses that count as "terminal" for the codex reconcile pre-check.
+# Session.status is one of {idle, running, waiting_for_input, archived}; only
+# archived is a true terminal — the rest are transient states that the harness
+# can resume from. Spec wording "completed/error/interrupted" describes Run
+# lifecycle, not Session; the Session-level analogue is archived.
+_RECONCILE_TERMINAL_SESSION_STATUSES = frozenset({"archived"})
 
 
 class SessionNotFoundError(KeyError):
@@ -302,6 +310,60 @@ class InMemoryRepository:
         with self._lock:
             self._sessions[session.id] = session
             self._messages.setdefault(session.id, [])
+
+    def find_recent_codex_harness_session(
+        self,
+        *,
+        cwd: str,
+        earliest_event_at: datetime,
+        window_seconds: float = 30.0,
+    ) -> Session | None:
+        # Return the most recently-created non-terminal harness codex session
+        # whose project.path matches ``cwd`` and whose ``created_at`` lies
+        # within ``window_seconds`` of the rollout's earliest event timestamp.
+        # Sessions already bound to a different rollout (``codex_internal_id``
+        # set) are excluded so a second rollout in the same cwd can't steal
+        # the first rollout's session.
+        window = timedelta(seconds=window_seconds)
+        best: Session | None = None
+        with self._lock:
+            for session in self._sessions.values():
+                if session.backend != "codex":
+                    continue
+                if session.origin != "harness":
+                    continue
+                if session.status in _RECONCILE_TERMINAL_SESSION_STATUSES:
+                    continue
+                if session.codex_internal_id is not None:
+                    continue
+                if session.project.path != cwd:
+                    continue
+                if abs(session.created_at - earliest_event_at) > window:
+                    continue
+                if best is None or session.created_at > best.created_at:
+                    best = session
+        return best.model_copy(deep=True) if best is not None else None
+
+    def find_session_by_codex_internal_id(self, internal_id: str) -> Session | None:
+        # Used by the observer on restart to re-derive the path→harness
+        # binding without rerunning the time-window match (which may now
+        # fail if the harness session has been archived since the bind).
+        with self._lock:
+            for session in self._sessions.values():
+                if session.codex_internal_id == internal_id:
+                    return session.model_copy(deep=True)
+        return None
+
+    def bind_codex_rollout(self, session_id: str, internal_id: str) -> Session:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            updated = session.model_copy(
+                update={"codex_internal_id": internal_id, "updated_at": utc_now()}
+            )
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
 
     def add_message(self, session_id: str, message: Message) -> None:
         with self._lock:

@@ -145,6 +145,13 @@ class Session(HarnessModel):
     # (`--dangerously-skip-permissions` for claude-code,
     # `--dangerously-bypass-approvals-and-sandbox` for codex).
     bypass_permissions: bool = False
+    # Codex rollout UUID once the harness session has been bound to a
+    # specific rollout file (see observer's reconcile pre-check). Only
+    # set for harness-origin codex sessions; ``None`` otherwise. Persists
+    # the path→harness-session mapping across observer restarts so a
+    # rebound rollout's events still route to this row even after the
+    # harness session has been archived.
+    codex_internal_id: str | None = Field(default=None, min_length=1)
 
 
 class Event(HarnessModel):

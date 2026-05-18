@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import TypeVar
@@ -20,7 +21,11 @@ from agent_harness.models import (
     StopReason,
     utc_now,
 )
-from agent_harness.repository import RunNotFoundError, SessionNotFoundError
+from agent_harness.repository import (
+    RunNotFoundError,
+    SessionNotFoundError,
+    _RECONCILE_TERMINAL_SESSION_STATUSES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -554,6 +559,64 @@ class SQLiteRepository:
     def upsert_session(self, session: Session) -> None:
         with self._lock, self._connection:
             self._upsert_session(session)
+
+    def find_recent_codex_harness_session(
+        self,
+        *,
+        cwd: str,
+        earliest_event_at: datetime,
+        window_seconds: float = 30.0,
+    ) -> Session | None:
+        # See ``InMemoryRepository.find_recent_codex_harness_session`` for the
+        # match criteria. The SQL filters the obvious dimensions; Python does
+        # the time-window comparison so we don't have to teach SQLite to
+        # parse pydantic-stored ISO timestamps.
+        window = timedelta(seconds=window_seconds)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                select payload from sessions
+                where json_extract(payload, '$.backend') = 'codex'
+                  and json_extract(payload, '$.origin') = 'harness'
+                  and json_extract(payload, '$.project.path') = ?
+                  and json_extract(payload, '$.codex_internal_id') is null
+                order by created_at desc
+                """,
+                (cwd,),
+            ).fetchall()
+        for row in rows:
+            session = _model_from_row(row, "payload", Session)
+            if session.status in _RECONCILE_TERMINAL_SESSION_STATUSES:
+                continue
+            if abs(session.created_at - earliest_event_at) > window:
+                continue
+            return session
+        return None
+
+    def find_session_by_codex_internal_id(self, internal_id: str) -> Session | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                select payload from sessions
+                where json_extract(payload, '$.codex_internal_id') = ?
+                limit 1
+                """,
+                (internal_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _model_from_row(row, "payload", Session)
+
+    def bind_codex_rollout(self, session_id: str, internal_id: str) -> Session:
+        with self._lock, self._connection:
+            session = self._find_session_locked(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            updated = session.model_copy(
+                update={"codex_internal_id": internal_id, "updated_at": utc_now()}
+            )
+            self._upsert_session(updated)
+        return updated.model_copy(deep=True)
 
     def add_message(self, session_id: str, message: Message) -> None:
         with self._lock, self._connection:

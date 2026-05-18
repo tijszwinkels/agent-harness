@@ -586,6 +586,7 @@ components:
             - run.completed
             - run.failed
             - run.interrupted
+            - run.usage
             - session.updated
             - ping
         data:
@@ -685,21 +686,32 @@ components:
 
     SessionStats:
       type: object
-      required: [messages, tokens, cost_usd]
+      required: [messages, tokens, cost_usd, context_window]
       properties:
         messages:
           type: integer
           minimum: 0
         tokens:
           type: object
+          description: Sum of input, output, cache_read, and cache_creation token usage across runs in the session.
           additionalProperties: true
         cost_usd:
           type: number
           minimum: 0
+        context_window:
+          type: [integer, "null"]
+          minimum: 1
+          description: Latest model context-window size observed for the session, when the backend exposes it.
 
     Usage:
       type: object
       required: [input, output, cache_read, cache_creation, cost_usd]
+      example:
+        input: 4342
+        output: 75
+        cache_read: 1024
+        cache_creation: 21949
+        cost_usd: 0.123
       properties:
         input:
           type: integer

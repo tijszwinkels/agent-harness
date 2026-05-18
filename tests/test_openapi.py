@@ -60,3 +60,14 @@ def test_openapi_documents_patch_session() -> None:
         "type": "string",
         "minLength": 1,
     }
+
+
+def test_openapi_documents_context_window() -> None:
+    spec = _openapi_spec()
+
+    session_stats = spec["components"]["schemas"]["SessionStats"]
+    assert session_stats["properties"]["context_window"] == {
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "description": "Latest model context-window size observed for the session, when the backend exposes it.",
+    }

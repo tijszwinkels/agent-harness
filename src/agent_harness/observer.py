@@ -48,15 +48,33 @@ _CODEX_ROLLOUT_RE = re.compile(
 _IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "pr-link", "queue-operation", "system"}
 _IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
+    # ``agent_message`` and ``assistant_message`` are codex's
+    # ``event_msg`` form of the assistant turn; the canonical
+    # representation is ``response_item/message`` which carries the
+    # full content blocks. Ignoring the event_msg form is what stops
+    # the observer from emitting the same assistant message twice.
     "agent_message",
     "assistant_message",
+    # ``context_compacted`` carries a codex-side summary of the
+    # compaction the runtime just performed; observability without a
+    # data-plane consumer yet. Demoted to "metadata", revisit if
+    # mm-bridge / command-bridge grow a need for it.
     "context_compacted",
-    "task_complete",
+    # ``task_started`` is the matching bookend to ``task_complete``;
+    # ``task_complete`` is now surfaced as ``run.end_turn`` (Phase 4).
+    # ``task_started`` stays ignored — the harness's own
+    # ``run.started`` event covers the same lifecycle moment from
+    # the supervisor's side.
     "task_started",
-    # ``token_count`` is no longer ignored — Phase 3 surfaces it as a
-    # ``run.usage`` event keyed to the session's active harness run
-    # (see ``_parse_codex_record``).
+    # ``web_search_call`` is the standalone codex search affordance
+    # (no harness consumer; the response_item/function_call form is
+    # what tool-use parsers care about).
     "web_search_call",
+    #
+    # ``token_count`` was removed from this set in Phase 3 — surfaced
+    # as ``run.usage``. ``task_complete`` was removed in Phase 4 —
+    # surfaced as ``run.end_turn``. Both have an explicit branch in
+    # ``_parse_codex_record`` before this gate fires.
 }
 
 
@@ -558,11 +576,12 @@ class ExternalTranscriptObserver:
             return []
         published: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
-            if event.event == "run.usage":
-                # Parsers emit run.usage with ``run_id=None``; resolve
-                # the active run for the session here (the parser has
-                # no repository). Drop if no active run.
-                resolved = self._resolve_run_usage_run_id(event)
+            if event.event in ("run.usage", "run.end_turn"):
+                # Parsers emit run.usage / run.end_turn with
+                # ``run_id=None`` (no repository access from the pure
+                # parser). Resolve the active run for the session here
+                # and drop the event if no active run exists.
+                resolved = self._resolve_active_run_id(event)
                 if resolved is None:
                     continue
                 event = resolved
@@ -689,26 +708,31 @@ class ExternalTranscriptObserver:
         )
         return published
 
-    def _resolve_run_usage_run_id(self, event: Event) -> Event | None:
-        """Phase 3: parsers emit ``run.usage`` events with
-        ``run_id=None`` because the parser has no repository access.
-        Here we resolve the active run for the session and stamp the
-        event's ``run_id`` so the materializer can apply the usage to
-        the right Run row.
+    def _resolve_active_run_id(self, event: Event) -> Event | None:
+        """Stamp the session's active run id onto an event whose
+        parser-emitted ``run_id`` is ``None``.
 
-        Returns ``None`` when there's no active run to attribute usage
-        to (pure-external session — documented gap; Falcon's
-        worth-noting #1 on PR #11). The synthesized event is dropped
-        on the floor rather than published as a phantom.
+        Used for ``run.usage`` (Phase 3) and ``run.end_turn`` (Phase 4):
+        both are observer-synthesized events that need to attribute
+        rollout-derived activity to the harness's running Run. The
+        pure parser has no repository access, so resolution happens
+        here.
+
+        Returns ``None`` when no active run exists — pure-external
+        sessions or runs that have already reached terminal state.
+        Falcon's worth-noting #1 on PR #11 documents the gap; the
+        synthesized event is dropped rather than published as a
+        phantom keyed to nothing.
         """
-        if event.event != "run.usage" or event.run_id is not None:
+        if event.run_id is not None:
             return event
         if event.session_id is None or self._repository is None:
             return None
         active_run_id = self._active_run_id_for_session(event.session_id)
         if active_run_id is None:
             logger.debug(
-                "Skipping run.usage: no active run for session=%s",
+                "Skipping %s: no active run for session=%s",
+                event.event,
                 event.session_id,
             )
             return None
@@ -996,6 +1020,19 @@ def _parse_claude_record(
                         offset=offset,
                     )
                 )
+            # Phase 4: when the assistant message ends the turn
+            # (``stop_reason == "end_turn"``), emit ``run.end_turn``.
+            # Drives the watchdog's post-end_turn cleanup via the
+            # event bus — replaces the supervisor's stdout-derived
+            # detector that Phase 4 retires.
+            if message.get("stop_reason") == "end_turn":
+                events.append(
+                    _run_end_turn_event(
+                        identity=identity,
+                        backend="claude-code",
+                        offset=offset,
+                    )
+                )
         return events
 
     logger.warning(
@@ -1042,6 +1079,21 @@ def _parse_codex_record(
                     offset=offset,
                 )
             )
+        return events
+
+    # Phase 4: codex's ``event_msg/task_complete`` signals end of
+    # turn. Surface as ``run.end_turn`` (run_id resolved in
+    # publish_line) — drives the watchdog's post-end_turn cleanup
+    # grace via the event bus, replacing the supervisor's removed
+    # stdout-derived signal.
+    if record_type == "event_msg" and payload_type == "task_complete":
+        events.append(
+            _run_end_turn_event(
+                identity=identity,
+                backend="codex",
+                offset=offset,
+            )
+        )
         return events
 
     if record_type in _IGNORED_CODEX_RECORD_TYPES or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES:
@@ -1231,6 +1283,34 @@ def _run_usage_event(
         session_id=identity.session_id,
         run_id=None,
         data=data,
+    )
+
+
+def _run_end_turn_event(
+    *,
+    identity: TranscriptIdentity,
+    backend: BackendName,
+    offset: int | None,
+) -> Event:
+    """Build a ``run.end_turn`` event with ``run_id=None``.
+
+    Phase 4: published whenever the rollout signals the end of an
+    assistant turn (claude ``stop_reason == "end_turn"`` or codex
+    ``event_msg/task_complete``). ``publish_line`` resolves the
+    active run id before publishing. The supervisor's
+    ``_watch_end_turn_cleanup`` watchdog subscribes to this event
+    on the bus and arms its SIGTERM grace timer when ``run_id``
+    matches its own. Replaces the supervisor-side stdout detector
+    that Phase 4 retires.
+    """
+    return Event(
+        event="run.end_turn",
+        session_id=identity.session_id,
+        run_id=None,
+        data={
+            **_source_data(identity, offset=offset),
+            "backend": backend,
+        },
     )
 
 

@@ -488,10 +488,9 @@ def test_parser_ignores_known_codex_metadata_without_warning(caplog: pytest.LogC
                 {"type": "event_msg", "payload": {"type": "context_compacted"}},
                 identity=identity,
             ),
-            *parse_transcript_record(
-                {"type": "event_msg", "payload": {"type": "task_complete"}},
-                identity=identity,
-            ),
+            # ``task_complete`` is no longer ignored as of Phase 4
+            # — it surfaces as ``run.end_turn``. Covered by
+            # ``test_observer_emits_run_end_turn_for_codex_task_complete``.
             *parse_transcript_record(
                 {"type": "response_item", "payload": {"type": "web_search_call", "id": "ws_1"}},
                 identity=identity,

@@ -468,18 +468,18 @@ class SQLiteRepository:
         return int(row[0])
 
     def append_event(self, event: Event) -> Event:
+        # Phase 2: ``append_event`` is a pure event-row insert plus run
+        # lifecycle materialization. The message-on-non-external
+        # carve-out used to also materialize messages from the durable
+        # bus's append path; that path exists to disambiguate dual-path
+        # ingestion, which Phase 2 eliminates. The observer's
+        # ``materialize_event`` is now the sole writer to the messages
+        # table.
         with self._lock, self._connection:
             published = event.with_sequence(self._next_event_sequence_locked())
             self._insert_event(published)
             if published.event in RUN_LIFECYCLE_EVENTS:
                 self._materialize_run_lifecycle_event(published)
-            if (
-                published.event == "message"
-                and published.session_id
-                and published.data.get("origin") != "external"
-                and self._find_session_locked(published.session_id) is not None
-            ):
-                self._materialize_message_event(published, dedupe_by_content=False)
         return published.model_copy(deep=True)
 
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:

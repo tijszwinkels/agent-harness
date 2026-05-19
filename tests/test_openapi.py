@@ -106,3 +106,17 @@ def test_openapi_documents_session_stats_context_window() -> None:
     assert cw["type"] == ["integer", "null"]
     assert cw["minimum"] == 1
     assert "context_window" not in session_stats.get("required", [])
+
+
+def test_openapi_documents_session_stats_context_used() -> None:
+    """Drift guard: ``Session.stats.context_used`` is the per-session
+    SNAPSHOT of currently-loaded context (overwrite-not-sum), distinct
+    from cumulative ``stats.tokens``. Optional (None until first
+    observation) and non-negative (a zero value is filtered upstream).
+    Spec: specs/2026-05-19-context-used.md"""
+    spec = _openapi_spec()
+    session_stats = spec["components"]["schemas"]["SessionStats"]
+    cu = session_stats["properties"]["context_used"]
+    assert cu["type"] == ["integer", "null"]
+    assert cu["minimum"] == 0
+    assert "context_used" not in session_stats.get("required", [])

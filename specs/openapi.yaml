@@ -707,6 +707,14 @@ components:
           type: [integer, "null"]
           minimum: 1
           description: Latest model context-window size observed for the session (codex token_count event_msg). Null until first observed; claude sessions never set it.
+        context_used:
+          type: [integer, "null"]
+          minimum: 0
+          description: |
+            Per-session SNAPSHOT of currently-loaded context tokens (overwrite-not-sum), distinct from
+            cumulative `tokens`. Sourced from codex `info.total_token_usage.total_tokens` and claude
+            `message.usage.input + cache_creation + cache_read` (output excluded). Null until first observation;
+            decreases (after context compaction) are valid.
 
     Usage:
       type: object

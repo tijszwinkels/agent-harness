@@ -53,6 +53,15 @@ class SessionStats(HarnessModel):
     # claude sessions never set it). The observer updates this each
     # time the rollout carries a fresh context-window value.
     context_window: int | None = Field(default=None, ge=1)
+    # Per-session SNAPSHOT of currently-loaded context tokens
+    # (overwrite-not-sum). Distinct from cumulative ``tokens``:
+    # for long claude tool-use loops, ``cache_read`` can exceed 10M
+    # while the actual loaded context is bounded by ``context_window``.
+    # Sourced from codex ``info.total_token_usage.total_tokens`` and
+    # claude ``message.usage.input + cache_creation + cache_read``.
+    # ``None`` until the first observation lands; decreases (after
+    # context compaction) are valid.
+    context_used: int | None = Field(default=None, ge=0)
 
 
 class TextBlock(HarnessModel):

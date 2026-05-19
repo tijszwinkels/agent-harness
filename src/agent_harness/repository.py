@@ -24,6 +24,30 @@ class RunNotFoundError(KeyError):
     pass
 
 
+class MaterializationDeferred(SessionNotFoundError):
+    """Phase 3: raised by ``DurableEventBus.publish`` when an event was
+    successfully inserted (event row + bus history + subscribers
+    notified) but its side-effect materialization needs the referenced
+    session to exist first — typically a rollout-derived message event
+    that arrived before ``POST /v1/sessions``.
+
+    Carries ``event`` so the caller can buffer the published event
+    (with its assigned sequence) for later replay via
+    ``repository.materialize_event(event, store_event=False)``. Without
+    the published event in hand, the caller would only see the
+    original pre-publish event with no sequence and have no clean way
+    to re-materialize against the existing event row.
+
+    Inherits from ``SessionNotFoundError`` so call-sites that already
+    catch the parent type keep working unchanged.
+    """
+
+    def __init__(self, event: Event, session_id: str) -> None:
+        super().__init__(session_id)
+        self.event = event
+        self.session_id = session_id
+
+
 class InMemoryRepository:
     def __init__(self) -> None:
         self._lock = RLock()

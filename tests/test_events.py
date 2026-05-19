@@ -151,7 +151,25 @@ async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_durable_lifecycle_publish_rolls_back_when_materialization_fails(tmp_path, monkeypatch) -> None:
+async def test_durable_lifecycle_publish_preserves_event_when_materialization_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """Phase 3 semantic change: ``DurableEventBus.publish`` splits the
+    append + materialize into two separate steps. ``append_event``
+    succeeds atomically; if ``materialize_event`` raises afterwards,
+    the event row is INTENTIONALLY preserved.
+
+    Rationale: the failure that motivates the split is the
+    ``SessionNotFoundError`` → buffer-for-later-flush path. The event
+    is durable; the side effect is deferred. The buffering caller
+    (observer.publish_line) replays via ``materialize_event(store_event=False)``
+    once the session appears.
+
+    A programmer-error ``RuntimeError`` in the materializer bubbles
+    up just like before, but the event row stays. This is consistent
+    with the unified design: durability and materialization are
+    decoupled at the bus seam.
+    """
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)
     session = repository.create_session(
@@ -161,16 +179,17 @@ async def test_durable_lifecycle_publish_rolls_back_when_materialization_fails(t
             project=Project(path="/repo", name="repo"),
         )
     )
-    run = repository.create_run(session.id, CreateRunRequest(message="finish atomically"))
+    run = repository.create_run(session.id, CreateRunRequest(message="finish"))
     repository.start_run(session.id, run.id)
     bus = DurableEventBus(repository)
+
+    original_materialize = repository._materialize_run_lifecycle_event
 
     def fail_materialization(event):
         if event.event == "run.completed":
             raise RuntimeError("simulated crash after append")
         return original_materialize(event)
 
-    original_materialize = repository._materialize_run_lifecycle_event
     monkeypatch.setattr(repository, "_materialize_run_lifecycle_event", fail_materialization)
 
     with pytest.raises(RuntimeError, match="simulated crash"):
@@ -186,8 +205,12 @@ async def test_durable_lifecycle_publish_rolls_back_when_materialization_fails(t
 
     reopened = open_sqlite_repository(db_path)
     try:
+        # The event row IS present (append succeeded).
         events = reopened.list_events(session_id=session.id, run_id=run.id)
-        assert [event.event for event in events] == []
+        assert [event.event for event in events] == ["run.completed"]
+        # The run was NOT moved to completed (the materialize was the
+        # step that did that; it crashed). Reopen reconciles dangling
+        # state — running → failed.
         assert reopened.get_run(session.id, run.id).status == "failed"
     finally:
         reopened.close()

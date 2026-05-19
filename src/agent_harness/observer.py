@@ -27,7 +27,11 @@ from agent_harness.models import (
     ToolUseBlock,
     utc_now,
 )
-from agent_harness.repository import InMemoryRepository, SessionNotFoundError
+from agent_harness.repository import (
+    InMemoryRepository,
+    MaterializationDeferred,
+    SessionNotFoundError,
+)
 
 try:
     from watchfiles import awatch
@@ -547,10 +551,14 @@ class ExternalTranscriptObserver:
             # Codex partial-flush — defer this line to a later tick.
             return []
         published: list[Event] = []
+        usage_events: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
-            published_event = await self._event_bus.publish(event)
-            if self._repository is not None:
-                self._materialize_or_buffer(published_event)
+            published_event = await self._publish_via_bus(event)
+            if published_event is None:
+                # Defensive: shouldn't normally happen — the bus
+                # publish either succeeds (returns event) or raises a
+                # specific exception ``_publish_via_bus`` catches.
+                continue
             published.append(published_event)
             if published_event.session_id:
                 self._last_event_at[published_event.session_id] = self._clock()
@@ -565,7 +573,76 @@ class ExternalTranscriptObserver:
                 )
                 if kick is not None:
                     published.append(kick)
+                # Phase 3: when the parsed record carries usage info,
+                # synthesize a ``run.usage`` event keyed to the
+                # session's active harness run. We collect them here
+                # and publish after the main parse loop so the rows
+                # they sum into (Run.usage) reflect every message in
+                # this turn, not just the prior ones.
+                synth = self._synthesize_run_usage_event(
+                    record_event=published_event,
+                    identity=resolved_identity,
+                )
+                if synth is not None:
+                    usage_events.append(synth)
+        for usage_event in usage_events:
+            published_usage = await self._publish_via_bus(usage_event)
+            if published_usage is not None:
+                published.append(published_usage)
         return published
+
+    async def _publish_via_bus(self, event: Event) -> Event | None:
+        """Publish through the bus and route side effects.
+
+        DurableEventBus does the materialize internally and may raise
+        ``MaterializationDeferred`` carrying the published event when
+        the referenced session doesn't yet exist (rollout-before-POST
+        race). InMemoryEventBus doesn't touch the repo, so the
+        observer still calls ``materialize_event(store_event=True)``
+        separately for the test path that pairs an in-memory bus with
+        a SQLite repo. Both paths share the same buffering on
+        ``SessionNotFoundError``.
+
+        Returns the published event in both the success and the
+        deferred-materialization case — the event row WAS inserted
+        and subscribers WERE notified; only the side-effect application
+        is pending. Buffered events are replayed via
+        ``_flush_pending_materialization`` once the session arrives.
+        """
+        published_event: Event
+        try:
+            published_event = await self._event_bus.publish(event)
+        except MaterializationDeferred as deferred:
+            # Durable bus path: event row is inserted and subscribers
+            # were notified; materialization is pending. Buffer the
+            # published event (with its assigned sequence) so the
+            # session.updated flush hook can re-materialize it once
+            # the session appears.
+            if self._repository is not None:
+                self._buffer_materialization(deferred.event)
+            return deferred.event
+        if self._repository is not None and not self._event_bus.stores_events:
+            # In-memory bus path: the bus stores nothing in the repo;
+            # the observer drives materialization explicitly. Tests
+            # use this combo with a SQLite repo.
+            try:
+                self._repository.materialize_event(published_event, store_event=True)
+            except SessionNotFoundError:
+                if published_event.event in {"message", "run.usage"} and published_event.session_id:
+                    self._buffer_materialization(published_event)
+                    return published_event
+                raise
+        # When a session arrives (either freshly registered by the
+        # rollout's session_meta event or the explicit
+        # ``session.updated`` carrying its row), flush any events that
+        # were buffered while the session didn't exist yet.
+        if (
+            published_event.event == "session.updated"
+            and published_event.session_id
+            and self._repository is not None
+        ):
+            self._flush_pending_materialization(published_event.session_id)
+        return published_event
 
     async def freshness_tick(self) -> None:
         """Flip running sessions to idle when their last transcript event is
@@ -609,38 +686,30 @@ class ExternalTranscriptObserver:
         data: dict[str, Any] = {"session": updated.model_dump(mode="json")}
         if identity is not None:
             data = {**_source_data(identity, offset=offset), **data}
-        event = await self._event_bus.publish(
+        # Phase 3: ``_publish_via_bus`` handles materialization on the
+        # durable path (via the bus) and on the in-memory path (via
+        # the explicit ``materialize_event`` call). The session is
+        # known to exist (we just fetched it), so MaterializationDeferred
+        # won't fire here — but use the same wrapper for uniformity.
+        published = await self._publish_via_bus(
             Event(event="session.updated", session_id=session.id, data=data)
         )
-        # Materialize into the repository so subsequent ``get_session`` calls
-        # reflect the new status. Skip buffering (session is known to exist).
-        if self._repository is not None:
-            try:
-                self._repository.materialize_event(
-                    event, store_event=not self._event_bus.stores_events
-                )
-            except SessionNotFoundError:
-                pass
-        return event
+        return published
 
-    def _materialize_or_buffer(self, event: Event) -> None:
-        if self._repository is None:
-            return
+    def _synthesize_run_usage_event(
+        self,
+        *,
+        record_event: Event,
+        identity: TranscriptIdentity,
+    ) -> Event | None:
+        """Stub. Wired up in the next commit (Phase 3 part 2).
 
-        if event.event == "message" and event.session_id and not self._session_exists(event.session_id):
-            self._buffer_materialization(event)
-            return
-
-        try:
-            self._repository.materialize_event(event, store_event=not self._event_bus.stores_events)
-        except SessionNotFoundError:
-            if event.event == "message" and event.session_id:
-                self._buffer_materialization(event)
-                return
-            raise
-
-        if event.event == "session.updated" and event.session_id:
-            self._flush_pending_materialization(event.session_id)
+        Phase 3 part 1 ships the architectural refactor only; the
+        rollout-side ``run.usage`` synthesis lives in the cherry-pick
+        + observer wiring commits that follow.
+        """
+        del record_event, identity
+        return None
 
     def _session_exists(self, session_id: str) -> bool:
         if self._repository is None:
@@ -671,8 +740,14 @@ class ExternalTranscriptObserver:
         pending = self._pending_materialization.pop(session_id, [])
         still_pending: list[Event] = []
         for event in pending:
+            # Buffered events have already been inserted via the bus
+            # (the durable path) or are about to be inserted via the
+            # ``store_event=True`` materialize (the in-memory bus path).
+            # On the durable path, ``store_event=False`` avoids
+            # reinserting the existing row.
+            store_event = not self._event_bus.stores_events
             try:
-                self._repository.materialize_event(event, store_event=not self._event_bus.stores_events)
+                self._repository.materialize_event(event, store_event=store_event)
             except SessionNotFoundError:
                 still_pending.append(event)
 

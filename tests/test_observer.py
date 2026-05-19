@@ -1834,6 +1834,364 @@ async def test_observer_skips_usage_publish_when_no_active_run(tmp_path) -> None
     assert usage_events == []
 
 
+# --- context_used: observer emits the live-context snapshot ------------------
+#
+# Distinct from per-turn ``usage`` above — context_used is the
+# SNAPSHOT of currently-loaded context tokens, overwrite-not-sum.
+# Spec: specs/2026-05-19-context-used.md
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_context_used_for_claude_assistant_record(tmp_path) -> None:
+    """A claude assistant record's ``message.usage`` carries the
+    inputs needed to compute the snapshot:
+    ``input + cache_creation + cache_read`` (output excluded).
+    The observer must attach ``context_used`` to the ``run.usage`` event."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    raw = session.id.removeprefix("ses_")
+    claude_uuid = (
+        f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    )
+    rollout = (
+        tmp_path / ".claude" / "projects" / "-repo" / f"{claude_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+        '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"hi"}],'
+        '"usage":{"input_tokens":100,"output_tokens":50,'
+        '"cache_read_input_tokens":30000,"cache_creation_input_tokens":4000}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    published = await observer.tail_file(rollout)
+
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events, [e.event for e in published]
+    # input + cache_creation + cache_read; output excluded.
+    assert usage_events[0].data.get("context_used") == 100 + 4000 + 30000
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_context_used_for_codex_token_count(tmp_path) -> None:
+    """Codex's ``info.total_token_usage.total_tokens`` is the cumulative
+    snapshot since session start (not the per-turn delta — that's
+    ``last_token_usage``). The observer must surface it on the
+    ``run.usage`` event."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0400-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":50},'
+        '"total_token_usage":{"total_tokens":42000},'
+        '"model_context_window":258400}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+    published = await observer.tail_file(rollout)
+
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events, [e.event for e in published]
+    assert usage_events[0].data.get("context_used") == 42000
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_context_used_per_assistant_record_claude(tmp_path) -> None:
+    """Two claude assistant records produce two ``run.usage`` events,
+    each carrying its own ``context_used`` snapshot. End-to-end
+    overwrite-not-sum on ``Session.stats.context_used`` is locked in
+    by ``tests/test_storage.py::test_materialize_run_usage_overwrites_context_used*``;
+    here we verify the OBSERVER side: each rollout record produces a
+    fresh snapshot in order."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    raw = session.id.removeprefix("ses_")
+    claude_uuid = (
+        f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    )
+    rollout = (
+        tmp_path / ".claude" / "projects" / "-repo" / f"{claude_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+        '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"a"}],'
+        '"usage":{"input_tokens":100,"output_tokens":50,'
+        '"cache_read_input_tokens":1000,"cache_creation_input_tokens":0}}}\n'
+        '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+        '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"b"}],'
+        '"usage":{"input_tokens":120,"output_tokens":40,'
+        '"cache_read_input_tokens":5000,"cache_creation_input_tokens":0}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    published = await observer.tail_file(rollout)
+
+    snapshots = [
+        e.data.get("context_used")
+        for e in published
+        if e.event == "run.usage"
+    ]
+    # Two records → two snapshots, in order.
+    assert snapshots == [100 + 1000, 120 + 5000]
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_context_used_per_token_count_codex(tmp_path) -> None:
+    """Codex parallel: two ``token_count`` events produce two
+    ``run.usage`` events, each carrying its own ``context_used``
+    snapshot from ``info.total_token_usage.total_tokens``."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0401-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0},'
+        '"total_token_usage":{"total_tokens":10000},'
+        '"model_context_window":258400}}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":80,"output_tokens":30,"cached_input_tokens":0},'
+        '"total_token_usage":{"total_tokens":25000},'
+        '"model_context_window":258400}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+    published = await observer.tail_file(rollout)
+
+    snapshots = [
+        e.data.get("context_used")
+        for e in published
+        if e.event == "run.usage"
+    ]
+    assert snapshots == [10000, 25000]
+
+
+@pytest.mark.asyncio
+async def test_observer_cumulative_vs_snapshot_end_to_end_claude(tmp_path) -> None:
+    """End-to-end proof that ``stats.context_used`` (snapshot) and
+    ``stats.tokens.cache_read`` (cumulative) diverge — the whole point
+    of having both fields. Multi-turn claude rollout with growing
+    cache_read; after ingestion the cumulative cache_read should be
+    much larger than the latest-turn snapshot. Mirrors the sidecar
+    smoke's cumulative-vs-snapshot check but runs in-process via the
+    real ``DurableEventBus`` + SQLite materializer."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+    from agent_harness.storage import open_sqlite_repository
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="claude-code",
+                model="claude-opus-4-7",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        raw = session.id.removeprefix("ses_")
+        claude_uuid = (
+            f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+        )
+        rollout = (
+            tmp_path / ".claude" / "projects" / "-repo" / f"{claude_uuid}.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        # Three turns, each with growing cache_read. Per-turn snapshot
+        # equals the latest turn's input + cache_read; cumulative
+        # cache_read is the SUM across turns.
+        per_turn = [(50, 10000), (60, 30000), (70, 50000)]
+        lines = [
+            (
+                '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+                '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"turn"}],'
+                f'"usage":{{"input_tokens":{inp},"output_tokens":5,'
+                f'"cache_read_input_tokens":{cr},"cache_creation_input_tokens":0}}}}}}'
+            )
+            for inp, cr in per_turn
+        ]
+        rollout.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        bus = DurableEventBus(repository)
+        observer = ExternalTranscriptObserver(bus, repository=repository)
+        await observer.tail_file(rollout)
+
+        after = repository.get_session(session.id)
+        latest_input, latest_cache_read = per_turn[-1]
+        cumulative_cache_read = sum(cr for _, cr in per_turn)
+
+        # Snapshot = latest turn (overwrite).
+        assert after.stats.context_used == latest_input + latest_cache_read
+        # Cumulative = sum across turns (additive).
+        assert after.stats.tokens["cache_read"] == cumulative_cache_read
+        # The whole point: cumulative > snapshot after several turns.
+        assert after.stats.tokens["cache_read"] > after.stats.context_used
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_decreasing_context_used_after_compaction_codex(tmp_path) -> None:
+    """After codex compacts, ``total_token_usage.total_tokens``
+    legitimately decreases. The observer must propagate the smaller
+    value (no monotonic-only filtering); the materializer applies it
+    (locked in by storage tests)."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0402-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":1,"output_tokens":1,"cached_input_tokens":0},'
+        '"total_token_usage":{"total_tokens":180000},'
+        '"model_context_window":258400}}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":1,"output_tokens":1,"cached_input_tokens":0},'
+        '"total_token_usage":{"total_tokens":12000},'
+        '"model_context_window":258400}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+    published = await observer.tail_file(rollout)
+
+    snapshots = [
+        e.data.get("context_used")
+        for e in published
+        if e.event == "run.usage"
+    ]
+    assert snapshots == [180000, 12000]
+
+
+@pytest.mark.asyncio
+async def test_observer_skips_context_used_when_codex_info_null(tmp_path) -> None:
+    """Codex's first ``token_count`` has ``info: null`` — the existing
+    test already locks in that NO ``run.usage`` event fires; this test
+    documents that nothing tries to publish a ``context_used`` either
+    (no zero-fill, no None payload)."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0403-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":null}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+    published = await observer.tail_file(rollout)
+    # The skip-when-info-null branch in parse_codex_token_count
+    # already gates any run.usage emission. Verify we DIDN'T regress
+    # into emitting a snapshot-only event.
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events == []
+
+
 # --- Phase 4: observer emits run.end_turn ------------------------------------
 
 

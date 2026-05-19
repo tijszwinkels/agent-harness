@@ -330,6 +330,7 @@ class InMemoryRepository:
             return
         delta = Usage.model_validate(usage_data)
         context_window = _context_window_from(event.data)
+        context_used = _context_used_from(event.data)
         with self._lock:
             # Check session presence BEFORE mutating the run. In SQLite
             # the outer ``materialize_event`` is wrapped in a single
@@ -356,6 +357,11 @@ class InMemoryRepository:
             }
             if context_window is not None:
                 stats_update["context_window"] = context_window
+            if context_used is not None:
+                # SNAPSHOT semantics: overwrite, never sum. A None
+                # value means "no fresh observation" (omitted from
+                # event); leave the prior snapshot untouched.
+                stats_update["context_used"] = context_used
             self._sessions[event.session_id] = session.model_copy(
                 update={
                     "stats": session.stats.model_copy(update=stats_update),
@@ -435,3 +441,24 @@ def _context_window_from(data: Mapping[str, object] | object) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 1 else None
+
+
+def _context_used_from(data: Mapping[str, object] | object) -> int | None:
+    # Parsed snapshot of currently-loaded context for
+    # ``Session.stats.context_used``. Returns ``None`` when the
+    # ``run.usage`` event omitted the field (preserve prior snapshot)
+    # or when the value can't be coerced to a non-negative integer.
+    # Unlike ``context_window`` (ge=1), a zero is rejected upstream by
+    # the parsers (zero is indistinguishable from "no observation
+    # yet"), but the materializer accepts ge=0 to match the model's
+    # constraint.
+    if not isinstance(data, Mapping):
+        return None
+    raw = data.get("context_used")
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None

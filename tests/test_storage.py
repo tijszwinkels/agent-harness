@@ -886,3 +886,211 @@ def test_materialize_run_usage_sets_session_context_window(tmp_path) -> None:
         assert after.stats.tokens.get("output") == 300
     finally:
         repository.close()
+
+
+def test_materialize_run_usage_sets_session_context_used(tmp_path) -> None:
+    """``context_used`` rides on the ``run.usage`` event alongside
+    ``usage`` and ``context_window`` (option A from the
+    Session.stats.context_used spec). Materializer overwrites
+    ``Session.stats.context_used`` in the same pass that adds usage
+    onto ``Session.stats.tokens`` and overwrites ``context_window``.
+    Spec: specs/2026-05-19-context-used.md"""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        repository.materialize_event(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={
+                    "usage": {"input": 50, "output": 20, "cache_read": 0, "cache_creation": 0},
+                    "context_window": 258400,
+                    "context_used": 17000,
+                },
+            ),
+            store_event=False,
+        )
+        assert repository.get_session(session.id).stats.context_used == 17000
+    finally:
+        repository.close()
+
+
+def test_materialize_run_usage_overwrites_context_used_does_not_sum(tmp_path) -> None:
+    """SNAPSHOT semantics: a later observation REPLACES the earlier
+    value (never sums). Two ``run.usage`` events with different
+    context_used must leave the session at the latter — but tokens
+    (additive) keeps accumulating, proving the two writes are
+    independent."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="claude-code",
+                model="claude-4-7-sonnet",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        for usage, snapshot in [
+            ({"input": 100, "output": 50, "cache_read": 10000, "cache_creation": 0}, 10500),
+            ({"input": 80, "output": 40, "cache_read": 30000, "cache_creation": 0}, 30200),
+        ]:
+            repository.materialize_event(
+                Event(
+                    event="run.usage",
+                    session_id=session.id,
+                    run_id=run.id,
+                    data={"usage": usage, "context_used": snapshot},
+                ),
+                store_event=False,
+            )
+
+        after = repository.get_session(session.id)
+        # Latest snapshot wins (overwrite-not-sum).
+        assert after.stats.context_used == 30200
+        # Tokens keep summing per existing contract.
+        assert after.stats.tokens["input"] == 100 + 80
+        assert after.stats.tokens["cache_read"] == 10000 + 30000
+
+
+    finally:
+        repository.close()
+
+
+def test_materialize_run_usage_preserves_context_used_when_event_omits_it(tmp_path) -> None:
+    """A ``run.usage`` event WITHOUT a ``context_used`` key must not
+    clear the existing snapshot. Earlier observation stays put; a
+    snapshot only changes when the rollout produces a fresh value."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        # First event seeds context_used.
+        repository.materialize_event(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={
+                    "usage": {"input": 10, "output": 5, "cache_read": 0, "cache_creation": 0},
+                    "context_used": 4096,
+                },
+            ),
+            store_event=False,
+        )
+        assert repository.get_session(session.id).stats.context_used == 4096
+
+        # Second event omits context_used (e.g. codex token_count
+        # event with info: null mid-session — only the per-turn delta
+        # is meaningful). The snapshot must survive.
+        repository.materialize_event(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={
+                    "usage": {"input": 3, "output": 2, "cache_read": 0, "cache_creation": 0},
+                },
+            ),
+            store_event=False,
+        )
+        assert repository.get_session(session.id).stats.context_used == 4096
+    finally:
+        repository.close()
+
+
+def test_materialize_run_usage_overwrites_context_used_inmemory() -> None:
+    """Parallel coverage for ``InMemoryRepository`` — both materializers
+    (SQLite + in-memory) implement the same ``run.usage`` branch, so the
+    overwrite-not-sum invariant must hold on both. Without this, a code
+    path that exercises only the in-memory repo (the FastAPI factory's
+    default) could silently regress."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+
+    repo = InMemoryRepository()
+    session = repo.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-4-7-sonnet",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repo.create_run(session.id, CreateRunRequest(message="hi"))
+    repo.start_run(session.id, run.id)
+
+    for snapshot in [4096, 9000]:
+        repo.materialize_event(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={
+                    "usage": {"input": 1, "output": 1, "cache_read": 0, "cache_creation": 0},
+                    "context_used": snapshot,
+                },
+            ),
+            store_event=False,
+        )
+    assert repo.get_session(session.id).stats.context_used == 9000
+
+
+def test_materialize_run_usage_accepts_context_used_decrease(tmp_path) -> None:
+    """After context compaction the snapshot legitimately decreases —
+    the materializer must apply a smaller value just as readily as a
+    larger one."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="claude-code",
+                model="claude-4-7-sonnet",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        for snapshot in [180000, 12000]:  # pre-compact, post-compact
+            repository.materialize_event(
+                Event(
+                    event="run.usage",
+                    session_id=session.id,
+                    run_id=run.id,
+                    data={
+                        "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
+                        "context_used": snapshot,
+                    },
+                ),
+                store_event=False,
+            )
+        assert repository.get_session(session.id).stats.context_used == 12000
+    finally:
+        repository.close()

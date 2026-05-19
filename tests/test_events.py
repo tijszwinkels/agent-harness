@@ -229,3 +229,162 @@ async def test_durable_subscribe_has_no_gap_between_replay_and_live(tmp_path) ->
     finally:
         await subscription.aclose()
         repository.close()
+
+
+# --- Phase 3: bus.publish becomes the single materialization point -----------
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_materializes_run_lifecycle(tmp_path) -> None:
+    """Phase 3: ``DurableEventBus.publish`` is the single materialization
+    point. A ``run.started`` event published through the bus must flip
+    the run's status to ``running`` without any other call doing it."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        bus = DurableEventBus(repository)
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        assert run.status == "queued"
+
+        await bus.publish(
+            Event(event="run.started", session_id=session.id, run_id=run.id, data={})
+        )
+
+        after = repository.get_run(session.id, run.id)
+        assert after.status == "running"
+        assert after.started_at is not None
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_materializes_run_usage(tmp_path) -> None:
+    """``run.usage`` published through the bus must apply additively to
+    ``Run.usage`` and reflect in ``Session.stats.tokens``. The
+    architectural unification means the side effect happens exactly
+    once per publish — no double-counting."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        bus = DurableEventBus(repository)
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="claude-code",
+                model="claude-opus-4-7",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+
+        await bus.publish(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={"usage": {"input": 6, "output": 4, "cache_read": 18, "cache_creation": 21}},
+            )
+        )
+
+        after_run = repository.get_run(session.id, run.id)
+        assert after_run.usage.input == 6
+        assert after_run.usage.output == 4
+        assert after_run.usage.cache_read == 18
+        assert after_run.usage.cache_creation == 21
+
+        after_session = repository.get_session(session.id)
+        assert after_session.stats.tokens.get("input") == 6
+        assert after_session.stats.tokens.get("output") == 4
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_does_not_double_count_run_usage(tmp_path) -> None:
+    """Regression for Falcon's PR #11 finding.
+
+    Pre-Phase-3, ``run.usage`` was materialized in BOTH
+    ``append_event`` and ``materialize_event``. The observer published
+    a usage event through the bus (insert + append_event materialize)
+    then separately called ``materialize_event`` for the same event,
+    doubling the applied usage.
+
+    Phase 3's structural fix: ``bus.publish`` is the single
+    materialization point. One publish → one materialize → the
+    advertised numbers land verbatim in ``Run.usage``."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        bus = DurableEventBus(repository)
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="claude-code",
+                model="claude-opus-4-7",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+
+        # Single publish — should NOT double-apply.
+        await bus.publish(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={"usage": {"input": 6, "output": 4, "cache_read": 18, "cache_creation": 21}},
+            )
+        )
+
+        after = repository.get_run(session.id, run.id)
+        # NOT (12, 8, 36, 42) — that was Falcon's bug.
+        assert (
+            after.usage.input,
+            after.usage.output,
+            after.usage.cache_read,
+            after.usage.cache_creation,
+        ) == (6, 4, 18, 21)
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_propagates_session_not_found_for_buffering(tmp_path) -> None:
+    """When ``bus.publish`` is asked to materialize a message event for
+    a session that doesn't exist yet (rollout fired before
+    ``POST /v1/sessions``), the bus inserts the event row (replay-safe)
+    and raises so the caller can buffer for later flush. The exception
+    must carry the published event so the buffer keeps the assigned
+    sequence."""
+    from agent_harness.repository import (
+        MaterializationDeferred,
+        SessionNotFoundError,
+    )
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        bus = DurableEventBus(repository)
+        message_event = Event(
+            event="message",
+            session_id="ses_does_not_exist",
+            data={"message": {"role": "user", "blocks": [{"type": "text", "text": "hi"}]}},
+        )
+
+        with pytest.raises((MaterializationDeferred, SessionNotFoundError)) as excinfo:
+            await bus.publish(message_event)
+
+        # The exception carries the published event so the caller's
+        # buffer keeps the sequence assigned by append_event.
+        deferred = excinfo.value
+        published = getattr(deferred, "event", None)
+        assert published is not None
+        assert published.sequence is not None
+        assert published.event == "message"
+
+        # Event row is in the durable store so replay still works.
+        events = repository.list_events(session_id="ses_does_not_exist")
+        assert any(e.event == "message" for e in events)
+    finally:
+        repository.close()

@@ -56,11 +56,11 @@ Approximate LOC delta: -250 in orchestrator.py, -40 across storage.py / events.p
 
 ### Rollout discovery
 
-**Claude.** Deterministic at spawn time. Orchestrator passes `--session-id ses_<hex>`; rollout filename is `~/.claude/projects/<slugified-cwd>/ses_<hex>.jsonl`. Supervisor pre-registers the path → harness-session-id binding with the observer immediately after spawn (the file may not exist yet, but the binding does; observer's tail-on-create handles the gap).
+**Claude.** Deterministic at spawn time. Orchestrator passes `--session-id <dashed-uuid>` (the 8-4-4-4-12 form, derived from the harness's `ses_<hex>` session id); rollout filename is `~/.claude/projects/<slugified-cwd>/<dashed-uuid>.jsonl`. Supervisor pre-registers the path → harness-session-id binding with the observer immediately after spawn (the file may not exist yet, but the binding does; observer's tail-on-create handles the gap). Phase 1 deviation: Phase 1's first cut composed the path using the `ses_<hex>` form, which never matched the file claude actually writes; fixed in Phase 1's self-review pass (commit `d027228`).
 
-**Codex.** Path is not predictable. Use `psutil.Process(pid).open_files()` to enumerate the codex subprocess's open file descriptors and filter for one matching `~/.codex/sessions/.../rollout-*.jsonl`. Cross-platform: psutil dispatches to `/proc/<pid>/fd/` on Linux and `libproc` on macOS. Poll briefly (50ms ticks for up to 5 seconds) after spawn — codex opens the rollout fd within the first few hundred ms but not strictly synchronously. Once found, register the binding the same way as for claude.
+**Codex.** Path is not predictable from the orchestrator's side. Phase 2 uses a content-based **expectation registry** on the observer instead of an fd probe: the orchestrator calls `observer.expect_codex_rollout(cwd, session_id)` synchronously at spawn time; the observer reads `session_meta` from each new codex rollout's first line and matches against active expectations (cwd-exact + ±30s window from `registered_at`, closest-time wins). Expectations have a 10s TTL so failed spawns don't leave permanent hints. Resolution is content-based, so a fast watchfiles inotify firing before/after the orchestrator's spawn-side handoff still routes correctly.
 
-Fallback if psutil isn't usable: `subprocess.run(['lsof', '-p', str(pid), '-F', 'n'])` and parse. Add psutil to dependencies; lsof stays as a defensive fallback only.
+Phase 1 originally probed `psutil.Process(pid).open_files()` synchronously (poll up to 5s) — that approach landed in PR #13 but Sentry's review flagged a residual race between psutil polling and watchfiles. Phase 2 replaces it with the expectation registry; psutil and the lsof fallback are removed.
 
 ### Observer (essentially unchanged, but becomes the sole writer)
 
@@ -124,12 +124,13 @@ Everything else in PR #11 (orchestrator stdout parsers, `_should_skip_parsed_eve
 
 **Cherry-pick from PR #12**: nothing required for correctness. `Session.codex_internal_id` may be worth keeping as a diagnostic field (the codex UUID is useful when humans cross-reference a session to a rollout filename); decide in Phase 1.
 
-**Phase 1 — supervisor refactor, no behavioral change.**
-- Add `observer.bind_rollout(path, session_id)`.
-- Add `RolloutDiscovery` module: claude (deterministic path) + codex (psutil fd probe with lsof fallback). Unit-tested with fake processes.
-- Supervisor calls `bind_rollout` before/after spawn as appropriate.
-- Stdout parsing still active; observer ingests as before. Result: each event lands in the same session row via both paths; the carve-outs prevent double materialization. No functional change yet.
-- New tests: discovery returns the right path for each backend; binding is registered before observer tails.
+**Phase 1 — supervisor refactor, no behavioral change.** (Landed: PR #13, `d651b61`.)
+- Added `observer.bind_rollout(path, session_id)` and `observer.unbind_rollout(path)`.
+- Added `RolloutDiscovery` module: claude (deterministic path) + codex (psutil fd probe with lsof fallback). Unit-tested with fake processes.
+- Supervisor calls `bind_rollout` after spawn; codex bind ran synchronously after Phase 1's self-review pass.
+- Stdout parsing still active; observer ingests as before. Result: each event lands in the same session row via both paths; the carve-outs prevent double materialization. No functional change.
+- Gated behind `AGENT_HARNESS_ROLLOUT_PRE_BIND=1` env var (default-off in Phase 1; Phase 2 removes the gate).
+- Sentry's review of PR #13 flagged a residual race between psutil-polling and watchfiles inotify (worth-noting #2), motivating Phase 2's switch to the expectation registry.
 
 **Phase 2 — observer becomes sole materializer for messages.**
 - Remove `parse_codex_stream_line` / `parse_claude_stream_line`. Remove the `message.delta` per-line publish from stdout in the supervisor.
@@ -152,7 +153,7 @@ Everything else in PR #11 (orchestrator stdout parsers, `_should_skip_parsed_eve
 
 For each phase:
 
-- Phase 1: `test_rollout_discovery_claude_deterministic`, `test_rollout_discovery_codex_psutil_probe`, `test_rollout_discovery_codex_lsof_fallback`, `test_observer_bind_rollout_predates_file_creation`.
+- Phase 1: `test_rollout_discovery_claude_deterministic`, `test_observer_bind_rollout_predates_file_creation`. (The psutil-probe and lsof-fallback tests landed with Phase 1 and were retired by Phase 2 along with `discover_codex` itself.)
 - Phase 2: existing message tests pass unchanged after stdout parser removal. New: `test_supervisor_does_not_emit_message_events`.
 - Phase 3: `test_watchdog_triggers_from_observer_end_turn`, `test_run_usage_no_double_count_via_unified_path` (Falcon's repro becomes a regression guard).
 - Phase 4: housekeeping.
@@ -163,7 +164,7 @@ Each phase's PR also runs the sidecar smoke (claude harness session + codex harn
 
 1. **Cost data — deferred** (Tijs, 2026-05-19). Token counts only in this refactor. `Usage.cost_usd` remains zero for codex (no upstream); claude `total_cost_usd` is dropped from the data plane since it only exists in stream-json `result`. A future helper can derive cost from token counts × a price table once we identify a maintainable price source.
 
-2. **psutil dependency — confirmed** (Tijs, 2026-05-19). Added as a regular dependency. `lsof` stays as a defensive fallback only.
+2. **psutil dependency — added in Phase 1, removed in Phase 2.** Phase 1 added `psutil` for the codex fd probe; Phase 2 retires that probe in favor of the observer-side expectation registry (content-based match on `session_meta`), and drops `psutil` along with the `lsof` fallback.
 
 3. **`process.stderr` event shape — confirmed** (Tijs, 2026-05-19). New event name: `process.stderr` with `{text: str}`. SSE consumers (mm-bridge, command-bridge) update accordingly. Mute previous `message.delta` from supervisor.
 

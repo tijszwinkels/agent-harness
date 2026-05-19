@@ -2,6 +2,7 @@ import asyncio
 import json
 import signal
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -1414,3 +1415,207 @@ async def test_run_process_continues_when_discover_codex_fails(
     warnings = [e for e in events if e.event == "run.warning"]
     assert warnings, [e.event for e in events]
     assert "discovery" in warnings[0].data.get("reason", "").lower() or warnings[0].data.get("error_type")
+
+
+# --- Phase 2: supervisor stops emitting message.delta; new process.stderr -----
+
+
+class _ExpectationRecordingObserver:
+    """Phase 2 stand-in for ``ExternalTranscriptObserver``. Replaces the
+    Phase 1 ``bind_rollout`` + ``unbind_rollout`` orchestrator surface
+    with ``expect_codex_rollout`` for the new spawn-side contract."""
+
+    def __init__(self) -> None:
+        self.expectations: list[tuple[object, str]] = []
+        # Phase 1 plumbing — claude pre-bind is unchanged in Phase 2.
+        self.bindings: list[tuple[object, str]] = []
+        self.unbindings: list[object] = []
+
+    def expect_codex_rollout(self, *, cwd, session_id: str) -> None:
+        self.expectations.append((cwd, session_id))
+
+    def bind_rollout(self, path, session_id: str) -> None:
+        self.bindings.append((path, session_id))
+
+    def unbind_rollout(self, path) -> None:
+        self.unbindings.append(path)
+
+
+@pytest.mark.asyncio
+async def test_run_process_emits_no_message_delta_for_stdout() -> None:
+    """After Phase 2, the supervisor's stdout pump stops emitting
+    ``message.delta`` entirely. The observer is the sole writer for
+    ``message``-shaped events. Stdout lines that aren't end-turn signals
+    are diagnostic-only and don't travel the event bus."""
+    bus = InMemoryEventBus()
+    session = make_session()  # codex
+    run = make_run(session)
+    process = FakeProcess(stdout=[b"some noise\n", b"more noise\n"], returncode=0)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert all(e.event != "message.delta" for e in events), [e.event for e in events]
+
+
+@pytest.mark.asyncio
+async def test_run_process_emits_process_stderr_for_stderr_lines() -> None:
+    """Stderr lines are forwarded as ``process.stderr`` events with a
+    ``{text: <line>}`` payload — diagnostic firehose, not parsed."""
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    process = FakeProcess(stderr=[b"warning A\n", b"warning B\n"], returncode=0)
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    stderr_events = [e for e in events if e.event == "process.stderr"]
+    assert [e.data["text"] for e in stderr_events] == ["warning A", "warning B"]
+    # message.delta MUST NOT be emitted from stderr either.
+    assert all(e.event != "message.delta" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_run_process_still_detects_end_turn_for_watchdog_codex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The end-turn signal that drives the post-end_turn cleanup
+    watchdog must still fire when codex emits ``turn.completed`` on
+    stdout. (Phase 3 will rewire this to come from the observer; for
+    now the stdout signal is what we have.)"""
+    import json as _json
+
+    from agent_harness.orchestrator import END_TURN_GRACE_SECONDS, END_TURN_HARD_KILL_AFTER_SECONDS
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[(_json.dumps({"type": "turn.completed"}) + "\n").encode()],
+        returncode=0,
+        exit_on_sigterm=True,
+    )
+    factory = FakeFactory(process)
+    clock = FakeClock()
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    # Let the stdout line be ingested.
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # Past the post-end_turn grace window — SIGTERM should fire.
+    clock.advance(END_TURN_GRACE_SECONDS + 1)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert signal.SIGTERM in process.group_signals
+
+
+@pytest.mark.asyncio
+async def test_run_process_still_detects_end_turn_for_watchdog_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same watchdog signal for claude (``result`` + stop_reason=end_turn)."""
+    import json as _json
+
+    from agent_harness.orchestrator import END_TURN_GRACE_SECONDS
+
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[
+            (_json.dumps({"type": "result", "stop_reason": "end_turn"}) + "\n").encode()
+        ],
+        returncode=0,
+        exit_on_sigterm=True,
+    )
+    factory = FakeFactory(process)
+    clock = FakeClock()
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    clock.advance(END_TURN_GRACE_SECONDS + 1)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert signal.SIGTERM in process.group_signals
+
+
+@pytest.mark.asyncio
+async def test_pre_bind_codex_registers_expectation() -> None:
+    """In Phase 2, the codex pre-bind step is a one-line synchronous
+    ``observer.expect_codex_rollout(cwd, session_id)`` call. No psutil
+    fd probe, no background task. Registration happens before (or
+    around) spawn — the observer matches incoming rollouts by content."""
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+    observer = _ExpectationRecordingObserver()
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=factory,
+        observer=observer,
+    )
+    task = asyncio.create_task(rp.run())
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert observer.expectations == [
+        (Path("/workspace/project"), session.id)
+    ]
+    # No bind/unbind for codex anymore — the expectation registry
+    # replaces the bind_rollout codepath for codex spawns.
+    assert observer.bindings == []
+    assert observer.unbindings == []

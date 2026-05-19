@@ -709,3 +709,46 @@ def test_observer_offsets_table_creation_is_idempotent_on_legacy_db(tmp_path) ->
         assert repo.get_observer_offsets() == {"/transcripts/a.jsonl": 42}
     finally:
         repo.close()
+
+
+def test_sqlite_repository_append_event_no_longer_materializes_message(tmp_path) -> None:
+    """Phase 2: ``append_event`` is a pure event-row insert. The
+    message-materialization carve-out (previously gated on
+    ``data.origin != "external"``) is removed; the observer's
+    ``materialize_event`` path is now the sole writer to the messages
+    table. The event row itself is still inserted, but the messages
+    table stays empty until materialize_event runs."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        message = Message(role="assistant", blocks=[{"type": "text", "text": "should not materialize"}])
+
+        published = repository.append_event(
+            Event(
+                event="message",
+                session_id=session.id,
+                data={"message": message.model_dump(mode="json")},
+            )
+        )
+
+        # Event row was inserted (the durable bus relies on this).
+        assert published.sequence is not None
+        events = repository.list_events(session_id=session.id)
+        assert any(e.event == "message" for e in events)
+
+        # But the message did NOT land in the messages table — that's
+        # the observer's job now via ``materialize_event``. The session
+        # also kept its baseline (one user message from create_run-less
+        # path; here zero because we didn't call create_run).
+        messages = repository.list_messages(session.id)
+        assert messages == []
+        # The default stats.messages from create_session is 0.
+        assert repository.get_session(session.id).stats.messages == 0
+    finally:
+        repository.close()

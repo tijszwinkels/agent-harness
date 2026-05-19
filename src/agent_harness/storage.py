@@ -24,6 +24,7 @@ from agent_harness.models import (
 from agent_harness.repository import (
     RunNotFoundError,
     SessionNotFoundError,
+    _context_used_from,
     _context_window_from,
 )
 
@@ -727,6 +728,7 @@ class SQLiteRepository:
             return
         delta = Usage.model_validate(usage_data)
         context_window = _context_window_from(event.data)
+        context_used = _context_used_from(event.data)
 
         row = self._connection.execute(
             "select payload from runs where id = ? and session_id = ?",
@@ -754,6 +756,11 @@ class SQLiteRepository:
         }
         if context_window is not None:
             stats_update["context_window"] = context_window
+        if context_used is not None:
+            # SNAPSHOT semantics: overwrite, never sum. A None value
+            # means "no fresh observation" (event omitted the field);
+            # leave the prior snapshot in place.
+            stats_update["context_used"] = context_used
         self._upsert_session(
             session.model_copy(
                 update={

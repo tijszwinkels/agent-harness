@@ -45,18 +45,73 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
-_IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "pr-link", "queue-operation", "system"}
-_IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
+# Claude rollout record-types we intentionally drop on the floor.
+# Phase 4 audit: every entry here has a "record genuinely doesn't
+# carry message-shaped content for us" rationale — not "avoid
+# double-emit because stdout already did it" (the dual-path
+# motivation went away with Phase 2).
+#
+# - ``attachment``: claude's image/file-attachment marker — payload
+#   shape is image-only; the canonical ``user``/``assistant`` record
+#   carries the image content blocks if they're conversation
+#   participants.
+# - ``last-prompt``: claude's bookkeeping for the most-recent user
+#   prompt; duplicate of the matching ``user`` record.
+# - ``pr-link``: claude-code's GitHub PR-link metadata; not
+#   conversational.
+# - ``queue-operation``: claude-code's internal queue housekeeping.
+# - ``system``: claude system-message hooks; not conversational.
+_IGNORED_CLAUDE_RECORD_TYPES = {
+    "attachment",
+    "last-prompt",
+    "pr-link",
+    "queue-operation",
+    "system",
+}
+
+# Codex rollout record-types (outer ``type``) we drop on the floor.
+# Phase 4 audit:
+#
+# - ``compacted``: codex's compaction snapshot — observability
+#   without a data-plane consumer.
+# - ``session_meta``: parsed separately (cwd + timestamp lookups for
+#   the expectation registry); ignoring here prevents duplicate
+#   session.updated emission.
+# - ``turn_context``: NEW in Phase 4 — codex emits this as a
+#   per-turn context-only marker. It carries cwd + model which
+#   ``_session_event_if_complete`` already extracts from
+#   ``payload``; without this entry the parser falls through to the
+#   "Unsupported Codex transcript shape" warning, spamming logs
+#   (Orion's worth-noting #3 on PR #15).
+_IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta", "turn_context"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
+    # ``agent_message`` and ``assistant_message`` are codex's
+    # ``event_msg`` form of the assistant turn; the canonical
+    # representation is ``response_item/message`` which carries the
+    # full content blocks. Ignoring the event_msg form is what stops
+    # the observer from emitting the same assistant message twice.
     "agent_message",
     "assistant_message",
+    # ``context_compacted`` carries a codex-side summary of the
+    # compaction the runtime just performed; observability without a
+    # data-plane consumer yet. Demoted to "metadata", revisit if
+    # mm-bridge / command-bridge grow a need for it.
     "context_compacted",
-    "task_complete",
+    # ``task_started`` is the matching bookend to ``task_complete``;
+    # ``task_complete`` is now surfaced as ``run.end_turn`` (Phase 4).
+    # ``task_started`` stays ignored — the harness's own
+    # ``run.started`` event covers the same lifecycle moment from
+    # the supervisor's side.
     "task_started",
-    # ``token_count`` is no longer ignored — Phase 3 surfaces it as a
-    # ``run.usage`` event keyed to the session's active harness run
-    # (see ``_parse_codex_record``).
+    # ``web_search_call`` is the standalone codex search affordance
+    # (no harness consumer; the response_item/function_call form is
+    # what tool-use parsers care about).
     "web_search_call",
+    #
+    # ``token_count`` was removed from this set in Phase 3 — surfaced
+    # as ``run.usage``. ``task_complete`` was removed in Phase 4 —
+    # surfaced as ``run.end_turn``. Both have an explicit branch in
+    # ``_parse_codex_record`` before this gate fires.
 }
 
 
@@ -238,21 +293,16 @@ class ExternalTranscriptObserver:
         # ``_path_to_session``: that's "matched, route to session_id";
         # this is "checked, falls through to filename pattern".
         #
-        # TODO(phase-3+): two known edges worth hardening (Aegis-flagged
-        # worth-notings on PR #14):
-        # (a) Cache poisoning when a tail_file fires BEFORE the
-        #     expectation is registered. Production is shielded because
-        #     ``_pre_register_codex_expectation_if_codex`` runs before
-        #     ``_process_factory(...)``, but the docstring promises
-        #     content-based race-tolerance. Consider clearing this
-        #     cache on every new ``expect_codex_rollout``, or only
-        #     memoizing the "no session_meta head" structural case
-        #     (not the "no expectation matched right now" case).
-        # (b) For genuinely-external codex rollouts (no expectation
-        #     will ever be registered), this cache accumulates one
-        #     entry per rollout the observer ever encounters. Bounded
-        #     by the rollout's own lifecycle, but worth a periodic
-        #     sweep on long-running harnesses.
+        # Phase 4 hardening (Aegis-flagged worth-noting on PR #14):
+        # the cache is cleared by ``expect_codex_rollout`` on every
+        # new spawn, so a tail_file that races ahead of expectation
+        # registration can't poison the entry. For genuinely-external
+        # rollouts (no expectation ever fires for them), the cache
+        # accumulates one entry per rollout the observer encounters —
+        # bounded by the rollout's own lifecycle; if the harness
+        # processes thousands of distinct external rollouts across a
+        # long uptime, a periodic sweep could be added (not load-bearing
+        # today).
         self._codex_resolution_cache: dict[Path, bool] = {}
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
@@ -359,6 +409,15 @@ class ExternalTranscriptObserver:
                 expires_at=now + self._expectation_ttl,
             )
         )
+        # Phase 4: invalidate the "checked-no-match" memo. Without
+        # this, if ``tail_file`` peeked a rollout BEFORE this
+        # expectation was registered (e.g. watchfiles fires fast on
+        # a brand-new codex spawn), the path would be permanently
+        # cached as "no match" — even though the just-registered
+        # expectation would match it. The cache is a small dict; a
+        # full clear on each spawn is cheap and corrects the race
+        # cleanly. Phase 3 left this as a TODO; Phase 4 closes it.
+        self._codex_resolution_cache.clear()
 
     def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity | None:
         """Resolve the identity that owns events from ``transcript_path``.
@@ -558,11 +617,12 @@ class ExternalTranscriptObserver:
             return []
         published: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
-            if event.event == "run.usage":
-                # Parsers emit run.usage with ``run_id=None``; resolve
-                # the active run for the session here (the parser has
-                # no repository). Drop if no active run.
-                resolved = self._resolve_run_usage_run_id(event)
+            if event.event in ("run.usage", "run.end_turn"):
+                # Parsers emit run.usage / run.end_turn with
+                # ``run_id=None`` (no repository access from the pure
+                # parser). Resolve the active run for the session here
+                # and drop the event if no active run exists.
+                resolved = self._resolve_active_run_id(event)
                 if resolved is None:
                     continue
                 event = resolved
@@ -689,26 +749,31 @@ class ExternalTranscriptObserver:
         )
         return published
 
-    def _resolve_run_usage_run_id(self, event: Event) -> Event | None:
-        """Phase 3: parsers emit ``run.usage`` events with
-        ``run_id=None`` because the parser has no repository access.
-        Here we resolve the active run for the session and stamp the
-        event's ``run_id`` so the materializer can apply the usage to
-        the right Run row.
+    def _resolve_active_run_id(self, event: Event) -> Event | None:
+        """Stamp the session's active run id onto an event whose
+        parser-emitted ``run_id`` is ``None``.
 
-        Returns ``None`` when there's no active run to attribute usage
-        to (pure-external session — documented gap; Falcon's
-        worth-noting #1 on PR #11). The synthesized event is dropped
-        on the floor rather than published as a phantom.
+        Used for ``run.usage`` (Phase 3) and ``run.end_turn`` (Phase 4):
+        both are observer-synthesized events that need to attribute
+        rollout-derived activity to the harness's running Run. The
+        pure parser has no repository access, so resolution happens
+        here.
+
+        Returns ``None`` when no active run exists — pure-external
+        sessions or runs that have already reached terminal state.
+        Falcon's worth-noting #1 on PR #11 documents the gap; the
+        synthesized event is dropped rather than published as a
+        phantom keyed to nothing.
         """
-        if event.event != "run.usage" or event.run_id is not None:
+        if event.run_id is not None:
             return event
         if event.session_id is None or self._repository is None:
             return None
         active_run_id = self._active_run_id_for_session(event.session_id)
         if active_run_id is None:
             logger.debug(
-                "Skipping run.usage: no active run for session=%s",
+                "Skipping %s: no active run for session=%s",
+                event.event,
                 event.session_id,
             )
             return None
@@ -718,16 +783,22 @@ class ExternalTranscriptObserver:
         """Return the id of the session's currently-running harness
         run, or ``None`` if no run is in ``running`` status.
 
+        Used by ``_resolve_active_run_id`` for both ``run.usage``
+        (Phase 3) and ``run.end_turn`` (Phase 4): the caller drops
+        the event when this returns ``None``. Two reasons not to fall
+        back to the most-recently-started non-running run:
+
+        - ``run.usage``: applying usage to a completed run silently
+          rewrites its outcome.
+        - ``run.end_turn``: a stale end-turn either no-ops against an
+          already-exited watchdog OR would falsely arm cleanup for an
+          unrelated future run (the watchdog's session-scoped
+          subscription would receive it).
+
         Walks ``list_runs`` in reverse so the most-recently-started
-        running run wins (the FIFO queue serializes the harness to one
-        running run per session, so reverse order is a defensive
-        no-op in practice). Returns ``None`` — and the caller drops
-        the ``run.usage`` event — when no running run exists; e.g.
-        between ``run.completed`` and the next spawn for multi-turn
-        codex sessions where ``token_count`` arrives after
-        ``task_complete``. A fallback to the most-recently-started
-        non-running run was considered but rejected: applying usage
-        to a completed run silently rewrites its outcome.
+        running run wins. The per-session FIFO queue serializes the
+        harness to one running run per session, so the reverse order
+        is a defensive no-op in practice — but cheap.
         """
         if self._repository is None:
             return None
@@ -996,6 +1067,19 @@ def _parse_claude_record(
                         offset=offset,
                     )
                 )
+            # Phase 4: when the assistant message ends the turn
+            # (``stop_reason == "end_turn"``), emit ``run.end_turn``.
+            # Drives the watchdog's post-end_turn cleanup via the
+            # event bus — replaces the supervisor's stdout-derived
+            # detector that Phase 4 retires.
+            if message.get("stop_reason") == "end_turn":
+                events.append(
+                    _run_end_turn_event(
+                        identity=identity,
+                        backend="claude-code",
+                        offset=offset,
+                    )
+                )
         return events
 
     logger.warning(
@@ -1042,6 +1126,21 @@ def _parse_codex_record(
                     offset=offset,
                 )
             )
+        return events
+
+    # Phase 4: codex's ``event_msg/task_complete`` signals end of
+    # turn. Surface as ``run.end_turn`` (run_id resolved in
+    # publish_line) — drives the watchdog's post-end_turn cleanup
+    # grace via the event bus, replacing the supervisor's removed
+    # stdout-derived signal.
+    if record_type == "event_msg" and payload_type == "task_complete":
+        events.append(
+            _run_end_turn_event(
+                identity=identity,
+                backend="codex",
+                offset=offset,
+            )
+        )
         return events
 
     if record_type in _IGNORED_CODEX_RECORD_TYPES or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES:
@@ -1231,6 +1330,34 @@ def _run_usage_event(
         session_id=identity.session_id,
         run_id=None,
         data=data,
+    )
+
+
+def _run_end_turn_event(
+    *,
+    identity: TranscriptIdentity,
+    backend: BackendName,
+    offset: int | None,
+) -> Event:
+    """Build a ``run.end_turn`` event with ``run_id=None``.
+
+    Phase 4: published whenever the rollout signals the end of an
+    assistant turn (claude ``stop_reason == "end_turn"`` or codex
+    ``event_msg/task_complete``). ``publish_line`` resolves the
+    active run id before publishing. The supervisor's
+    ``_watch_end_turn_cleanup`` watchdog subscribes to this event
+    on the bus and arms its SIGTERM grace timer when ``run_id``
+    matches its own. Replaces the supervisor-side stdout detector
+    that Phase 4 retires.
+    """
+    return Event(
+        event="run.end_turn",
+        session_id=identity.session_id,
+        run_id=None,
+        data={
+            **_source_data(identity, offset=offset),
+            "backend": backend,
+        },
     )
 
 
@@ -1425,9 +1552,16 @@ def _text_parts_from_content(content: object) -> list[str]:
 
 
 def _source_data(identity: TranscriptIdentity, *, offset: int | None) -> dict[str, Any]:
+    # Phase 4: the unconditional ``origin: "external"`` stamp was
+    # load-bearing under Phase 2's dual-path materialization — the
+    # storage carve-outs gated on it to disambiguate "harness vs
+    # external" message handling. Phase 3's single materialization
+    # point retired those carve-outs; the tag is now dead metadata
+    # and would actually mislead consumers (an observer-emitted
+    # event for a harness-bound rollout carries the harness session
+    # id but a misleading ``origin: external`` source tag).
     data: dict[str, Any] = {
         "backend": identity.backend,
-        "origin": "external",
         "transcript_path": str(identity.path),
     }
     if offset is not None:

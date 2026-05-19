@@ -1,9 +1,21 @@
 # Unified Ingestion: Rollout Files as the Single Data Source
 
 Drafted: 2026-05-19 — Echo (PM)
-Status: spec, awaiting Tijs sign-off before implementation
-Worktree: `worktrees/spec/unified-ingestion`
-Branch: `spec/unified-ingestion`
+**Status: Done as of 2026-05-19.** Shipped across four phased PRs:
+- PR #13 (Phase 1): rollout discovery + observer pre-binding
+- PR #14 (Phase 2): observer becomes sole writer for messages; codex expectation registry
+- PR #15 (Phase 3): single materialization point; observer writes run.usage
+- PR #16 (Phase 4): watchdog rewires; supervisor stops parsing; final cleanup
+
+The dual-path architecture is fully gone. The original design smell
+Tijs flagged ("why is materialization invoked from two places?") is
+resolved at every layer — `bus.publish` is the single materialization
+point, the observer is the sole writer for `message` / `run.usage` /
+`run.end_turn`, and the supervisor's stdout pump is purely heartbeat
++ stderr passthrough.
+
+Original worktree: `worktrees/spec/unified-ingestion` (spec drafting).
+Implementation worktrees: `worktrees/feat/unified-phase-{1,2,3,4}`.
 
 ## Why
 

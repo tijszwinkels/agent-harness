@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -9,9 +8,8 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
-
 from pathlib import Path
+from typing import Any, Literal, Protocol
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock, utc_now
@@ -25,17 +23,17 @@ IDLE_TIMEOUT_SECONDS = 30 * 60
 IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
 
-_END_TURN_EVENT = "__end_turn__"
-# Phase 2: ``message.delta`` is no longer emitted from the supervisor
-# (the observer is the sole writer for message-shaped events). We keep
-# ``message`` and ``tool_use`` for forward-compatibility (Phase 3 will
-# rewire the watchdog to subscribe to observer events directly) and add
-# ``process.stderr`` so long stderr-active codex runs don't trip the
-# 30-min idle watchdog spuriously while the orchestrator-side activity
-# stream is otherwise sparse.
+# Phase 4: events that tick ``_last_activity_at`` via ``RunProcess._publish``,
+# keeping the 30-min idle watchdog warm. The observer's ``message`` /
+# ``tool_use`` / ``run.usage`` / ``run.end_turn`` events flow through
+# the shared bus but DON'T go through ``RunProcess._publish``, so they
+# don't tick this map. The two activity signals the supervisor still
+# publishes are ``process.stderr`` (stderr-active runs) and the
+# stdout heartbeat (which sets ``_last_activity_at`` directly in
+# ``_stream_lines``, bypassing _publish). Idle-watchdog rewire to
+# subscribe to observer events is a future-phase candidate; for now
+# stdout heartbeat + stderr keep claude / codex runs warm.
 _ACTIVITY_EVENTS = frozenset({
-    "message",
-    "tool_use",
     "process.stderr",
 })
 
@@ -186,34 +184,12 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
     }
 
 
-def _detect_end_turn_in_line(line: str, *, backend: str) -> bool:
-    """Detect the end-of-turn signal in a single stdout line.
-
-    Phase 2 collapses the per-backend stdout parsers into this single
-    boolean helper — the only thing the supervisor still cares about
-    in stdout is whether the watchdog's post-end_turn cleanup should
-    fire. Message data flows through the observer.
-
-    Recognized shapes:
-    - claude-code: ``{"type":"result","stop_reason":"end_turn"}``
-    - codex: ``{"type":"turn.completed"}``
-    """
-    if not line:
-        return False
-    try:
-        record = json.loads(line)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(record, Mapping):
-        return False
-    if backend == "claude-code":
-        return (
-            record.get("type") == "result"
-            and record.get("stop_reason") == "end_turn"
-        )
-    if backend == "codex":
-        return record.get("type") == "turn.completed"
-    return False
+# Phase 4 retired the supervisor's stdout end-turn detector
+# (``_detect_end_turn_in_line``). End-turn signaling now flows from
+# the observer's rollout parser via the ``run.end_turn`` event bus
+# subscription (see ``RunProcess._wait_for_run_end_turn``). The
+# supervisor's stdout pump is now purely a heartbeat tick + stderr
+# passthrough (see ``_stream_lines``).
 
 
 def validate_session_resume_target(session: Session) -> None:
@@ -297,7 +273,9 @@ class RunProcess:
         self._interrupted = False
         self._clock = clock
         self._sleep = sleep
-        self._end_turn_event = asyncio.Event()
+        # Phase 4: end-turn signaling moved to the event bus
+        # (``_wait_for_run_end_turn`` subscribes by session_id).
+        # The internal ``_end_turn_event`` asyncio.Event is retired.
         self._last_activity_at = self._clock()
         self._last_activity_event: str | None = None
         self._watchdog_termination_in_progress = False
@@ -512,23 +490,16 @@ class RunProcess:
         return tasks
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
-        # Phase 2: stdout is end-turn-only; stderr forwards as
-        # ``process.stderr`` events. The observer is the sole writer
-        # for ``message`` / ``message.delta``; nothing on this path
-        # synthesizes messages.
+        # Phase 4: the supervisor's stdout pump is now purely
+        # heartbeat + stderr passthrough. End-turn signaling moved to
+        # the observer (rollout-parser → ``run.end_turn`` event →
+        # watchdog subscription); message data has flowed through
+        # the observer since Phase 2. No parsing, no detection.
         #
-        # Watchdog heartbeat: every non-empty stdout line ticks
-        # ``_last_activity_at`` directly (NOT via ``_publish``), without
-        # publishing any event. This is a private liveness signal — the
-        # idle watchdog reads ``_last_activity_at``, and Phase 2's
-        # removal of ``message.delta`` from ``_ACTIVITY_EVENTS`` would
-        # otherwise leave claude harness runs (which talk only via the
-        # rollout, rarely via stderr) without any activity ticks and
-        # trip the 30-min SIGTERM. Phase 3 will rewire the watchdog to
-        # subscribe to observer-emitted activity directly.
-        is_harness_stdout = (
-            stream_name == "stdout" and self.session.origin == "harness"
-        )
+        # Heartbeat: every non-empty stdout line ticks
+        # ``_last_activity_at`` directly (NOT via ``_publish``),
+        # keeping the idle watchdog warm for long-running harness
+        # runs that emit no stderr (claude talks only via rollout).
         while line := await stream.readline():
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not text:
@@ -536,22 +507,9 @@ class RunProcess:
             if stream_name == "stderr":
                 await self._publish("process.stderr", {"text": text})
                 continue
-            # Stdout heartbeat (no publish): keeps the idle watchdog
-            # warm for long-running harness runs that emit no stderr.
+            # Stdout heartbeat (no publish).
             self._last_activity_at = self._clock()
             self._last_activity_event = "stdout"
-            if not is_harness_stdout:
-                continue
-            try:
-                if _detect_end_turn_in_line(text, backend=self.session.backend):
-                    self._end_turn_event.set()
-            except Exception:
-                logger.exception(
-                    "End-turn detector raised: session=%s run=%s backend=%s",
-                    self.session.id,
-                    self.run_record.id,
-                    self.session.backend,
-                )
 
     async def _finish_streams(self, tasks: list[asyncio.Task[None]]) -> None:
         if not tasks:
@@ -586,8 +544,62 @@ class RunProcess:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _wait_for_run_end_turn(self) -> bool:
+        """Block until the observer publishes a ``run.end_turn`` event
+        for this RunProcess's session AND run id.
+
+        Returns ``True`` when the matching event arrived (caller
+        proceeds to the grace + SIGTERM ladder); returns ``False`` if
+        the subscription is cancelled while we wait. Subscribes
+        filtered by ``session_id`` (cheap filter built into
+        bus.subscribe) and double-checks ``event.run_id`` in the
+        handler so a same-session parallel run can't arm our cleanup.
+
+        ``after=current_max_sequence`` skips historical events: the
+        watchdog only cares about end-turn signals fired AFTER this
+        RunProcess started. Without this filter, the observer's first
+        tail of a never-observed rollout (e.g. a fresh harness
+        restart picking up a long-lived external session) would
+        replay historical ``run.end_turn`` records — and
+        ``_resolve_active_run_id`` would stamp them with THIS run's
+        id, arming the watchdog SIGTERM within the 20s grace window
+        for a brand-new run.
+        """
+        after = await self._event_bus.max_sequence(session_id=self.session.id)
+        subscription = self._event_bus.subscribe(
+            after=after, session_id=self.session.id
+        )
+        try:
+            async for event in subscription:
+                if event is None:
+                    continue
+                if event.event != "run.end_turn":
+                    continue
+                # ``run_id`` is stamped at the top level by the
+                # observer's ``_resolve_active_run_id`` (a model_copy
+                # update on ``Event.run_id``); the parser-built event
+                # carries ``run_id=None`` until that resolution.
+                if event.run_id == self.run_record.id:
+                    return True
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await subscription.aclose()
+        return False
+
     async def _watch_end_turn_cleanup(self, wait_task: asyncio.Task[int]) -> None:
-        await self._end_turn_event.wait()
+        # Phase 4: subscribe to observer-emitted ``run.end_turn``
+        # events on the bus instead of polling an internal
+        # stdout-derived signal. Filter by session_id (subscription
+        # parameter) AND ``data.run_id`` (handler-side check) so a
+        # parallel run for the same session doesn't arm our cleanup.
+        #
+        # Latency: end-turn timing now depends on rollout flush
+        # cadence — empirically <1s for claude (flushes promptly on
+        # ``stop_reason``) and <2s for codex (flushes on
+        # ``task_complete``). Acceptable for a 20s grace window.
+        if not await self._wait_for_run_end_turn():
+            return
         if self._process_exited(wait_task):
             return
 

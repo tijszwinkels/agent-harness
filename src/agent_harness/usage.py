@@ -96,6 +96,60 @@ def parse_codex_usage(data: object) -> Usage | None:
     )
 
 
+def parse_codex_context_snapshot(payload: object) -> int | None:
+    """Pull the currently-loaded context size from a codex
+    ``event_msg/token_count`` payload's
+    ``info.total_token_usage.total_tokens``.
+
+    Distinct from ``parse_codex_token_count``: that returns the
+    per-turn delta from ``last_token_usage`` (additive on
+    ``Session.stats.tokens``); this returns a snapshot suitable for
+    overwrite onto ``Session.stats.context_used``. After every turn
+    codex emits a fresh ``token_count`` whose total reflects the
+    context loaded for the next turn — so the latest value wins.
+
+    Returns ``None`` whenever the snapshot is unavailable: codex's
+    first ``token_count`` after session start has ``info: null``; some
+    payloads omit ``total_token_usage`` entirely; a zero total is
+    treated as no-data (a real zero is indistinguishable from "we
+    haven't observed yet" and we mustn't overwrite an earlier real
+    snapshot with it).
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    info = payload.get("info")
+    if not isinstance(info, Mapping):
+        return None
+    total = info.get("total_token_usage")
+    if not isinstance(total, Mapping):
+        return None
+    snapshot = _nonnegative_int(total.get("total_tokens"))
+    return snapshot if snapshot >= 1 else None
+
+
+def parse_claude_context_snapshot(usage: object) -> int | None:
+    """Compute the currently-loaded context size from a claude
+    ``message.usage`` block.
+
+    For an assistant turn the loaded context equals
+    ``input_tokens + cache_creation_input_tokens + cache_read_input_tokens``.
+    ``output_tokens`` is excluded — output is the model's response, not
+    part of the context the model sees on the next turn.
+
+    Returns ``None`` for a non-mapping input (matches
+    ``parse_claude_usage``'s contract). An all-zero mapping returns
+    ``0``, which the materializer treats as "no useful snapshot" — see
+    ``observer._run_usage_event``'s skip-on-zero guard.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+    return (
+        _nonnegative_int(usage.get("input_tokens"))
+        + _nonnegative_int(usage.get("cache_creation_input_tokens"))
+        + _nonnegative_int(usage.get("cache_read_input_tokens"))
+    )
+
+
 def add_usage(left: Usage, right: Usage) -> Usage:
     """Sum two ``Usage`` records component-wise. Used by the
     materializer to apply per-turn usage onto the run's running

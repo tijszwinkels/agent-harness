@@ -67,6 +67,41 @@ class TranscriptIdentity:
     is_rebound: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class CodexRolloutExpectation:
+    """A hint from the orchestrator that a codex rollout from ``cwd``
+    is about to appear, and should route to ``session_id`` rather than
+    the synthesized ``codex_<uuid>`` external row.
+
+    The observer matches incoming codex rollouts against active
+    expectations by ``session_meta.cwd`` + a ±30s timestamp window —
+    content-based, not timing-based, so a watchfiles inotify firing
+    BEFORE the orchestrator's spawn-side handoff can still resolve
+    correctly. Expectations have a TTL so a failed/cancelled spawn
+    doesn't leave a permanent ghost hint.
+    """
+
+    cwd: Path
+    session_id: str
+    registered_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionMetaPeek:
+    """Outcome of peeking the first line of a codex rollout file.
+
+    ``retry`` distinguishes "partial flush — try again next tick" from
+    "we read enough to know this isn't a codex rollout with a
+    session_meta head"; only the latter gets memoized as "no match"
+    by the caller.
+    """
+
+    cwd: str | None
+    timestamp: datetime | None
+    retry: bool = False
+
+
 class ObserverOffsetStore(Protocol):
     def get_observer_offsets(self) -> dict[str, int]:
         pass
@@ -130,6 +165,11 @@ class ObserverState:
 
 
 DEFAULT_IDLE_AFTER_SECONDS = 30.0
+DEFAULT_EXPECTATION_TTL_SECONDS = 10.0
+# Window within which a session_meta timestamp must lie of an
+# expectation's ``registered_at`` for them to match. Generous — codex
+# startup can take a few seconds and a chunky cwd-mtime lag is normal.
+_EXPECTATION_TIMESTAMP_WINDOW = timedelta(seconds=30)
 
 
 class ExternalTranscriptObserver:
@@ -141,6 +181,7 @@ class ExternalTranscriptObserver:
         state: ObserverState | None = None,
         idle_after_seconds: float = DEFAULT_IDLE_AFTER_SECONDS,
         clock: Callable[[], datetime] | None = None,
+        expectation_ttl_seconds: float = DEFAULT_EXPECTATION_TTL_SECONDS,
     ) -> None:
         self._event_bus = event_bus
         self._repository = repository
@@ -156,14 +197,26 @@ class ExternalTranscriptObserver:
         self._idle_after = timedelta(seconds=idle_after_seconds)
         self._clock = clock or utc_now
         # Pre-bindings populated by the orchestrator's spawn path (via
-        # ``bind_rollout``). When the observer later sees a rollout
-        # path, a binding here wins over the filename-pattern lookup —
-        # which lets harness-origin runs attribute events to their own
-        # session id even when the backend can't pin the rollout uuid
-        # at spawn time (codex). Pre-binding before the file exists is
-        # supported: the binding is consulted only when ``tail_file``
+        # ``bind_rollout``) — claude pre-bind path. When the observer
+        # later sees a rollout path, a binding here wins over the
+        # filename-pattern lookup. Pre-binding before the file exists
+        # is supported: the binding is consulted only when ``tail_file``
         # encounters the path.
         self._path_to_session: dict[Path, str] = {}
+        # Phase 2: codex rollout expectations. The orchestrator hints
+        # ("I'm spawning codex from cwd X at time T"); the observer
+        # consumes by reading session_meta from the rollout's first
+        # line and matching against active expectations. Content-based
+        # so the watchfiles inotify ↔ orchestrator-side race that
+        # plagued Phase 1's psutil fd probe dissolves.
+        self._codex_expectations: list[CodexRolloutExpectation] = []
+        self._expectation_ttl = timedelta(seconds=expectation_ttl_seconds)
+        # Memoize "we already peeked and this rollout doesn't have a
+        # session_meta head" so we don't re-read the file on every
+        # tail_file tick for the same path. Distinct from
+        # ``_path_to_session``: that's "matched, route to session_id";
+        # this is "checked, falls through to filename pattern".
+        self._codex_resolution_cache: dict[Path, bool] = {}
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
         # threshold flips silent sessions to idle; a fresh event on an idle
@@ -215,18 +268,168 @@ class ExternalTranscriptObserver:
         runs are dead weight. Idempotent: missing entries are a no-op.
         """
         self._path_to_session.pop(Path(path), None)
+        # Forget any "checked-no-match" memoization too, so a fresh
+        # session_meta peek can run if the rollout reappears.
+        self._codex_resolution_cache.pop(Path(path), None)
 
-    def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity:
+    def expect_codex_rollout(self, *, cwd: Path | str, session_id: str) -> None:
+        """Register a hint that a codex rollout matching ``cwd`` is about
+        to appear and should route to ``session_id``.
+
+        Called by the orchestrator at codex spawn time. The observer
+        matches incoming codex rollouts against active expectations by
+        ``session_meta.cwd`` + a ±30s timestamp window from the
+        expectation's registration time. Expectations expire after
+        ``expectation_ttl_seconds`` (default 10s) so a failed spawn
+        doesn't strand a permanent ghost hint.
+        """
+        now = self._clock()
+        self._codex_expectations.append(
+            CodexRolloutExpectation(
+                cwd=Path(cwd),
+                session_id=session_id,
+                registered_at=now,
+                expires_at=now + self._expectation_ttl,
+            )
+        )
+
+    def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity | None:
+        """Resolve the identity that owns events from ``transcript_path``.
+
+        Returns ``None`` when codex's session_meta is in a partial
+        flush — caller should retry on the next tail tick rather than
+        attribute events to the wrong session id.
+        """
         base = transcript_identity_from_path(transcript_path)
         bound = self._path_to_session.get(transcript_path)
-        if bound is None or bound == base.session_id:
+        if bound is not None and bound != base.session_id:
+            return TranscriptIdentity(
+                backend=base.backend,
+                path=transcript_path,
+                session_id=bound,
+                is_rebound=True,
+            )
+        if base.backend == "codex" and bound is None:
+            return self._resolve_codex_identity(transcript_path, base)
+        return base
+
+    def _resolve_codex_identity(
+        self, transcript_path: Path, base: TranscriptIdentity
+    ) -> TranscriptIdentity | None:
+        # Memoized "we already checked this path and there's no
+        # matching expectation". Falls through to the filename-pattern
+        # base identity (external codex_<uuid> row) — the desired
+        # behavior for genuinely-external codex sessions.
+        if self._codex_resolution_cache.get(transcript_path) is True:
             return base
+
+        peek = self._peek_session_meta(transcript_path)
+        if peek.retry:
+            # Partial flush — return None so the caller skips this
+            # tail. The expectation stays alive for the next tick.
+            return None
+
+        if peek.cwd is None or peek.timestamp is None:
+            # First line isn't a session_meta record (or no timestamp).
+            # Memoize so we don't re-read on every event line.
+            self._codex_resolution_cache[transcript_path] = True
+            return base
+
+        self._purge_expired_expectations()
+        expectation = self._find_matching_expectation(
+            cwd=peek.cwd, timestamp=peek.timestamp
+        )
+        if expectation is None:
+            self._codex_resolution_cache[transcript_path] = True
+            return base
+
+        self._consume_expectation(expectation)
+        self._path_to_session[transcript_path] = expectation.session_id
         return TranscriptIdentity(
-            backend=base.backend,
+            backend="codex",
             path=transcript_path,
-            session_id=bound,
+            session_id=expectation.session_id,
             is_rebound=True,
         )
+
+    def _purge_expired_expectations(self) -> None:
+        now = self._clock()
+        self._codex_expectations = [
+            e for e in self._codex_expectations if e.expires_at > now
+        ]
+
+    def _find_matching_expectation(
+        self, *, cwd: str, timestamp: datetime
+    ) -> CodexRolloutExpectation | None:
+        """Among unexpired expectations whose cwd matches and whose
+        registered_at lies within the timestamp window, return the one
+        closest in time. Closest-wins disambiguates the rare
+        back-to-back same-cwd spawn race.
+        """
+        cwd_path = Path(cwd)
+        candidates: list[tuple[timedelta, CodexRolloutExpectation]] = []
+        for exp in self._codex_expectations:
+            if exp.cwd != cwd_path:
+                continue
+            delta = abs(exp.registered_at - timestamp)
+            if delta > _EXPECTATION_TIMESTAMP_WINDOW:
+                continue
+            candidates.append((delta, exp))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    def _consume_expectation(self, expectation: CodexRolloutExpectation) -> None:
+        try:
+            self._codex_expectations.remove(expectation)
+        except ValueError:
+            # Already removed by a concurrent purge — fine.
+            pass
+
+    def _peek_session_meta(self, path: Path) -> _SessionMetaPeek:
+        """Read the first record of a codex rollout file.
+
+        Returns ``retry=True`` for partial-flush cases (no trailing
+        newline on the first line, OSError opening the file). Returns
+        ``cwd``/``timestamp`` only for a confirmed ``session_meta``
+        record with both fields. Anything else (non-session_meta first
+        line, malformed JSON) returns ``cwd=None`` and ``timestamp=None``
+        with ``retry=False`` — the caller memoizes that result.
+        """
+        try:
+            with path.open("rb") as fh:
+                first = fh.readline()
+        except OSError:
+            logger.debug("session_meta peek: cannot open %s yet", path)
+            return _SessionMetaPeek(cwd=None, timestamp=None, retry=True)
+        if not first.endswith(b"\n"):
+            return _SessionMetaPeek(cwd=None, timestamp=None, retry=True)
+        try:
+            record = json.loads(first.decode("utf-8", errors="replace").strip())
+        except JSONDecodeError:
+            logger.debug("session_meta peek: malformed first line in %s", path)
+            return _SessionMetaPeek(cwd=None, timestamp=None)
+        if not isinstance(record, Mapping):
+            return _SessionMetaPeek(cwd=None, timestamp=None)
+        if record.get("type") != "session_meta":
+            return _SessionMetaPeek(cwd=None, timestamp=None)
+        payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            cwd = None
+        # Prefer the outer timestamp on the session_meta record (the
+        # rollout's earliest event timestamp); fall back to the inner
+        # payload timestamp for older codex versions.
+        ts_str = record.get("timestamp") or payload.get("timestamp")
+        if not isinstance(ts_str, str) or not ts_str:
+            return _SessionMetaPeek(cwd=cwd, timestamp=None)
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except ValueError:
+            logger.warning("session_meta peek: unparseable timestamp %s in %s", ts_str, path)
+            return _SessionMetaPeek(cwd=cwd, timestamp=None)
+        return _SessionMetaPeek(cwd=cwd, timestamp=ts)
 
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)
@@ -234,6 +437,11 @@ class ExternalTranscriptObserver:
             identity = self._resolve_identity(transcript_path)
         except ValueError:
             logger.warning("Unsupported transcript path: %s", transcript_path)
+            return []
+        # Codex partial-flush case: session_meta hasn't been newline-
+        # terminated yet, so we can't confidently route events. Skip
+        # this tick; watchfiles will fire again once the writer flushes.
+        if identity is None:
             return []
 
         published: list[Event] = []
@@ -278,6 +486,9 @@ class ExternalTranscriptObserver:
             return []
 
         resolved_identity = identity or self._resolve_identity(transcript_path)
+        if resolved_identity is None:
+            # Codex partial-flush — defer this line to a later tick.
+            return []
         published: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
             published_event = await self._event_bus.publish(event)

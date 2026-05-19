@@ -165,10 +165,23 @@ class ObserverState:
 
 
 DEFAULT_IDLE_AFTER_SECONDS = 30.0
-DEFAULT_EXPECTATION_TTL_SECONDS = 10.0
-# Window within which a session_meta timestamp must lie of an
-# expectation's ``registered_at`` for them to match. Generous — codex
-# startup can take a few seconds and a chunky cwd-mtime lag is normal.
+# Codex rollout expectation knobs (two dimensions, two purposes):
+#
+# - ``DEFAULT_EXPECTATION_TTL_SECONDS`` (60s) — how long a registered
+#   expectation stays eligible to match before ``_purge_expired_expectations``
+#   evicts it.
+# - ``_EXPECTATION_TIMESTAMP_WINDOW`` (30s) — how far the rollout's
+#   ``session_meta.timestamp`` may diverge from the expectation's
+#   ``registered_at`` for them to match.
+#
+# TTL > window deliberately. A slow codex spawn (>10s before
+# session_meta is flushed) is normal; if TTL ≤ window the expectation
+# would be evicted while still timing-eligible to match, silently
+# falling through to the filename-pattern path and re-instating the
+# Heron-PR-#12 dupe-session symptom. The TTL provides a generous
+# buffer for codex startup jitter; the window enforces the
+# tight-coupling guarantee at match time.
+DEFAULT_EXPECTATION_TTL_SECONDS = 60.0
 _EXPECTATION_TIMESTAMP_WINDOW = timedelta(seconds=30)
 
 

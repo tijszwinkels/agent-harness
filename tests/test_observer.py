@@ -1490,6 +1490,52 @@ async def test_expectation_expires_after_ttl(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_expectation_matches_after_partial_ttl_elapsed(tmp_path) -> None:
+    """Regression guard for the TTL/window asymmetry. The expectation
+    TTL (60s default) must be strictly greater than the timestamp
+    match window (30s) — otherwise a slow codex spawn whose
+    ``session_meta.timestamp`` is still within the window from
+    ``registered_at`` would find the expectation already evicted,
+    silently fall through to filename-pattern, and re-instate the
+    Heron-PR-#12 dupe-session symptom.
+
+    Scenario: expectation registered at t=0; rollout flushed at t=25s
+    with ``session_meta.timestamp`` matching the registration time.
+    25s is past the (insufficient) old 10s TTL but well inside the
+    timestamp-window — match must succeed under Phase 2's 60s TTL.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    # Use the production default TTL (60s) — this is the contract
+    # under test.
+    observer = ExternalTranscriptObserver(bus, clock=clock)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_slow_codex")
+
+    # 25s later: slow codex spawn has finally flushed session_meta.
+    # Within the 60s TTL; the rollout's session_meta timestamp matches
+    # the original registration time (well within the 30s window).
+    now = base + timedelta(seconds=25)
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0107-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:30:00.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published
+    for event in published:
+        assert event.session_id == "ses_slow_codex", event
+
+
+@pytest.mark.asyncio
 async def test_session_meta_peek_returns_none_for_partial_flush(tmp_path) -> None:
     """First line of the rollout has no trailing newline yet (codex is
     still writing). The observer must not match an expectation against

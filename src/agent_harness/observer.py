@@ -25,6 +25,7 @@ from agent_harness.models import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    Usage,
     utc_now,
 )
 from agent_harness.repository import (
@@ -32,6 +33,7 @@ from agent_harness.repository import (
     MaterializationDeferred,
     SessionNotFoundError,
 )
+from agent_harness.usage import parse_claude_usage, parse_codex_token_count
 
 try:
     from watchfiles import awatch
@@ -51,7 +53,9 @@ _IGNORED_CODEX_PAYLOAD_TYPES = {
     "context_compacted",
     "task_complete",
     "task_started",
-    "token_count",
+    # ``token_count`` is no longer ignored — Phase 3 surfaces it as a
+    # ``run.usage`` event keyed to the session's active harness run
+    # (see ``_parse_codex_record``).
     "web_search_call",
 }
 
@@ -551,20 +555,23 @@ class ExternalTranscriptObserver:
             # Codex partial-flush — defer this line to a later tick.
             return []
         published: list[Event] = []
-        usage_events: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
+            if event.event == "run.usage":
+                # Parsers emit run.usage with ``run_id=None``; resolve
+                # the active run for the session here (the parser has
+                # no repository). Drop if no active run.
+                resolved = self._resolve_run_usage_run_id(event)
+                if resolved is None:
+                    continue
+                event = resolved
             published_event = await self._publish_via_bus(event)
             if published_event is None:
-                # Defensive: shouldn't normally happen — the bus
-                # publish either succeeds (returns event) or raises a
-                # specific exception ``_publish_via_bus`` catches.
                 continue
             published.append(published_event)
             if published_event.session_id:
                 self._last_event_at[published_event.session_id] = self._clock()
-                # If a fresh transcript event arrives for a session that was
-                # marked idle by a previous freshness tick, flip it back to
-                # running so subscribers see the resumption.
+                # Fresh transcript event on a session that was idled
+                # by a previous freshness tick → flip back to running.
                 kick = await self._maybe_publish_status_flip(
                     published_event.session_id,
                     target_status="running",
@@ -573,22 +580,6 @@ class ExternalTranscriptObserver:
                 )
                 if kick is not None:
                     published.append(kick)
-                # Phase 3: when the parsed record carries usage info,
-                # synthesize a ``run.usage`` event keyed to the
-                # session's active harness run. We collect them here
-                # and publish after the main parse loop so the rows
-                # they sum into (Run.usage) reflect every message in
-                # this turn, not just the prior ones.
-                synth = self._synthesize_run_usage_event(
-                    record_event=published_event,
-                    identity=resolved_identity,
-                )
-                if synth is not None:
-                    usage_events.append(synth)
-        for usage_event in usage_events:
-            published_usage = await self._publish_via_bus(usage_event)
-            if published_usage is not None:
-                published.append(published_usage)
         return published
 
     async def _publish_via_bus(self, event: Event) -> Event | None:
@@ -696,19 +687,45 @@ class ExternalTranscriptObserver:
         )
         return published
 
-    def _synthesize_run_usage_event(
-        self,
-        *,
-        record_event: Event,
-        identity: TranscriptIdentity,
-    ) -> Event | None:
-        """Stub. Wired up in the next commit (Phase 3 part 2).
+    def _resolve_run_usage_run_id(self, event: Event) -> Event | None:
+        """Phase 3: parsers emit ``run.usage`` events with
+        ``run_id=None`` because the parser has no repository access.
+        Here we resolve the active run for the session and stamp the
+        event's ``run_id`` so the materializer can apply the usage to
+        the right Run row.
 
-        Phase 3 part 1 ships the architectural refactor only; the
-        rollout-side ``run.usage`` synthesis lives in the cherry-pick
-        + observer wiring commits that follow.
+        Returns ``None`` when there's no active run to attribute usage
+        to (pure-external session — documented gap; Falcon's
+        worth-noting #1 on PR #11). The synthesized event is dropped
+        on the floor rather than published as a phantom.
         """
-        del record_event, identity
+        if event.event != "run.usage" or event.run_id is not None:
+            return event
+        if event.session_id is None or self._repository is None:
+            return None
+        active_run_id = self._active_run_id_for_session(event.session_id)
+        if active_run_id is None:
+            logger.debug(
+                "Skipping run.usage: no active run for session=%s",
+                event.session_id,
+            )
+            return None
+        return event.model_copy(update={"run_id": active_run_id})
+
+    def _active_run_id_for_session(self, session_id: str) -> str | None:
+        if self._repository is None:
+            return None
+        try:
+            runs = self._repository.list_runs(session_id)
+        except SessionNotFoundError:
+            return None
+        # Prefer a run in "running" status; fall back to the most-
+        # recently-started one if none is currently active (handles
+        # the brief window between ``run.completed`` and the next
+        # spawn for multi-turn sessions).
+        for run in reversed(runs):
+            if run.status == "running":
+                return run.id
         return None
 
     def _session_exists(self, session_id: str) -> bool:
@@ -952,6 +969,21 @@ def _parse_claude_record(
         )
         if message_event is not None:
             events.append(message_event)
+        # Phase 3: claude's ``assistant`` record carries
+        # ``message.usage`` with per-turn token counts. Emit a
+        # ``run.usage`` event with ``run_id=None`` — ``publish_line``
+        # resolves the active run id before publishing.
+        if record_type == "assistant":
+            usage = parse_claude_usage(message.get("usage"))
+            if usage is not None:
+                events.append(
+                    _run_usage_event(
+                        identity=identity,
+                        usage=usage,
+                        context_window=None,
+                        offset=offset,
+                    )
+                )
         return events
 
     logger.warning(
@@ -979,6 +1011,27 @@ def _parse_codex_record(
     )
 
     payload_type = _string_value(payload.get("type"))
+
+    # Phase 3: codex's ``event_msg/token_count`` carries per-turn
+    # usage in ``payload.info.last_token_usage`` and the
+    # session-scoped ``model_context_window``. Emit a ``run.usage``
+    # event with ``run_id=None`` (resolved by ``publish_line`` against
+    # the session's active harness run before publish) — codex's
+    # first ``token_count`` has ``info: null``; the parser returns
+    # ``(None, None)`` for that case and we skip emission.
+    if record_type == "event_msg" and payload_type == "token_count":
+        usage, context_window = parse_codex_token_count(payload)
+        if usage is not None or context_window is not None:
+            events.append(
+                _run_usage_event(
+                    identity=identity,
+                    usage=usage or Usage(),
+                    context_window=context_window,
+                    offset=offset,
+                )
+            )
+        return events
+
     if record_type in _IGNORED_CODEX_RECORD_TYPES or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES:
         logger.debug(
             "Ignoring Codex transcript metadata: path=%s type=%s payload_type=%s",
@@ -1137,6 +1190,36 @@ def _message_event(
         "source_type": source_type,
     }
     return Event(event="message", session_id=identity.session_id, data=data)
+
+
+def _run_usage_event(
+    *,
+    identity: TranscriptIdentity,
+    usage: Usage,
+    context_window: int | None,
+    offset: int | None,
+) -> Event:
+    """Build a ``run.usage`` event with ``run_id=None``.
+
+    The parser has no repository access; ``publish_line`` resolves the
+    active run id for the session and stamps it on the event before
+    publishing. Carries ``context_window`` for codex (option (b) of
+    the Phase 3 spec's open question: usage and window share one
+    event so the materializer updates both Run.usage and Session.stats
+    in a single pass).
+    """
+    data: dict[str, Any] = {
+        **_source_data(identity, offset=offset),
+        "usage": usage.model_dump(mode="json"),
+    }
+    if context_window is not None:
+        data["context_window"] = context_window
+    return Event(
+        event="run.usage",
+        session_id=identity.session_id,
+        run_id=None,
+        data=data,
+    )
 
 
 def blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:

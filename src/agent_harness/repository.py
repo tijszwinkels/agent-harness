@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from threading import RLock
 
 from agent_harness.models import (
@@ -12,6 +13,7 @@ from agent_harness.models import (
     RunStatus,
     Session,
     StopReason,
+    Usage,
     utc_now,
 )
 
@@ -290,6 +292,54 @@ class InMemoryRepository:
             message_data = event.data.get("message")
             if event.session_id and isinstance(message_data, dict):
                 self.add_message(event.session_id, Message.model_validate(message_data))
+            return
+
+        if event.event == "run.usage":
+            self._materialize_run_usage_event(event)
+            return
+
+    def _materialize_run_usage_event(self, event: Event) -> None:
+        # Phase 3: apply per-turn ``Usage`` from the rollout to the
+        # named ``Run`` (additive — usage sums across turns) and roll
+        # the aggregate up into ``Session.stats.tokens``. Codex
+        # ``token_count`` events additionally carry ``context_window``
+        # so ``Session.stats.context_window`` updates in the same pass
+        # (option (b) of the Phase 3 spec's open question).
+        from agent_harness.usage import add_usage
+
+        if event.session_id is None or event.run_id is None:
+            return
+        usage_data = event.data.get("usage")
+        if not isinstance(usage_data, Mapping):
+            return
+        delta = Usage.model_validate(usage_data)
+        context_window = _context_window_from(event.data)
+        with self._lock:
+            run = self._runs.get(event.run_id)
+            if run is None or run.session_id != event.session_id:
+                return
+            self._runs[event.run_id] = run.model_copy(
+                update={"usage": add_usage(run.usage, delta)}
+            )
+            session = self._sessions.get(event.session_id)
+            if session is None:
+                raise SessionNotFoundError(event.session_id)
+            tokens = dict(session.stats.tokens or {})
+            for key in ("input", "output", "cache_read", "cache_creation"):
+                tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)
+            new_cost = session.stats.cost_usd + delta.cost_usd
+            stats_update: dict[str, object] = {
+                "tokens": tokens,
+                "cost_usd": new_cost,
+            }
+            if context_window is not None:
+                stats_update["context_window"] = context_window
+            self._sessions[event.session_id] = session.model_copy(
+                update={
+                    "stats": session.stats.model_copy(update=stats_update),
+                    "updated_at": utc_now(),
+                }
+            )
 
     def _materialize_run_lifecycle_event(self, event: Event) -> None:
         if event.session_id is None or event.run_id is None:
@@ -350,3 +400,16 @@ def _messages_equivalent(left: Message, right: Message) -> bool:
 
 def _message_key(message: Message) -> tuple[str, str]:
     return (message.role, "".join(block.model_dump_json() for block in message.blocks))
+
+
+def _context_window_from(data: Mapping[str, object] | object) -> int | None:
+    if not isinstance(data, Mapping):
+        return None
+    raw = data.get("context_window")
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None

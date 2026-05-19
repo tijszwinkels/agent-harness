@@ -18,9 +18,14 @@ from agent_harness.models import (
     RunStatus,
     Session,
     StopReason,
+    Usage,
     utc_now,
 )
-from agent_harness.repository import RunNotFoundError, SessionNotFoundError
+from agent_harness.repository import (
+    RunNotFoundError,
+    SessionNotFoundError,
+    _context_window_from,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -510,6 +515,10 @@ class SQLiteRepository:
 
             if event.event == "message":
                 self._materialize_message_event(event)
+                return
+
+            if event.event == "run.usage":
+                self._materialize_run_usage_event(event)
 
     def _materialize_message_event(self, event: Event, *, dedupe_by_content: bool = True) -> None:
         message_data = event.data.get("message")
@@ -685,6 +694,58 @@ class SQLiteRepository:
             logger.error("SQLite event sequence lookup returned no row")
             raise RuntimeError("Failed to allocate event sequence")
         return int(row[0])
+
+    def _materialize_run_usage_event(self, event: Event) -> None:
+        # Phase 3: additive per-turn usage from the rollout. Applies
+        # the ``Usage`` to the named run AND rolls the same delta into
+        # ``Session.stats.tokens``. Codex ``token_count`` events
+        # additionally carry ``context_window`` → updates
+        # ``Session.stats.context_window`` in the same pass.
+        from collections.abc import Mapping as _Mapping
+        from agent_harness.usage import add_usage
+
+        if event.session_id is None or event.run_id is None:
+            return
+        usage_data = event.data.get("usage")
+        if not isinstance(usage_data, _Mapping):
+            return
+        delta = Usage.model_validate(usage_data)
+        context_window = _context_window_from(event.data)
+
+        row = self._connection.execute(
+            "select payload from runs where id = ? and session_id = ?",
+            (event.run_id, event.session_id),
+        ).fetchone()
+        if row is None:
+            logger.warning(
+                "SQLite run.usage materialization skipped missing run: session=%s run=%s",
+                event.session_id,
+                event.run_id,
+            )
+            return
+        run = _model_from_row(row, "payload", Run)
+        self._upsert_run(run.model_copy(update={"usage": add_usage(run.usage, delta)}))
+
+        session = self._find_session_locked(event.session_id)
+        if session is None:
+            raise SessionNotFoundError(event.session_id)
+        tokens = dict(session.stats.tokens or {})
+        for key in ("input", "output", "cache_read", "cache_creation"):
+            tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)
+        stats_update: dict[str, object] = {
+            "tokens": tokens,
+            "cost_usd": session.stats.cost_usd + delta.cost_usd,
+        }
+        if context_window is not None:
+            stats_update["context_window"] = context_window
+        self._upsert_session(
+            session.model_copy(
+                update={
+                    "stats": session.stats.model_copy(update=stats_update),
+                    "updated_at": utc_now(),
+                }
+            )
+        )
 
     def _materialize_run_lifecycle_event(self, event: Event) -> None:
         if event.session_id is None or event.run_id is None:

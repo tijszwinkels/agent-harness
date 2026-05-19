@@ -8,6 +8,7 @@ import uvicorn
 from agent_harness.api import create_app
 from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.orchestrator import RunManager
+from agent_harness.rollout_discovery import RolloutDiscovery
 from agent_harness.settings import ObserverSettings
 from agent_harness.storage import open_sqlite_repository
 
@@ -84,7 +85,15 @@ def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings
         kwargs["event_bus"] = event_bus
     if args.execute_runs:
         kwargs["event_bus"] = event_bus
-        kwargs["run_manager"] = RunManager(event_bus=event_bus)
+        # The observer is constructed by api.py's lifespan and late-bound
+        # onto RunManager via ``set_observer``. A default ``RolloutDiscovery``
+        # is wired here so the env-var-gated pre-binding path is reachable
+        # in production once the observer arrives. Discovery without an
+        # observer is a no-op (RunProcess gates on both being present).
+        kwargs["run_manager"] = RunManager(
+            event_bus=event_bus,
+            rollout_discovery=RolloutDiscovery(),
+        )
     return create_app(**kwargs)
 
 

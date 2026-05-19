@@ -11,8 +11,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
+from pathlib import Path
+
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock, utc_now
+from agent_harness.rollout_discovery import RolloutDiscovery, RolloutDiscoveryError
+
+# Env var that opts the runtime into rollout pre-binding. Default-off in
+# Phase 1: the machinery lands without changing production behavior, and
+# Phase 2 will flip the default and remove the gate entirely.
+ROLLOUT_PRE_BIND_ENV_VAR = "AGENT_HARNESS_ROLLOUT_PRE_BIND"
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +311,8 @@ class RunProcess:
         stdout_parsers: Mapping[str, StdoutParser] | None = None,
         clock: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        observer: Any | None = None,
+        rollout_discovery: Any | None = None,
     ) -> None:
         self.session = session
         self.run_record = run
@@ -321,6 +331,12 @@ class RunProcess:
         self._last_activity_event: str | None = None
         self._watchdog_termination_in_progress = False
         self._watchdog_termination_task: asyncio.Task[None] | None = None
+        # Phase 1: optional rollout pre-binding wiring. Both must be
+        # present AND ``AGENT_HARNESS_ROLLOUT_PRE_BIND=1`` for any work
+        # to happen. Defaults are ``None``; the env-var gate stays off.
+        self._observer = observer
+        self._rollout_discovery = rollout_discovery
+        self._codex_bind_task: asyncio.Task[None] | None = None
 
     async def run(self) -> RunProcessResult:
         await self._publish("run.started", {})
@@ -331,6 +347,13 @@ class RunProcess:
             logger.exception("Failed to start run process: session=%s run=%s", self.session.id, self.run_record.id)
             await self._publish("run.failed", {"error": str(exc), "error_type": type(exc).__name__})
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
+
+        # Phase 1 (flag-gated): pre-bind the rollout file to the harness
+        # session id so the observer attributes events to our row
+        # rather than the synthesized filename-derived id. claude is
+        # deterministic (no race); codex needs an fd probe and runs as
+        # a background task so spawn returns quickly.
+        await self._maybe_pre_bind_rollout(self._process)
 
         stream_tasks = self._stream_tasks(self._process)
         wait_task = asyncio.create_task(self._process.wait())
@@ -348,6 +371,7 @@ class RunProcess:
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
         finally:
             await self._finish_watchdogs(watchdog_tasks)
+            await self._cancel_codex_bind_task()
 
         if self._interrupted:
             await self._publish("run.interrupted", {"returncode": returncode})
@@ -375,6 +399,118 @@ class RunProcess:
         self._interrupted = True
         self._process.terminate()
         return True
+
+    async def _maybe_pre_bind_rollout(self, process: ManagedProcess) -> None:
+        if not self._pre_bind_enabled():
+            return
+        backend = self.session.backend
+        try:
+            if backend == "claude-code":
+                self._pre_bind_claude()
+                return
+            if backend == "codex":
+                # codex opens its rollout fd a few hundred ms after spawn;
+                # poll asynchronously so we don't block the run loop.
+                self._codex_bind_task = asyncio.create_task(
+                    self._pre_bind_codex(process.pid)
+                )
+                return
+        except Exception:
+            # Pre-bind is best-effort. Existing filename-pattern flow
+            # remains as a safety net.
+            logger.exception(
+                "Pre-bind setup failed: session=%s backend=%s",
+                self.session.id,
+                backend,
+            )
+
+    def _pre_bind_enabled(self) -> bool:
+        if self.session.origin != "harness":
+            return False
+        if self._observer is None or self._rollout_discovery is None:
+            return False
+        return os.environ.get(ROLLOUT_PRE_BIND_ENV_VAR) == "1"
+
+    def _pre_bind_claude(self) -> None:
+        cwd_str = self.command.cwd
+        if cwd_str is None:
+            logger.warning(
+                "Skipping claude rollout pre-bind: command has no cwd; session=%s",
+                self.session.id,
+            )
+            return
+        path = self._rollout_discovery.discover_claude(
+            session_id=self.session.id, cwd=Path(cwd_str)
+        )
+        self._observer.bind_rollout(path, self.session.id)
+        logger.debug(
+            "Claude rollout pre-bound: session=%s path=%s",
+            self.session.id,
+            path,
+        )
+
+    async def _pre_bind_codex(self, pid: int) -> None:
+        cwd_str = self.command.cwd
+        if cwd_str is None:
+            logger.warning(
+                "Skipping codex rollout pre-bind: command has no cwd; session=%s",
+                self.session.id,
+            )
+            return
+        try:
+            path = await self._rollout_discovery.discover_codex(
+                pid=pid, cwd=Path(cwd_str)
+            )
+        except RolloutDiscoveryError as exc:
+            logger.warning(
+                "Codex rollout discovery failed: session=%s pid=%s error=%s",
+                self.session.id,
+                pid,
+                exc,
+            )
+            await self._publish(
+                "run.warning",
+                {
+                    "reason": "codex_rollout_discovery_failed",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Codex rollout pre-bind raised: session=%s pid=%s",
+                self.session.id,
+                pid,
+            )
+            await self._publish(
+                "run.warning",
+                {
+                    "reason": "codex_rollout_discovery_failed",
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return
+        self._observer.bind_rollout(path, self.session.id)
+        logger.debug(
+            "Codex rollout pre-bound: session=%s pid=%s path=%s",
+            self.session.id,
+            pid,
+            path,
+        )
+
+    async def _cancel_codex_bind_task(self) -> None:
+        task = self._codex_bind_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     def _stream_tasks(self, process: ManagedProcess) -> list[asyncio.Task[None]]:
         tasks: list[asyncio.Task[None]] = []
@@ -611,6 +747,8 @@ class RunManager:
         process_factory: ProcessFactory | None = None,
         stdout_parsers: Mapping[str, StdoutParser] | None = None,
         queue_max_per_session: int = RUN_QUEUE_MAX_PER_SESSION,
+        observer: Any | None = None,
+        rollout_discovery: Any | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
@@ -626,6 +764,24 @@ class RunManager:
         # which would race on the shared claude-code rollout JSONL.
         self._active_run_by_session: dict[str, str] = {}
         self._queues: dict[str, deque[_QueuedRun]] = {}
+        # Optional wiring for the Phase 1 rollout pre-binding path. Either
+        # both are set (production: cli wires the live observer + a
+        # default RolloutDiscovery) or both are None (back-compat for
+        # callers / tests that don't need pre-binding). The env-var gate
+        # in RunProcess decides at run() time whether to actually probe.
+        self._observer = observer
+        self._rollout_discovery = rollout_discovery
+        if (self._observer is None) != (self._rollout_discovery is None):
+            logger.warning(
+                "RunManager constructed with only one of observer / rollout_discovery; "
+                "pre-binding will be skipped (both must be provided)."
+            )
+
+    def set_observer(self, observer: Any) -> None:
+        """Late binder used by api.py's lifespan: observer is constructed
+        when the FastAPI app starts up, after RunManager already exists.
+        Idempotent. Called once at most in normal flow."""
+        self._observer = observer
 
     def submit(
         self,
@@ -714,6 +870,8 @@ class RunManager:
             event_bus=self._event_bus,
             process_factory=self._process_factory,
             stdout_parsers=self._stdout_parsers,
+            observer=self._observer,
+            rollout_discovery=self._rollout_discovery,
         )
         self._active[run.id] = run_process
         self._active_run_by_session[session.id] = run.id

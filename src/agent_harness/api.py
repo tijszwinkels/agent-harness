@@ -83,6 +83,7 @@ def create_app(
             observer_settings=settings,
             watch_service_factory=watch_service_factory,
             task_factory=task_factory,
+            run_manager=run_manager,
         ),
     )
 
@@ -405,6 +406,7 @@ def _lifespan(
     observer_settings: ObserverSettings,
     watch_service_factory: WatchServiceFactory | None,
     task_factory: TaskFactory | None,
+    run_manager: RunManager | None,
 ):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -415,6 +417,14 @@ def _lifespan(
             try:
                 observer_settings.validate()
                 observer = ExternalTranscriptObserver(event_bus, repository=repository)
+                # Phase 1 pre-binding: hand the live observer to the
+                # RunManager so RunProcess can call ``bind_rollout``.
+                # The env-var gate inside RunProcess still decides
+                # whether any probing actually happens.
+                if run_manager is not None:
+                    setter = getattr(run_manager, "set_observer", None)
+                    if callable(setter):
+                        setter(observer)
                 service = _create_watch_service(
                     observer_settings.roots,
                     observer,

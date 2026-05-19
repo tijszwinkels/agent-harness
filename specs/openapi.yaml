@@ -586,6 +586,8 @@ components:
             - run.completed
             - run.failed
             - run.interrupted
+            - run.usage
+            - process.stderr
             - session.updated
             - ping
         data:
@@ -692,10 +694,15 @@ components:
           minimum: 0
         tokens:
           type: object
+          description: Sum of input, output, cache_read, and cache_creation token usage across runs in the session.
           additionalProperties: true
         cost_usd:
           type: number
           minimum: 0
+        context_window:
+          type: [integer, "null"]
+          minimum: 1
+          description: Latest model context-window size observed for the session (codex token_count event_msg). Null until first observed; claude sessions never set it.
 
     Usage:
       type: object

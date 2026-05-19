@@ -2035,6 +2035,71 @@ async def test_observer_emits_context_used_per_token_count_codex(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_observer_cumulative_vs_snapshot_end_to_end_claude(tmp_path) -> None:
+    """End-to-end proof that ``stats.context_used`` (snapshot) and
+    ``stats.tokens.cache_read`` (cumulative) diverge — the whole point
+    of having both fields. Multi-turn claude rollout with growing
+    cache_read; after ingestion the cumulative cache_read should be
+    much larger than the latest-turn snapshot. Mirrors the sidecar
+    smoke's cumulative-vs-snapshot check but runs in-process via the
+    real ``DurableEventBus`` + SQLite materializer."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+    from agent_harness.storage import open_sqlite_repository
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="claude-code",
+                model="claude-opus-4-7",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        raw = session.id.removeprefix("ses_")
+        claude_uuid = (
+            f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+        )
+        rollout = (
+            tmp_path / ".claude" / "projects" / "-repo" / f"{claude_uuid}.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        # Three turns, each with growing cache_read. Per-turn snapshot
+        # equals the latest turn's input + cache_read; cumulative
+        # cache_read is the SUM across turns.
+        per_turn = [(50, 10000), (60, 30000), (70, 50000)]
+        lines = [
+            (
+                '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+                '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"turn"}],'
+                f'"usage":{{"input_tokens":{inp},"output_tokens":5,'
+                f'"cache_read_input_tokens":{cr},"cache_creation_input_tokens":0}}}}}}'
+            )
+            for inp, cr in per_turn
+        ]
+        rollout.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        bus = DurableEventBus(repository)
+        observer = ExternalTranscriptObserver(bus, repository=repository)
+        await observer.tail_file(rollout)
+
+        after = repository.get_session(session.id)
+        latest_input, latest_cache_read = per_turn[-1]
+        cumulative_cache_read = sum(cr for _, cr in per_turn)
+
+        # Snapshot = latest turn (overwrite).
+        assert after.stats.context_used == latest_input + latest_cache_read
+        # Cumulative = sum across turns (additive).
+        assert after.stats.tokens["cache_read"] == cumulative_cache_read
+        # The whole point: cumulative > snapshot after several turns.
+        assert after.stats.tokens["cache_read"] > after.stats.context_used
+    finally:
+        repository.close()
+
+
+@pytest.mark.asyncio
 async def test_observer_emits_decreasing_context_used_after_compaction_codex(tmp_path) -> None:
     """After codex compacts, ``total_token_usage.total_tokens``
     legitimately decreases. The observer must propagate the smaller

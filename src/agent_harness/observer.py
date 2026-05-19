@@ -45,8 +45,45 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
-_IGNORED_CLAUDE_RECORD_TYPES = {"attachment", "last-prompt", "pr-link", "queue-operation", "system"}
-_IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta"}
+# Claude rollout record-types we intentionally drop on the floor.
+# Phase 4 audit: every entry here has a "record genuinely doesn't
+# carry message-shaped content for us" rationale — not "avoid
+# double-emit because stdout already did it" (the dual-path
+# motivation went away with Phase 2).
+#
+# - ``attachment``: claude's image/file-attachment marker — payload
+#   shape is image-only; the canonical ``user``/``assistant`` record
+#   carries the image content blocks if they're conversation
+#   participants.
+# - ``last-prompt``: claude's bookkeeping for the most-recent user
+#   prompt; duplicate of the matching ``user`` record.
+# - ``pr-link``: claude-code's GitHub PR-link metadata; not
+#   conversational.
+# - ``queue-operation``: claude-code's internal queue housekeeping.
+# - ``system``: claude system-message hooks; not conversational.
+_IGNORED_CLAUDE_RECORD_TYPES = {
+    "attachment",
+    "last-prompt",
+    "pr-link",
+    "queue-operation",
+    "system",
+}
+
+# Codex rollout record-types (outer ``type``) we drop on the floor.
+# Phase 4 audit:
+#
+# - ``compacted``: codex's compaction snapshot — observability
+#   without a data-plane consumer.
+# - ``session_meta``: parsed separately (cwd + timestamp lookups for
+#   the expectation registry); ignoring here prevents duplicate
+#   session.updated emission.
+# - ``turn_context``: NEW in Phase 4 — codex emits this as a
+#   per-turn context-only marker. It carries cwd + model which
+#   ``_session_event_if_complete`` already extracts from
+#   ``payload``; without this entry the parser falls through to the
+#   "Unsupported Codex transcript shape" warning, spamming logs
+#   (Orion's worth-noting #3 on PR #15).
+_IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta", "turn_context"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
     # ``agent_message`` and ``assistant_message`` are codex's
     # ``event_msg`` form of the assistant turn; the canonical
@@ -1505,9 +1542,16 @@ def _text_parts_from_content(content: object) -> list[str]:
 
 
 def _source_data(identity: TranscriptIdentity, *, offset: int | None) -> dict[str, Any]:
+    # Phase 4: the unconditional ``origin: "external"`` stamp was
+    # load-bearing under Phase 2's dual-path materialization — the
+    # storage carve-outs gated on it to disambiguate "harness vs
+    # external" message handling. Phase 3's single materialization
+    # point retired those carve-outs; the tag is now dead metadata
+    # and would actually mislead consumers (an observer-emitted
+    # event for a harness-bound rollout carries the harness session
+    # id but a misleading ``origin: external`` source tag).
     data: dict[str, Any] = {
         "backend": identity.backend,
-        "origin": "external",
         "transcript_path": str(identity.path),
     }
     if offset is not None:

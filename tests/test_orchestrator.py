@@ -1289,3 +1289,60 @@ async def test_pre_bind_codex_registers_expectation() -> None:
     # replaces the bind_rollout codepath for codex spawns.
     assert observer.bindings == []
     assert observer.unbindings == []
+
+
+@pytest.mark.asyncio
+async def test_stream_lines_updates_last_activity_on_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 2 dropped ``message.delta`` from ``_ACTIVITY_EVENTS``;
+    observer-emitted ``message`` events don't go through
+    ``RunProcess._publish`` so they can't tick the idle watchdog.
+    Claude harness runs talk via the rollout (rarely via stderr) and
+    would trip the 30-min SIGTERM without a stdout heartbeat.
+
+    Fix: each non-empty stdout line ticks ``_last_activity_at``
+    directly (no publish — diagnostic-only signal). Verify the
+    timestamp advances across stdout lines, and that no event is
+    emitted as a side effect.
+    """
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[b"alpha\n", b"beta\n", b"gamma\n"],
+        returncode=0,
+    )
+    factory = FakeFactory(process)
+    clock = FakeClock()
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("claude", "--print"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    initial = rp._last_activity_at
+
+    # Advance the clock BEFORE the stream pump runs so the heartbeat
+    # tick (which reads ``clock()``) lands on a different value.
+    clock.advance(5)
+    task = asyncio.create_task(rp.run())
+    for _ in range(8):
+        await asyncio.sleep(0)
+
+    # Activity timestamp advanced past the initial value, and the
+    # last-activity event marker reflects the stdout heartbeat path.
+    assert rp._last_activity_at > initial
+    assert rp._last_activity_event == "stdout"
+
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    # No ``message.delta`` events fired as a side effect of the
+    # stdout heartbeat — observer is still the sole message writer.
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert all(e.event != "message.delta" for e in events), [e.event for e in events]

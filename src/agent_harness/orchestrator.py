@@ -498,7 +498,17 @@ class RunProcess:
         # ``process.stderr`` events. The observer is the sole writer
         # for ``message`` / ``message.delta``; nothing on this path
         # synthesizes messages.
-        detect_end_turn = (
+        #
+        # Watchdog heartbeat: every non-empty stdout line ticks
+        # ``_last_activity_at`` directly (NOT via ``_publish``), without
+        # publishing any event. This is a private liveness signal — the
+        # idle watchdog reads ``_last_activity_at``, and Phase 2's
+        # removal of ``message.delta`` from ``_ACTIVITY_EVENTS`` would
+        # otherwise leave claude harness runs (which talk only via the
+        # rollout, rarely via stderr) without any activity ticks and
+        # trip the 30-min SIGTERM. Phase 3 will rewire the watchdog to
+        # subscribe to observer-emitted activity directly.
+        is_harness_stdout = (
             stream_name == "stdout" and self.session.origin == "harness"
         )
         while line := await stream.readline():
@@ -508,7 +518,11 @@ class RunProcess:
             if stream_name == "stderr":
                 await self._publish("process.stderr", {"text": text})
                 continue
-            if not detect_end_turn:
+            # Stdout heartbeat (no publish): keeps the idle watchdog
+            # warm for long-running harness runs that emit no stderr.
+            self._last_activity_at = self._clock()
+            self._last_activity_event = "stdout"
+            if not is_harness_stdout:
                 continue
             try:
                 if _detect_end_turn_in_line(text, backend=self.session.backend):

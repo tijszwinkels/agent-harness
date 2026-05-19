@@ -71,6 +71,33 @@ def test_openapi_documents_phase3_event_types() -> None:
     assert "process.stderr" in event_enum
 
 
+def test_openapi_documents_phase4_event_types() -> None:
+    """Phase 4 introduces ``run.end_turn`` (observer-emitted; drives
+    the watchdog's post-end_turn cleanup grace). The pre-existing
+    watchdog terminal events (``run.terminated_after_end_turn``,
+    ``run.timed_out_idle``) and ``run.warning`` were emitted but
+    never enumerated; locked in here for SSE consumer drift-guard."""
+    spec = _openapi_spec()
+    event_enum = spec["components"]["schemas"]["Event"]["properties"]["event"]["enum"]
+    assert "run.end_turn" in event_enum
+    assert "run.terminated_after_end_turn" in event_enum
+    assert "run.timed_out_idle" in event_enum
+    assert "run.warning" in event_enum
+
+
+def test_openapi_session_schema_does_not_document_codex_internal_id() -> None:
+    """Drift guard: ``Session.codex_internal_id`` only ever lived on
+    the abandoned PR #12 branch (never merged to main). Phase 4
+    explicitly retires the field at the spec level; verify the
+    OpenAPI schema doesn't list it (would be a stray reintroduction)."""
+    spec = _openapi_spec()
+    session_props = spec["components"]["schemas"]["Session"]["properties"]
+    assert "codex_internal_id" not in session_props, (
+        f"Session.codex_internal_id should be absent from OpenAPI; "
+        f"properties={list(session_props)}"
+    )
+
+
 def test_openapi_documents_session_stats_context_window() -> None:
     spec = _openapi_spec()
     session_stats = spec["components"]["schemas"]["SessionStats"]

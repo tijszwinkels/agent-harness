@@ -136,6 +136,8 @@ def main() -> int:
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         cwd=str(repo_root),
     )
+    rc = 0
+    body_failed = False
     try:
         wait_for_health()
         print(f"[smoke] harness up on :{PORT}")
@@ -148,10 +150,10 @@ def main() -> int:
         )
         print(f"[smoke] dropped rollout with task_complete: {rollout}")
 
-        # Wait for the observer to ingest.
         deadline = time.monotonic() + 6.0
         external_id = f"codex_{rollout_uuid}"
         external_seen = False
+        ids: list[str] = []
         while time.monotonic() < deadline:
             _, sessions_list = http_json("GET", f"{BASE_URL}/v1/sessions")
             ids = [s["id"] for s in sessions_list["data"]]
@@ -161,15 +163,10 @@ def main() -> int:
             time.sleep(0.2)
         if not external_seen:
             print(f"[smoke] FAIL: observer did not register the rollout: {ids}")
-            return 2
-        print(f"[smoke] OK: observer registered external session {external_id}")
-
-        # Drain the harness's stdout/stderr buffer to capture any
-        # warning log lines from the observer.
-        # (We read the tail in the finally block.)
-
-        print("[smoke] ALL OK")
-        return 0
+            body_failed = True
+            rc = 2
+        else:
+            print(f"[smoke] OK: observer registered external session {external_id}")
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
@@ -177,26 +174,33 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
+        warning_lines: list[str] = []
         if proc.stdout is not None:
             tail = proc.stdout.read().decode("utf-8", errors="replace")
             if tail:
-                # Surface warnings — there shouldn't be any
-                # "Unsupported Codex transcript shape" for turn_context.
                 warning_lines = [
                     line for line in tail.splitlines()
                     if "Unsupported Codex transcript shape" in line
                     and "turn_context" in line
                 ]
                 if warning_lines:
+                    # Phase 4 invariant: turn_context records must NOT
+                    # produce the "Unsupported Codex transcript shape"
+                    # warning. Set the exit code so the script returns
+                    # non-zero AFTER the finally cleanup completes.
                     print(
-                        "[smoke] WARN: turn_context warning(s) seen — "
-                        "Phase 4 ignore-list entry missing?"
+                        "[smoke] FAIL: turn_context warning(s) seen — "
+                        "Phase 4 ignore-list entry missing or broken:"
                     )
                     for line in warning_lines:
                         print(f"  {line}")
+                    rc = 3
                 print("[smoke] --- harness tail (last 2 KB) ---")
                 print(tail[-2000:])
         shutil.rmtree(tmp, ignore_errors=True)
+    if rc == 0 and not body_failed and not warning_lines:
+        print("[smoke] ALL OK")
+    return rc
 
 
 if __name__ == "__main__":

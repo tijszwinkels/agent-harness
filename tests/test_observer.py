@@ -2009,3 +2009,63 @@ def test_source_data_does_not_carry_origin_external_tag() -> None:
     assert data["backend"] == "codex"
     assert data["offset"] == 42
     assert "transcript_path" in data
+
+
+@pytest.mark.asyncio
+async def test_expect_codex_rollout_invalidates_resolution_cache(tmp_path) -> None:
+    """Regression for the Phase 3 worth-noting + Phase 4 prior-PR
+    finding: ``_codex_resolution_cache`` would memoize "no
+    expectation matched" forever, even if a matching expectation was
+    registered LATER. Production was shielded because
+    ``_pre_register_codex_expectation_if_codex`` runs BEFORE
+    ``_process_factory(...)`` — but the docstring promised
+    content-based race-tolerance and the cache could poison.
+
+    Phase 4 closes the gap: ``expect_codex_rollout`` clears the
+    resolution cache. A tail_file that ran ahead of the expectation
+    re-peeks on the next watchfiles tick after registration."""
+    from datetime import UTC, datetime
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(bus, clock=lambda: fixed_now)
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0500-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"timestamp":"2026-05-19T10:30:00.000Z","type":"session_meta",'
+        '"payload":{"id":"019e0500-0000-0000-0000-000000000000",'
+        '"timestamp":"2026-05-19T10:30:00.000Z","cwd":"/repo"}}\n'
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    # First tail BEFORE any expectation — falls through to filename
+    # pattern; resolution cache memoizes "no match".
+    published = await observer.tail_file(rollout)
+    expected_external_id = "codex_019e0500-0000-0000-0000-000000000000"
+    assert all(e.session_id == expected_external_id for e in published)
+    assert rollout in observer._codex_resolution_cache
+
+    # Now register a matching expectation. Without Phase 4's
+    # ``cache.clear()`` this would NOT take effect because the
+    # cache still says "no match" for this path.
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_late_arrival")
+
+    # Cache must be invalidated.
+    assert rollout not in observer._codex_resolution_cache
+
+    # Append a fresh event line; re-tail re-peeks session_meta,
+    # finds the expectation, rebinds the path.
+    with rollout.open("a", encoding="utf-8") as fh:
+        fh.write(
+            '{"type":"event_msg","payload":{"type":"user_message","message":"hello again"}}\n'
+        )
+    published2 = await observer.tail_file(rollout)
+    assert published2, "expected at least one event after the new line"
+    for event in published2:
+        assert event.session_id == "ses_late_arrival", event

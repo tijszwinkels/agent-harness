@@ -1528,3 +1528,86 @@ def test_session_does_not_carry_codex_internal_id() -> None:
     assert "codex_internal_id" not in fields, (
         f"Session.codex_internal_id should be retired; fields={list(fields)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_watchdog_skips_historical_run_end_turn_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for Phase 4 git-history reviewer finding.
+
+    Scenario: a ``run.end_turn`` event sits in the bus's history from
+    an earlier run (or from an observer's first-tail of a previously-
+    unseen rollout that contained historical ``stop_reason=end_turn``
+    records). A brand-new RunProcess starts and its watchdog
+    subscribes to the bus. Without ``after=current_max_sequence``,
+    the subscription would replay the historical event AND match it
+    against the new run's id (the observer's
+    ``_resolve_active_run_id`` stamps the CURRENT active run on any
+    parser-emitted ``run.end_turn`` with ``run_id=None``).
+
+    With the Phase 4 fix, the watchdog only sees events sequenced
+    AFTER its subscription. The historical event is filtered out by
+    the bus's ``after`` parameter; no spurious SIGTERM."""
+    from agent_harness.events import InMemoryEventBus
+    from agent_harness.models import Event
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+
+    # Drop a stale ``run.end_turn`` keyed to THIS run id into the bus
+    # history BEFORE the RunProcess starts. Simulates the
+    # "observer's first tail of a historical rollout" race.
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "codex"},
+        )
+    )
+
+    process = FakeProcess(stdout=[], exit_on_sigterm=True)
+    install_fake_process_group(monkeypatch, process)
+    clock = FakeClock()
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    task = asyncio.create_task(rp.run())
+    # Let the watchdog subscription register.
+    for _ in range(8):
+        await asyncio.sleep(0)
+
+    # Advance past the grace window without publishing any NEW
+    # run.end_turn. The historical one should NOT have armed the
+    # watchdog (its sequence is before our subscription's
+    # ``after=`` filter).
+    clock.advance(60)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert process.group_signals == []
+
+    # Sanity: publishing a fresh run.end_turn AFTER subscription
+    # still arms the watchdog.
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "codex"},
+        )
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    clock.advance(60)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert signal.SIGTERM in process.group_signals

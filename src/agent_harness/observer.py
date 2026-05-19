@@ -293,21 +293,16 @@ class ExternalTranscriptObserver:
         # ``_path_to_session``: that's "matched, route to session_id";
         # this is "checked, falls through to filename pattern".
         #
-        # TODO(phase-3+): two known edges worth hardening (Aegis-flagged
-        # worth-notings on PR #14):
-        # (a) Cache poisoning when a tail_file fires BEFORE the
-        #     expectation is registered. Production is shielded because
-        #     ``_pre_register_codex_expectation_if_codex`` runs before
-        #     ``_process_factory(...)``, but the docstring promises
-        #     content-based race-tolerance. Consider clearing this
-        #     cache on every new ``expect_codex_rollout``, or only
-        #     memoizing the "no session_meta head" structural case
-        #     (not the "no expectation matched right now" case).
-        # (b) For genuinely-external codex rollouts (no expectation
-        #     will ever be registered), this cache accumulates one
-        #     entry per rollout the observer ever encounters. Bounded
-        #     by the rollout's own lifecycle, but worth a periodic
-        #     sweep on long-running harnesses.
+        # Phase 4 hardening (Aegis-flagged worth-noting on PR #14):
+        # the cache is cleared by ``expect_codex_rollout`` on every
+        # new spawn, so a tail_file that races ahead of expectation
+        # registration can't poison the entry. For genuinely-external
+        # rollouts (no expectation ever fires for them), the cache
+        # accumulates one entry per rollout the observer encounters —
+        # bounded by the rollout's own lifecycle; if the harness
+        # processes thousands of distinct external rollouts across a
+        # long uptime, a periodic sweep could be added (not load-bearing
+        # today).
         self._codex_resolution_cache: dict[Path, bool] = {}
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
@@ -414,6 +409,15 @@ class ExternalTranscriptObserver:
                 expires_at=now + self._expectation_ttl,
             )
         )
+        # Phase 4: invalidate the "checked-no-match" memo. Without
+        # this, if ``tail_file`` peeked a rollout BEFORE this
+        # expectation was registered (e.g. watchfiles fires fast on
+        # a brand-new codex spawn), the path would be permanently
+        # cached as "no match" — even though the just-registered
+        # expectation would match it. The cache is a small dict; a
+        # full clear on each spawn is cheap and corrects the race
+        # cleanly. Phase 3 left this as a TODO; Phase 4 closes it.
+        self._codex_resolution_cache.clear()
 
     def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity | None:
         """Resolve the identity that owns events from ``transcript_path``.
@@ -779,16 +783,22 @@ class ExternalTranscriptObserver:
         """Return the id of the session's currently-running harness
         run, or ``None`` if no run is in ``running`` status.
 
+        Used by ``_resolve_active_run_id`` for both ``run.usage``
+        (Phase 3) and ``run.end_turn`` (Phase 4): the caller drops
+        the event when this returns ``None``. Two reasons not to fall
+        back to the most-recently-started non-running run:
+
+        - ``run.usage``: applying usage to a completed run silently
+          rewrites its outcome.
+        - ``run.end_turn``: a stale end-turn either no-ops against an
+          already-exited watchdog OR would falsely arm cleanup for an
+          unrelated future run (the watchdog's session-scoped
+          subscription would receive it).
+
         Walks ``list_runs`` in reverse so the most-recently-started
-        running run wins (the FIFO queue serializes the harness to one
-        running run per session, so reverse order is a defensive
-        no-op in practice). Returns ``None`` — and the caller drops
-        the ``run.usage`` event — when no running run exists; e.g.
-        between ``run.completed`` and the next spawn for multi-turn
-        codex sessions where ``token_count`` arrives after
-        ``task_complete``. A fallback to the most-recently-started
-        non-running run was considered but rejected: applying usage
-        to a completed run silently rewrites its outcome.
+        running run wins. The per-session FIFO queue serializes the
+        harness to one running run per session, so the reverse order
+        is a defensive no-op in practice — but cheap.
         """
         if self._repository is None:
             return None

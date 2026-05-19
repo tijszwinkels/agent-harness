@@ -587,6 +587,10 @@ components:
             - run.failed
             - run.interrupted
             - run.usage
+            - run.end_turn
+            - run.terminated_after_end_turn
+            - run.timed_out_idle
+            - run.warning
             - process.stderr
             - session.updated
             - ping

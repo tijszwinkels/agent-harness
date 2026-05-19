@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -9,9 +8,8 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
-
 from pathlib import Path
+from typing import Any, Literal, Protocol
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock, utc_now
@@ -25,17 +23,17 @@ IDLE_TIMEOUT_SECONDS = 30 * 60
 IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
 
-_END_TURN_EVENT = "__end_turn__"
-# Phase 2: ``message.delta`` is no longer emitted from the supervisor
-# (the observer is the sole writer for message-shaped events). We keep
-# ``message`` and ``tool_use`` for forward-compatibility (Phase 3 will
-# rewire the watchdog to subscribe to observer events directly) and add
-# ``process.stderr`` so long stderr-active codex runs don't trip the
-# 30-min idle watchdog spuriously while the orchestrator-side activity
-# stream is otherwise sparse.
+# Phase 4: events that tick ``_last_activity_at`` via ``RunProcess._publish``,
+# keeping the 30-min idle watchdog warm. The observer's ``message`` /
+# ``tool_use`` / ``run.usage`` / ``run.end_turn`` events flow through
+# the shared bus but DON'T go through ``RunProcess._publish``, so they
+# don't tick this map. The two activity signals the supervisor still
+# publishes are ``process.stderr`` (stderr-active runs) and the
+# stdout heartbeat (which sets ``_last_activity_at`` directly in
+# ``_stream_lines``, bypassing _publish). Idle-watchdog rewire to
+# subscribe to observer events is a future-phase candidate; for now
+# stdout heartbeat + stderr keep claude / codex runs warm.
 _ACTIVITY_EVENTS = frozenset({
-    "message",
-    "tool_use",
     "process.stderr",
 })
 
@@ -552,26 +550,39 @@ class RunProcess:
 
         Returns ``True`` when the matching event arrived (caller
         proceeds to the grace + SIGTERM ladder); returns ``False`` if
-        the subscription is cancelled while we wait. Subscribes to
-        the bus filtered by ``session_id`` (cheap filter built into
-        bus.subscribe) and double-checks ``data.run_id`` so a
-        same-session parallel run can't arm our cleanup.
+        the subscription is cancelled while we wait. Subscribes
+        filtered by ``session_id`` (cheap filter built into
+        bus.subscribe) and double-checks ``event.run_id`` in the
+        handler so a same-session parallel run can't arm our cleanup.
+
+        ``after=current_max_sequence`` skips historical events: the
+        watchdog only cares about end-turn signals fired AFTER this
+        RunProcess started. Without this filter, the observer's first
+        tail of a never-observed rollout (e.g. a fresh harness
+        restart picking up a long-lived external session) would
+        replay historical ``run.end_turn`` records — and
+        ``_resolve_active_run_id`` would stamp them with THIS run's
+        id, arming the watchdog SIGTERM within the 20s grace window
+        for a brand-new run.
         """
-        subscription = self._event_bus.subscribe(session_id=self.session.id)
+        after = await self._event_bus.max_sequence(session_id=self.session.id)
+        subscription = self._event_bus.subscribe(
+            after=after, session_id=self.session.id
+        )
         try:
             async for event in subscription:
                 if event is None:
                     continue
                 if event.event != "run.end_turn":
                     continue
-                if event.data.get("run_id") == self.run_record.id:
-                    return True
-                # Cross-check ``event.run_id`` too — older event
-                # writers attached run id at the top level.
+                # ``run_id`` is stamped at the top level by the
+                # observer's ``_resolve_active_run_id`` (a model_copy
+                # update on ``Event.run_id``); the parser-built event
+                # carries ``run_id=None`` until that resolution.
                 if event.run_id == self.run_record.id:
                     return True
         except asyncio.CancelledError:
-            return False
+            raise
         finally:
             await subscription.aclose()
         return False

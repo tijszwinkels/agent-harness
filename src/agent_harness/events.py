@@ -177,8 +177,15 @@ class DurableEventBus:
             except SessionNotFoundError as exc:
                 # Cache the session_id for the post-lock raise. We still
                 # want to notify subscribers (they care about the
-                # event regardless of materialization state).
-                deferred_session_id = str(exc) or published.session_id or ""
+                # event regardless of materialization state). ``str(exc)``
+                # on a ``KeyError`` subclass returns a repr-quoted
+                # form (``"'ses_abc'"``); prefer the raw ``args[0]``
+                # so future consumers / log formatters see the plain id.
+                deferred_session_id = (
+                    exc.args[0]
+                    if exc.args and isinstance(exc.args[0], str)
+                    else (published.session_id or "")
+                )
             subscribers = tuple(self._subscribers)
 
         for subscriber in subscribers:

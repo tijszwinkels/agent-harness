@@ -765,3 +765,124 @@ def test_sqlite_repository_append_event_does_not_materialize_run_usage(tmp_path)
         ) == (0, 0, 0, 0)
     finally:
         repository.close()
+
+
+def test_materialize_event_preserves_existing_session_stats_on_external_upsert(tmp_path) -> None:
+    """Regression for Phase 3 review's must-fix #1.
+
+    The observer's parser builds a freshly-constructed ``Session``
+    payload for ``session.updated`` events whose ``stats`` field
+    defaults to a zero-valued ``SessionStats()``. Phase 3's
+    ``run.usage`` materializer rolls token deltas into
+    ``Session.stats``; if a subsequent ``session.updated`` upsert
+    overwrites the existing row wholesale (including its accumulated
+    stats), every assistant / turn_context line in a multi-turn
+    external-resume session would wipe prior turns' accumulated
+    tokens. PR #11 originally guarded against this; the Phase 3
+    cherry-pick of the parsers dropped the guard.
+
+    Verify: an external session with non-zero stats receives a fresh
+    session.updated and KEEPS its accumulated stats.
+    """
+    from agent_harness.models import Event, Project, Session, SessionStats
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        # Seed an external session with non-trivial stats (as if a
+        # prior ``run.usage`` had already aggregated tokens).
+        seeded = Session(
+            id="codex_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+            origin="external",
+            stats=SessionStats(
+                messages=3,
+                tokens={"input": 120, "output": 300, "cache_read": 50, "cache_creation": 0},
+                cost_usd=0.0,
+                context_window=258400,
+            ),
+        )
+        repository.upsert_session(seeded)
+
+        # Now materialize a fresh session.updated event (as the
+        # observer would emit on a later turn_context line). The
+        # payload's stats is zero-valued by construction.
+        fresh = Session(
+            id=seeded.id,
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+            origin="external",
+        )
+        assert fresh.stats == SessionStats()  # zeroed by default
+
+        repository.materialize_event(
+            Event(
+                event="session.updated",
+                session_id=seeded.id,
+                data={"session": fresh.model_dump(mode="json")},
+            ),
+            store_event=False,
+        )
+
+        after = repository.get_session(seeded.id)
+        assert after.stats.messages == 3
+        assert after.stats.tokens == {
+            "input": 120,
+            "output": 300,
+            "cache_read": 50,
+            "cache_creation": 0,
+        }
+        assert after.stats.context_window == 258400
+    finally:
+        repository.close()
+
+
+def test_materialize_run_usage_sets_session_context_window(tmp_path) -> None:
+    """End-to-end coverage for the Phase 3 spec's open-question (b)
+    resolution: codex's ``context_window`` rides on the ``run.usage``
+    event and the materializer applies it to ``Session.stats.context_window``
+    in the same pass that updates ``Run.usage`` and ``Session.stats.tokens``.
+
+    Falcon's worth-noting + Aegis-style coverage gap: parser and
+    observer emission were tested in isolation; this nails the
+    materializer's session-stats write."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest, Event, Project
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+        repository.start_run(session.id, run.id)
+
+        repository.materialize_event(
+            Event(
+                event="run.usage",
+                session_id=session.id,
+                run_id=run.id,
+                data={
+                    "usage": {
+                        "input": 120,
+                        "output": 300,
+                        "cache_read": 50,
+                        "cache_creation": 0,
+                    },
+                    "context_window": 258400,
+                },
+            ),
+            store_event=False,
+        )
+
+        after = repository.get_session(session.id)
+        assert after.stats.context_window == 258400
+        assert after.stats.tokens.get("input") == 120
+        assert after.stats.tokens.get("output") == 300
+    finally:
+        repository.close()

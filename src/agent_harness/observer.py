@@ -345,7 +345,9 @@ class ExternalTranscriptObserver:
         matches incoming codex rollouts against active expectations by
         ``session_meta.cwd`` + a ±30s timestamp window from the
         expectation's registration time. Expectations expire after
-        ``expectation_ttl_seconds`` (default 10s) so a failed spawn
+        ``expectation_ttl_seconds`` (default 60s — TTL > window so a
+        slow codex spawn doesn't lose its expectation; see the
+        constant definitions for the rationale) so a failed spawn
         doesn't strand a permanent ghost hint.
         """
         now = self._clock()
@@ -713,16 +715,26 @@ class ExternalTranscriptObserver:
         return event.model_copy(update={"run_id": active_run_id})
 
     def _active_run_id_for_session(self, session_id: str) -> str | None:
+        """Return the id of the session's currently-running harness
+        run, or ``None`` if no run is in ``running`` status.
+
+        Walks ``list_runs`` in reverse so the most-recently-started
+        running run wins (the FIFO queue serializes the harness to one
+        running run per session, so reverse order is a defensive
+        no-op in practice). Returns ``None`` — and the caller drops
+        the ``run.usage`` event — when no running run exists; e.g.
+        between ``run.completed`` and the next spawn for multi-turn
+        codex sessions where ``token_count`` arrives after
+        ``task_complete``. A fallback to the most-recently-started
+        non-running run was considered but rejected: applying usage
+        to a completed run silently rewrites its outcome.
+        """
         if self._repository is None:
             return None
         try:
             runs = self._repository.list_runs(session_id)
         except SessionNotFoundError:
             return None
-        # Prefer a run in "running" status; fall back to the most-
-        # recently-started one if none is currently active (handles
-        # the brief window between ``run.completed`` and the next
-        # spawn for multi-turn sessions).
         for run in reversed(runs):
             if run.status == "running":
                 return run.id

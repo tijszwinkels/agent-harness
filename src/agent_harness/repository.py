@@ -273,15 +273,31 @@ class InMemoryRepository:
                 incoming = Session.model_validate(session_data)
                 with self._lock:
                     existing = self._sessions.get(incoming.id)
-                # The external transcript observer always emits payloads
-                # with origin="external"; if a harness-spawned record
-                # already exists under the canonical ses_<hex> id, skip
-                # the upsert so we don't downgrade its origin /
-                # bypass_permissions / etc. See test_storage.py for the
-                # rationale (a downgrade causes the bridge to adopt the
-                # channel away from the live session on next MM post).
-                if existing is None or existing.origin == "external":
+                # The external transcript observer (and the freshness
+                # tick) emit ``session.updated`` payloads built from a
+                # freshly-constructed ``Session`` whose ``stats`` field
+                # defaults to a zero-valued ``SessionStats()``. If a
+                # harness-spawned record already exists under the
+                # canonical ses_<hex> id we skip the upsert entirely
+                # (origin-downgrade guard — Phase 1 incident; a
+                # downgrade caused the bridge to adopt the channel
+                # away from the live session on next MM post).
+                #
+                # For absent or external-origin records we DO upsert,
+                # but we must preserve any accumulated stats on the
+                # existing row. Without this, every assistant /
+                # turn_context line in a multi-turn external-resume
+                # session would wipe prior turns' aggregated token
+                # counts (``run.usage`` is additive into Session.stats
+                # — see ``_materialize_run_usage_event``). PR #11
+                # originally added this guard; the Phase 3 cherry-pick
+                # of the parsers dropped it.
+                if existing is None:
                     self.upsert_session(incoming)
+                elif existing.origin == "external":
+                    self.upsert_session(
+                        incoming.model_copy(update={"stats": existing.stats})
+                    )
             return
 
         if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
@@ -315,15 +331,21 @@ class InMemoryRepository:
         delta = Usage.model_validate(usage_data)
         context_window = _context_window_from(event.data)
         with self._lock:
+            # Check session presence BEFORE mutating the run. In SQLite
+            # the outer ``materialize_event`` is wrapped in a single
+            # transaction so a late raise rolls back; in-memory state
+            # is not transactional and a mid-method raise would leave
+            # ``Run.usage`` already incremented — a buffered re-flush
+            # would then double-apply the delta.
+            session = self._sessions.get(event.session_id)
+            if session is None:
+                raise SessionNotFoundError(event.session_id)
             run = self._runs.get(event.run_id)
             if run is None or run.session_id != event.session_id:
                 return
             self._runs[event.run_id] = run.model_copy(
                 update={"usage": add_usage(run.usage, delta)}
             )
-            session = self._sessions.get(event.session_id)
-            if session is None:
-                raise SessionNotFoundError(event.session_id)
             tokens = dict(session.stats.tokens or {})
             for key in ("input", "output", "cache_read", "cache_creation"):
                 tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)

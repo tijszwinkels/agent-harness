@@ -496,17 +496,33 @@ class SQLiteRepository:
                 if isinstance(session_data, dict):
                     incoming = Session.model_validate(session_data)
                     existing = self._find_session_locked(incoming.id)
-                    # The external transcript observer always emits payloads
-                    # with origin="external". If a harness-spawned session
-                    # already exists under this canonical id, the observer
-                    # is not authoritative — letting the upsert run would
-                    # downgrade origin to "external", and the next bridge
-                    # restart would re-derive _external_sessions and adopt
-                    # the channel away from the live harness session. Skip
-                    # the upsert in that case; for absent or already-external
-                    # records the observer remains the source of truth.
-                    if existing is None or existing.origin == "external":
+                    # The external transcript observer (and the
+                    # freshness tick) emit ``session.updated`` payloads
+                    # built from a freshly-constructed ``Session``
+                    # whose ``stats`` field defaults to a zero-valued
+                    # ``SessionStats()``. If a harness-spawned record
+                    # already exists under this canonical id we skip
+                    # the upsert entirely (origin-downgrade guard —
+                    # Phase 1 incident; a downgrade caused the bridge
+                    # to adopt the channel away from the live session
+                    # on next MM post).
+                    #
+                    # For absent or external-origin records we DO
+                    # upsert, but we must preserve any accumulated
+                    # stats on the existing row. Without this, every
+                    # assistant / turn_context line in a multi-turn
+                    # external-resume session would wipe prior turns'
+                    # aggregated token counts (``run.usage`` is
+                    # additive into Session.stats — see
+                    # ``_materialize_run_usage_event``). PR #11
+                    # originally added this guard; the Phase 3
+                    # cherry-pick of the parsers dropped it.
+                    if existing is None:
                         self._upsert_session(incoming)
+                    elif existing.origin == "external":
+                        self._upsert_session(
+                            incoming.model_copy(update={"stats": existing.stats})
+                        )
                 return
 
             if event.event in RUN_LIFECYCLE_EVENTS:

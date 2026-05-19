@@ -1651,3 +1651,185 @@ async def test_session_meta_peek_skips_non_session_meta_first_line(tmp_path) -> 
     assert published
     for event in published:
         assert event.session_id == expected_id, event
+
+
+# --- Phase 3: observer materializes run.usage from rollout records -----------
+
+
+@pytest.mark.asyncio
+async def test_observer_publishes_run_usage_from_claude_assistant_record(tmp_path) -> None:
+    """A claude rollout's ``assistant`` record carries
+    ``message.usage`` with input/output/cache token counts. The
+    observer must publish a ``run.usage`` event with those numbers
+    AND the active run_id resolved from the session's running run."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    # ``create_run`` flips the session to "running"; start_run moves
+    # the run itself from "queued" to "running" (active for usage).
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    # Use the session's id-derived claude UUID so the rollout filename
+    # produces ``ses_<hex>`` matching ``session.id``.
+    raw = session.id.removeprefix("ses_")
+    claude_uuid = (
+        f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    )
+    rollout = (
+        tmp_path / ".claude" / "projects" / "-repo" / f"{claude_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+        '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"hi"}],'
+        '"usage":{"input_tokens":6,"output_tokens":4,"cache_read_input_tokens":18,"cache_creation_input_tokens":21}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    published = await observer.tail_file(rollout)
+
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events, [e.event for e in published]
+    payload = usage_events[0].data.get("usage")
+    assert payload == {
+        "input": 6,
+        "output": 4,
+        "cache_read": 18,
+        "cache_creation": 21,
+        "cost_usd": 0.0,
+    }
+    assert usage_events[0].run_id == run.id
+    assert usage_events[0].session_id == session.id
+
+
+@pytest.mark.asyncio
+async def test_observer_publishes_run_usage_from_codex_token_count(tmp_path) -> None:
+    """Codex emits ``event_msg/token_count`` with
+    ``payload.info.last_token_usage`` (per-turn) + ``model_context_window``
+    (session-scope). The observer must publish a ``run.usage`` with the
+    per-turn Usage AND ``context_window`` embedded so the materializer
+    can update both Run.usage and Session.stats in one pass."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0300-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":50},'
+        '"model_context_window":258400}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+
+    published = await observer.tail_file(rollout)
+
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events, [e.event for e in published]
+    assert usage_events[0].run_id == run.id
+    payload = usage_events[0].data.get("usage")
+    assert payload["input"] == 120
+    assert payload["output"] == 300
+    assert payload["cache_read"] == 50
+    # Phase 3 open-question resolution: context_window rides on the
+    # ``run.usage`` event so the materializer updates Session.stats
+    # in the same pass — no separate session.stats_update event type.
+    assert usage_events[0].data.get("context_window") == 258400
+
+
+@pytest.mark.asyncio
+async def test_observer_handles_initial_codex_token_count_with_null_info(tmp_path) -> None:
+    """Codex's first ``token_count`` after session start has
+    ``info: null`` (no usage yet, no context window). Must NOT crash
+    and must NOT publish a zero-usage ``run.usage`` event."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0301-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":null}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+
+    published = await observer.tail_file(rollout)
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events == []
+
+
+@pytest.mark.asyncio
+async def test_observer_skips_usage_publish_when_no_active_run(tmp_path) -> None:
+    """Pure-external sessions where the harness never created a Run
+    record can't attribute usage to anything — no ``run.usage`` event
+    fires. Documented edge: Falcon's worth-noting #1 from PR #11."""
+    repository = InMemoryRepository()
+    # No create_session / create_run — observer encounters the rollout
+    # cold and registers an external session row from session_meta.
+
+    rollout_uuid = "019e0302-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"token_count","info":{'
+        '"last_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":0},'
+        '"model_context_window":258400}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    published = await observer.tail_file(rollout)
+
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events == []

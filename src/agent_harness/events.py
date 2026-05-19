@@ -6,6 +6,7 @@ from contextlib import suppress
 from typing import Protocol
 
 from agent_harness.models import Event
+from agent_harness.repository import MaterializationDeferred, SessionNotFoundError
 
 
 class EventRepository(Protocol):
@@ -159,13 +160,39 @@ class DurableEventBus:
         self._subscribers: set[asyncio.Queue[Event]] = set()
 
     async def publish(self, event: Event) -> Event:
+        # Phase 3: single materialization point. ``append_event``
+        # inserts the row; ``materialize_event(store_event=False)``
+        # applies side effects (run lifecycle, run.usage, session.updated,
+        # message). Both under the same lock so subscribers never see
+        # a published event before its side effects land. If the
+        # materializer raises ``SessionNotFoundError`` (rollout-derived
+        # message for a session that doesn't yet exist), the event
+        # row is preserved and the bus raises ``MaterializationDeferred``
+        # carrying the published event — caller buffers for later flush.
+        deferred_session_id: str | None = None
         async with self._lock:
             published = self._repository.append_event(event)
+            try:
+                self._repository.materialize_event(published, store_event=False)
+            except SessionNotFoundError as exc:
+                # Cache the session_id for the post-lock raise. We still
+                # want to notify subscribers (they care about the
+                # event regardless of materialization state). ``str(exc)``
+                # on a ``KeyError`` subclass returns a repr-quoted
+                # form (``"'ses_abc'"``); prefer the raw ``args[0]``
+                # so future consumers / log formatters see the plain id.
+                deferred_session_id = (
+                    exc.args[0]
+                    if exc.args and isinstance(exc.args[0], str)
+                    else (published.session_id or "")
+                )
             subscribers = tuple(self._subscribers)
 
         for subscriber in subscribers:
             subscriber.put_nowait(published)
 
+        if deferred_session_id is not None:
+            raise MaterializationDeferred(published, deferred_session_id)
         return published
 
     async def replay(self, after: int = 0, *, session_id: str | None = None) -> list[Event]:

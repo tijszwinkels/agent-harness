@@ -18,9 +18,14 @@ from agent_harness.models import (
     RunStatus,
     Session,
     StopReason,
+    Usage,
     utc_now,
 )
-from agent_harness.repository import RunNotFoundError, SessionNotFoundError
+from agent_harness.repository import (
+    RunNotFoundError,
+    SessionNotFoundError,
+    _context_window_from,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -468,18 +473,17 @@ class SQLiteRepository:
         return int(row[0])
 
     def append_event(self, event: Event) -> Event:
-        # Phase 2: ``append_event`` is a pure event-row insert plus run
-        # lifecycle materialization. The message-on-non-external
-        # carve-out used to also materialize messages from the durable
-        # bus's append path; that path exists to disambiguate dual-path
-        # ingestion, which Phase 2 eliminates. The observer's
-        # ``materialize_event`` is now the sole writer to the messages
-        # table.
+        # Phase 3: ``append_event`` is a pure event-row insert. All
+        # side-effect materialization (run lifecycle, run.usage,
+        # session.updated, message) is orchestrated by
+        # ``DurableEventBus.publish``, which calls
+        # ``materialize_event(store_event=False)`` after ``append_event``
+        # under the same lock. Single materialization point per event;
+        # no double-application even if a caller invokes both paths
+        # (Falcon's PR #11 bug becomes structurally impossible).
         with self._lock, self._connection:
             published = event.with_sequence(self._next_event_sequence_locked())
             self._insert_event(published)
-            if published.event in RUN_LIFECYCLE_EVENTS:
-                self._materialize_run_lifecycle_event(published)
         return published.model_copy(deep=True)
 
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
@@ -492,17 +496,33 @@ class SQLiteRepository:
                 if isinstance(session_data, dict):
                     incoming = Session.model_validate(session_data)
                     existing = self._find_session_locked(incoming.id)
-                    # The external transcript observer always emits payloads
-                    # with origin="external". If a harness-spawned session
-                    # already exists under this canonical id, the observer
-                    # is not authoritative — letting the upsert run would
-                    # downgrade origin to "external", and the next bridge
-                    # restart would re-derive _external_sessions and adopt
-                    # the channel away from the live harness session. Skip
-                    # the upsert in that case; for absent or already-external
-                    # records the observer remains the source of truth.
-                    if existing is None or existing.origin == "external":
+                    # The external transcript observer (and the
+                    # freshness tick) emit ``session.updated`` payloads
+                    # built from a freshly-constructed ``Session``
+                    # whose ``stats`` field defaults to a zero-valued
+                    # ``SessionStats()``. If a harness-spawned record
+                    # already exists under this canonical id we skip
+                    # the upsert entirely (origin-downgrade guard —
+                    # Phase 1 incident; a downgrade caused the bridge
+                    # to adopt the channel away from the live session
+                    # on next MM post).
+                    #
+                    # For absent or external-origin records we DO
+                    # upsert, but we must preserve any accumulated
+                    # stats on the existing row. Without this, every
+                    # assistant / turn_context line in a multi-turn
+                    # external-resume session would wipe prior turns'
+                    # aggregated token counts (``run.usage`` is
+                    # additive into Session.stats — see
+                    # ``_materialize_run_usage_event``). PR #11
+                    # originally added this guard; the Phase 3
+                    # cherry-pick of the parsers dropped it.
+                    if existing is None:
                         self._upsert_session(incoming)
+                    elif existing.origin == "external":
+                        self._upsert_session(
+                            incoming.model_copy(update={"stats": existing.stats})
+                        )
                 return
 
             if event.event in RUN_LIFECYCLE_EVENTS:
@@ -511,6 +531,10 @@ class SQLiteRepository:
 
             if event.event == "message":
                 self._materialize_message_event(event)
+                return
+
+            if event.event == "run.usage":
+                self._materialize_run_usage_event(event)
 
     def _materialize_message_event(self, event: Event, *, dedupe_by_content: bool = True) -> None:
         message_data = event.data.get("message")
@@ -686,6 +710,58 @@ class SQLiteRepository:
             logger.error("SQLite event sequence lookup returned no row")
             raise RuntimeError("Failed to allocate event sequence")
         return int(row[0])
+
+    def _materialize_run_usage_event(self, event: Event) -> None:
+        # Phase 3: additive per-turn usage from the rollout. Applies
+        # the ``Usage`` to the named run AND rolls the same delta into
+        # ``Session.stats.tokens``. Codex ``token_count`` events
+        # additionally carry ``context_window`` → updates
+        # ``Session.stats.context_window`` in the same pass.
+        from collections.abc import Mapping as _Mapping
+        from agent_harness.usage import add_usage
+
+        if event.session_id is None or event.run_id is None:
+            return
+        usage_data = event.data.get("usage")
+        if not isinstance(usage_data, _Mapping):
+            return
+        delta = Usage.model_validate(usage_data)
+        context_window = _context_window_from(event.data)
+
+        row = self._connection.execute(
+            "select payload from runs where id = ? and session_id = ?",
+            (event.run_id, event.session_id),
+        ).fetchone()
+        if row is None:
+            logger.warning(
+                "SQLite run.usage materialization skipped missing run: session=%s run=%s",
+                event.session_id,
+                event.run_id,
+            )
+            return
+        run = _model_from_row(row, "payload", Run)
+        self._upsert_run(run.model_copy(update={"usage": add_usage(run.usage, delta)}))
+
+        session = self._find_session_locked(event.session_id)
+        if session is None:
+            raise SessionNotFoundError(event.session_id)
+        tokens = dict(session.stats.tokens or {})
+        for key in ("input", "output", "cache_read", "cache_creation"):
+            tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)
+        stats_update: dict[str, object] = {
+            "tokens": tokens,
+            "cost_usd": session.stats.cost_usd + delta.cost_usd,
+        }
+        if context_window is not None:
+            stats_update["context_window"] = context_window
+        self._upsert_session(
+            session.model_copy(
+                update={
+                    "stats": session.stats.model_copy(update=stats_update),
+                    "updated_at": utc_now(),
+                }
+            )
+        )
 
     def _materialize_run_lifecycle_event(self, event: Event) -> None:
         if event.session_id is None or event.run_id is None:

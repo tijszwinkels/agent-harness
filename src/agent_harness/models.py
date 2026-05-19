@@ -43,8 +43,16 @@ class Usage(HarnessModel):
 
 class SessionStats(HarnessModel):
     messages: int = Field(default=0, ge=0)
-    tokens: dict[str, Any] = Field(default_factory=dict)
+    tokens: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Sum of input, output, cache_read, and cache_creation token usage across runs in the session.",
+    )
     cost_usd: float = Field(default=0, ge=0)
+    # Codex-only: latest ``model_context_window`` observed in a
+    # ``token_count`` payload. ``None`` until first observed (e.g.
+    # claude sessions never set it). The observer updates this each
+    # time the rollout carries a fresh context-window value.
+    context_window: int | None = Field(default=None, ge=1)
 
 
 class TextBlock(HarnessModel):

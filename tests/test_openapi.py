@@ -60,3 +60,22 @@ def test_openapi_documents_patch_session() -> None:
         "type": "string",
         "minLength": 1,
     }
+
+
+def test_openapi_documents_phase3_event_types() -> None:
+    spec = _openapi_spec()
+    event_enum = spec["components"]["schemas"]["Event"]["properties"]["event"]["enum"]
+    # Phase 3 adds ``run.usage`` (observer-materialized from rollouts).
+    assert "run.usage" in event_enum
+    # Phase 2 added ``process.stderr`` (supervisor forwards stderr lines).
+    assert "process.stderr" in event_enum
+
+
+def test_openapi_documents_session_stats_context_window() -> None:
+    spec = _openapi_spec()
+    session_stats = spec["components"]["schemas"]["SessionStats"]
+    cw = session_stats["properties"]["context_window"]
+    # Nullable integer, minimum 1, NOT required (codex-only field).
+    assert cw["type"] == ["integer", "null"]
+    assert cw["minimum"] == 1
+    assert "context_window" not in session_stats.get("required", [])

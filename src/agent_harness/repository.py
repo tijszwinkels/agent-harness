@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from threading import RLock
 
 from agent_harness.models import (
@@ -12,6 +13,7 @@ from agent_harness.models import (
     RunStatus,
     Session,
     StopReason,
+    Usage,
     utc_now,
 )
 
@@ -22,6 +24,30 @@ class SessionNotFoundError(KeyError):
 
 class RunNotFoundError(KeyError):
     pass
+
+
+class MaterializationDeferred(SessionNotFoundError):
+    """Phase 3: raised by ``DurableEventBus.publish`` when an event was
+    successfully inserted (event row + bus history + subscribers
+    notified) but its side-effect materialization needs the referenced
+    session to exist first — typically a rollout-derived message event
+    that arrived before ``POST /v1/sessions``.
+
+    Carries ``event`` so the caller can buffer the published event
+    (with its assigned sequence) for later replay via
+    ``repository.materialize_event(event, store_event=False)``. Without
+    the published event in hand, the caller would only see the
+    original pre-publish event with no sequence and have no clean way
+    to re-materialize against the existing event row.
+
+    Inherits from ``SessionNotFoundError`` so call-sites that already
+    catch the parent type keep working unchanged.
+    """
+
+    def __init__(self, event: Event, session_id: str) -> None:
+        super().__init__(session_id)
+        self.event = event
+        self.session_id = session_id
 
 
 class InMemoryRepository:
@@ -247,15 +273,31 @@ class InMemoryRepository:
                 incoming = Session.model_validate(session_data)
                 with self._lock:
                     existing = self._sessions.get(incoming.id)
-                # The external transcript observer always emits payloads
-                # with origin="external"; if a harness-spawned record
-                # already exists under the canonical ses_<hex> id, skip
-                # the upsert so we don't downgrade its origin /
-                # bypass_permissions / etc. See test_storage.py for the
-                # rationale (a downgrade causes the bridge to adopt the
-                # channel away from the live session on next MM post).
-                if existing is None or existing.origin == "external":
+                # The external transcript observer (and the freshness
+                # tick) emit ``session.updated`` payloads built from a
+                # freshly-constructed ``Session`` whose ``stats`` field
+                # defaults to a zero-valued ``SessionStats()``. If a
+                # harness-spawned record already exists under the
+                # canonical ses_<hex> id we skip the upsert entirely
+                # (origin-downgrade guard — Phase 1 incident; a
+                # downgrade caused the bridge to adopt the channel
+                # away from the live session on next MM post).
+                #
+                # For absent or external-origin records we DO upsert,
+                # but we must preserve any accumulated stats on the
+                # existing row. Without this, every assistant /
+                # turn_context line in a multi-turn external-resume
+                # session would wipe prior turns' aggregated token
+                # counts (``run.usage`` is additive into Session.stats
+                # — see ``_materialize_run_usage_event``). PR #11
+                # originally added this guard; the Phase 3 cherry-pick
+                # of the parsers dropped it.
+                if existing is None:
                     self.upsert_session(incoming)
+                elif existing.origin == "external":
+                    self.upsert_session(
+                        incoming.model_copy(update={"stats": existing.stats})
+                    )
             return
 
         if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:
@@ -266,6 +308,60 @@ class InMemoryRepository:
             message_data = event.data.get("message")
             if event.session_id and isinstance(message_data, dict):
                 self.add_message(event.session_id, Message.model_validate(message_data))
+            return
+
+        if event.event == "run.usage":
+            self._materialize_run_usage_event(event)
+            return
+
+    def _materialize_run_usage_event(self, event: Event) -> None:
+        # Phase 3: apply per-turn ``Usage`` from the rollout to the
+        # named ``Run`` (additive — usage sums across turns) and roll
+        # the aggregate up into ``Session.stats.tokens``. Codex
+        # ``token_count`` events additionally carry ``context_window``
+        # so ``Session.stats.context_window`` updates in the same pass
+        # (option (b) of the Phase 3 spec's open question).
+        from agent_harness.usage import add_usage
+
+        if event.session_id is None or event.run_id is None:
+            return
+        usage_data = event.data.get("usage")
+        if not isinstance(usage_data, Mapping):
+            return
+        delta = Usage.model_validate(usage_data)
+        context_window = _context_window_from(event.data)
+        with self._lock:
+            # Check session presence BEFORE mutating the run. In SQLite
+            # the outer ``materialize_event`` is wrapped in a single
+            # transaction so a late raise rolls back; in-memory state
+            # is not transactional and a mid-method raise would leave
+            # ``Run.usage`` already incremented — a buffered re-flush
+            # would then double-apply the delta.
+            session = self._sessions.get(event.session_id)
+            if session is None:
+                raise SessionNotFoundError(event.session_id)
+            run = self._runs.get(event.run_id)
+            if run is None or run.session_id != event.session_id:
+                return
+            self._runs[event.run_id] = run.model_copy(
+                update={"usage": add_usage(run.usage, delta)}
+            )
+            tokens = dict(session.stats.tokens or {})
+            for key in ("input", "output", "cache_read", "cache_creation"):
+                tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)
+            new_cost = session.stats.cost_usd + delta.cost_usd
+            stats_update: dict[str, object] = {
+                "tokens": tokens,
+                "cost_usd": new_cost,
+            }
+            if context_window is not None:
+                stats_update["context_window"] = context_window
+            self._sessions[event.session_id] = session.model_copy(
+                update={
+                    "stats": session.stats.model_copy(update=stats_update),
+                    "updated_at": utc_now(),
+                }
+            )
 
     def _materialize_run_lifecycle_event(self, event: Event) -> None:
         if event.session_id is None or event.run_id is None:
@@ -326,3 +422,16 @@ def _messages_equivalent(left: Message, right: Message) -> bool:
 
 def _message_key(message: Message) -> tuple[str, str]:
     return (message.role, "".join(block.model_dump_json() for block in message.blocks))
+
+
+def _context_window_from(data: Mapping[str, object] | object) -> int | None:
+    if not isinstance(data, Mapping):
+        return None
+    raw = data.get("context_window")
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None

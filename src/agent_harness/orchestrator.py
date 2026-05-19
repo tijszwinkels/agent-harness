@@ -15,12 +15,7 @@ from pathlib import Path
 
 from agent_harness.events import InMemoryEventBus
 from agent_harness.models import Event, Message, Run, RunStatus, Session, TextBlock, utc_now
-from agent_harness.rollout_discovery import RolloutDiscovery, RolloutDiscoveryError
-
-# Env var that opts the runtime into rollout pre-binding. Default-off in
-# Phase 1: the machinery lands without changing production behavior, and
-# Phase 2 will flip the default and remove the gate entirely.
-ROLLOUT_PRE_BIND_ENV_VAR = "AGENT_HARNESS_ROLLOUT_PRE_BIND"
+from agent_harness.rollout_discovery import RolloutDiscovery
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +26,17 @@ IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
 
 _END_TURN_EVENT = "__end_turn__"
+# Phase 2: ``message.delta`` is no longer emitted from the supervisor
+# (the observer is the sole writer for message-shaped events). We keep
+# ``message`` and ``tool_use`` for forward-compatibility (Phase 3 will
+# rewire the watchdog to subscribe to observer events directly) and add
+# ``process.stderr`` so long stderr-active codex runs don't trip the
+# 30-min idle watchdog spuriously while the orchestrator-side activity
+# stream is otherwise sparse.
 _ACTIVITY_EVENTS = frozenset({
     "message",
-    "message.delta",
-    # Reserved for future stdout parsers; activity tracking already handles it.
     "tool_use",
+    "process.stderr",
 })
 
 
@@ -185,60 +186,34 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
     }
 
 
-StdoutParser = Callable[[str], list[tuple[str, dict[str, Any]]]]
+def _detect_end_turn_in_line(line: str, *, backend: str) -> bool:
+    """Detect the end-of-turn signal in a single stdout line.
 
+    Phase 2 collapses the per-backend stdout parsers into this single
+    boolean helper — the only thing the supervisor still cares about
+    in stdout is whether the watchdog's post-end_turn cleanup should
+    fire. Message data flows through the observer.
 
-def parse_codex_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
+    Recognized shapes:
+    - claude-code: ``{"type":"result","stop_reason":"end_turn"}``
+    - codex: ``{"type":"turn.completed"}``
+    """
     if not line:
-        return []
+        return False
     try:
         record = json.loads(line)
     except json.JSONDecodeError:
-        return []
+        return False
     if not isinstance(record, Mapping):
-        return []
-    if record.get("type") == "turn.completed":
-        return [(_END_TURN_EVENT, {})]
-    if record.get("type") != "item.completed":
-        return []
-    item = record.get("item")
-    if not isinstance(item, Mapping) or item.get("type") != "agent_message":
-        return []
-    text = item.get("text")
-    if not isinstance(text, str) or not text:
-        return []
-
-    message = Message(role="assistant", blocks=[TextBlock(text=text)], model=None)
-    return [
-        (
-            "message",
-            {
-                "message": message.model_dump(mode="json"),
-                "source_type": "agent_message",
-            },
+        return False
+    if backend == "claude-code":
+        return (
+            record.get("type") == "result"
+            and record.get("stop_reason") == "end_turn"
         )
-    ]
-
-
-def parse_claude_stream_line(line: str) -> list[tuple[str, dict[str, Any]]]:
-    if not line:
-        return []
-    try:
-        record = json.loads(line)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(record, Mapping):
-        return []
-    if record.get("type") == "result" and record.get("stop_reason") == "end_turn":
-        return [(_END_TURN_EVENT, {})]
-    return []
-
-
-def default_stdout_parsers() -> dict[str, StdoutParser]:
-    # Claude messages still come exclusively from ExternalTranscriptObserver,
-    # but codex exec --json cannot be pinned to the harness session id. Its
-    # assistant messages must be synthesized from stdout under the harness run.
-    return {"codex": parse_codex_stream_line, "claude-code": parse_claude_stream_line}
+    if backend == "codex":
+        return record.get("type") == "turn.completed"
+    return False
 
 
 def validate_session_resume_target(session: Session) -> None:
@@ -308,7 +283,6 @@ class RunProcess:
         command: ProcessCommand,
         event_bus: InMemoryEventBus,
         process_factory: ProcessFactory | None = None,
-        stdout_parsers: Mapping[str, StdoutParser] | None = None,
         clock: Callable[[], datetime] = utc_now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         observer: Any | None = None,
@@ -319,9 +293,6 @@ class RunProcess:
         self.command = command
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
-        self._stdout_parsers: Mapping[str, StdoutParser] = (
-            stdout_parsers if stdout_parsers is not None else default_stdout_parsers()
-        )
         self._process: ManagedProcess | None = None
         self._interrupted = False
         self._clock = clock
@@ -331,18 +302,29 @@ class RunProcess:
         self._last_activity_event: str | None = None
         self._watchdog_termination_in_progress = False
         self._watchdog_termination_task: asyncio.Task[None] | None = None
-        # Phase 1: optional rollout pre-binding wiring. Both must be
-        # present AND ``AGENT_HARNESS_ROLLOUT_PRE_BIND=1`` for any work
-        # to happen. Defaults are ``None``; the env-var gate stays off.
+        # Phase 2: rollout pre-binding is unconditional for harness
+        # sessions. claude uses the deterministic ``discover_claude``
+        # path; codex uses the expectation registry (no fd probe).
+        # ``observer`` and ``rollout_discovery`` may be ``None`` for
+        # tests that don't exercise the pre-bind path; production wires
+        # both via api.py's lifespan + cli.py.
         self._observer = observer
         self._rollout_discovery = rollout_discovery
-        # Set to the bound rollout path once pre-bind succeeds, so
-        # ``run()``'s finally block can unbind on terminal-state
-        # cleanup (keeps observer._path_to_session bounded).
+        # Set to the bound rollout path once claude pre-bind succeeds,
+        # so ``run()``'s finally block can unbind on terminal-state
+        # cleanup. Codex uses the expectation registry instead; no
+        # bound path to clean up there (the registry self-purges via
+        # TTL + consume-on-match).
         self._bound_rollout_path: Path | None = None
 
     async def run(self) -> RunProcessResult:
         await self._publish("run.started", {})
+
+        # Phase 2: codex pre-bind registers an expectation BEFORE the
+        # spawn so a fast watchfiles fire on codex's first byte can
+        # still resolve correctly. Claude pre-bind runs post-spawn
+        # (deterministic; no race against the file existing).
+        self._pre_register_codex_expectation_if_codex()
 
         try:
             self._process = await self._process_factory(self.command)
@@ -351,12 +333,8 @@ class RunProcess:
             await self._publish("run.failed", {"error": str(exc), "error_type": type(exc).__name__})
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
 
-        # Phase 1 (flag-gated): pre-bind the rollout file to the harness
-        # session id so the observer attributes events to our row
-        # rather than the synthesized filename-derived id. claude is
-        # deterministic (no race); codex needs an fd probe and runs as
-        # a background task so spawn returns quickly.
-        await self._maybe_pre_bind_rollout(self._process)
+        # Claude pre-bind (deterministic, post-spawn).
+        self._pre_bind_claude_if_claude()
 
         stream_tasks = self._stream_tasks(self._process)
         wait_task = asyncio.create_task(self._process.wait())
@@ -407,41 +385,52 @@ class RunProcess:
         self._process.terminate()
         return True
 
-    async def _maybe_pre_bind_rollout(self, process: ManagedProcess) -> None:
-        if not self._pre_bind_enabled():
-            return
-        backend = self.session.backend
-        try:
-            if backend == "claude-code":
-                self._pre_bind_claude()
-                return
-            if backend == "codex":
-                # Run synchronously so the binding is in place before
-                # the observer's watchfiles loop fires on codex's first
-                # session_meta flush. Adds ~100-300ms to spawn but
-                # eliminates the dual-row race: if the bind landed
-                # AFTER tail_file, the observer would attribute the
-                # first events to the synthesized ``codex_<uuid>``
-                # external row and a phantom session would survive.
-                await self._pre_bind_codex(process.pid)
-                return
-        except Exception:
-            # Pre-bind is best-effort. Existing filename-pattern flow
-            # remains as a safety net.
-            logger.exception(
-                "Pre-bind setup failed: session=%s backend=%s",
-                self.session.id,
-                backend,
-            )
-
     def _pre_bind_enabled(self) -> bool:
         if self.session.origin != "harness":
             return False
-        if self._observer is None or self._rollout_discovery is None:
+        if self._observer is None:
             return False
-        return os.environ.get(ROLLOUT_PRE_BIND_ENV_VAR) == "1"
+        return True
 
-    def _pre_bind_claude(self) -> None:
+    def _pre_register_codex_expectation_if_codex(self) -> None:
+        """Phase 2 codex hand-off. Replaces Phase 1's psutil-based fd
+        probe with a one-line expectation registration the observer
+        will match content-side via ``session_meta`` peek. No spawn-
+        time blocking, no race with watchfiles."""
+        if self.session.backend != "codex":
+            return
+        if not self._pre_bind_enabled():
+            return
+        cwd_str = self.command.cwd
+        if cwd_str is None:
+            logger.warning(
+                "Skipping codex expectation registration: command has no cwd; session=%s",
+                self.session.id,
+            )
+            return
+        try:
+            self._observer.expect_codex_rollout(
+                cwd=Path(cwd_str), session_id=self.session.id
+            )
+        except Exception:
+            logger.exception(
+                "Codex expectation registration failed: session=%s",
+                self.session.id,
+            )
+            return
+        logger.debug(
+            "Codex rollout expectation registered: session=%s cwd=%s",
+            self.session.id,
+            cwd_str,
+        )
+
+    def _pre_bind_claude_if_claude(self) -> None:
+        if self.session.backend != "claude-code":
+            return
+        if not self._pre_bind_enabled():
+            return
+        if self._rollout_discovery is None:
+            return
         cwd_str = self.command.cwd
         if cwd_str is None:
             logger.warning(
@@ -463,68 +452,21 @@ class RunProcess:
                 exc,
             )
             return
-        path = self._rollout_discovery.discover_claude(
-            session_id=claude_uuid, cwd=Path(cwd_str)
-        )
-        self._observer.bind_rollout(path, self.session.id)
+        try:
+            path = self._rollout_discovery.discover_claude(
+                session_id=claude_uuid, cwd=Path(cwd_str)
+            )
+            self._observer.bind_rollout(path, self.session.id)
+        except Exception:
+            logger.exception(
+                "Claude rollout pre-bind raised: session=%s",
+                self.session.id,
+            )
+            return
         self._bound_rollout_path = path
         logger.debug(
             "Claude rollout pre-bound: session=%s path=%s",
             self.session.id,
-            path,
-        )
-
-    async def _pre_bind_codex(self, pid: int) -> None:
-        cwd_str = self.command.cwd
-        if cwd_str is None:
-            logger.warning(
-                "Skipping codex rollout pre-bind: command has no cwd; session=%s",
-                self.session.id,
-            )
-            return
-        try:
-            path = await self._rollout_discovery.discover_codex(
-                pid=pid, cwd=Path(cwd_str)
-            )
-        except RolloutDiscoveryError as exc:
-            logger.warning(
-                "Codex rollout discovery failed: session=%s pid=%s error=%s",
-                self.session.id,
-                pid,
-                exc,
-            )
-            await self._publish(
-                "run.warning",
-                {
-                    "reason": "codex_rollout_discovery_failed",
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                },
-            )
-            return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.exception(
-                "Codex rollout pre-bind raised: session=%s pid=%s",
-                self.session.id,
-                pid,
-            )
-            await self._publish(
-                "run.warning",
-                {
-                    "reason": "codex_rollout_discovery_failed",
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                },
-            )
-            return
-        self._observer.bind_rollout(path, self.session.id)
-        self._bound_rollout_path = path
-        logger.debug(
-            "Codex rollout pre-bound: session=%s pid=%s path=%s",
-            self.session.id,
-            pid,
             path,
         )
 
@@ -552,31 +494,32 @@ class RunProcess:
         return tasks
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
-        parser: StdoutParser | None = None
-        if stream_name == "stdout" and self.session.origin == "harness":
-            parser = self._stdout_parsers.get(self.session.backend)
+        # Phase 2: stdout is end-turn-only; stderr forwards as
+        # ``process.stderr`` events. The observer is the sole writer
+        # for ``message`` / ``message.delta``; nothing on this path
+        # synthesizes messages.
+        detect_end_turn = (
+            stream_name == "stdout" and self.session.origin == "harness"
+        )
         while line := await stream.readline():
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not text:
                 continue
-            await self._publish("message.delta", {"stream": stream_name, "text": text})
-            if parser is None:
+            if stream_name == "stderr":
+                await self._publish("process.stderr", {"text": text})
+                continue
+            if not detect_end_turn:
                 continue
             try:
-                events = parser(text)
+                if _detect_end_turn_in_line(text, backend=self.session.backend):
+                    self._end_turn_event.set()
             except Exception:
                 logger.exception(
-                    "Stdout parser raised: session=%s run=%s backend=%s",
+                    "End-turn detector raised: session=%s run=%s backend=%s",
                     self.session.id,
                     self.run_record.id,
                     self.session.backend,
                 )
-                continue
-            for event_name, data in events:
-                if event_name == _END_TURN_EVENT:
-                    self._end_turn_event.set()
-                    continue
-                await self._publish(event_name, data)
 
     async def _finish_streams(self, tasks: list[asyncio.Task[None]]) -> None:
         if not tasks:
@@ -776,16 +719,12 @@ class RunManager:
         *,
         event_bus: InMemoryEventBus,
         process_factory: ProcessFactory | None = None,
-        stdout_parsers: Mapping[str, StdoutParser] | None = None,
         queue_max_per_session: int = RUN_QUEUE_MAX_PER_SESSION,
         observer: Any | None = None,
         rollout_discovery: Any | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
-        self._stdout_parsers: Mapping[str, StdoutParser] = (
-            stdout_parsers if stdout_parsers is not None else default_stdout_parsers()
-        )
         self._queue_max_per_session = queue_max_per_session
         self._active: dict[str, RunProcess] = {}
         self._tasks: dict[str, asyncio.Task[RunProcessResult]] = {}
@@ -795,13 +734,12 @@ class RunManager:
         # which would race on the shared claude-code rollout JSONL.
         self._active_run_by_session: dict[str, str] = {}
         self._queues: dict[str, deque[_QueuedRun]] = {}
-        # Optional wiring for the Phase 1 rollout pre-binding path. The
-        # production cli wires only ``rollout_discovery`` here — the
-        # observer is constructed later inside FastAPI's lifespan and
-        # late-bound via ``set_observer`` (see api.py). Tests usually
-        # pass both directly. The env-var gate in RunProcess decides at
-        # run() time whether to actually probe; either or both being
-        # ``None`` is a valid configuration (pre-bind is skipped).
+        # Optional wiring for the rollout pre-binding path. The production
+        # cli wires only ``rollout_discovery`` here — the observer is
+        # constructed later inside FastAPI's lifespan and late-bound via
+        # ``set_observer`` (see api.py). Tests usually pass both directly.
+        # Pre-bind is unconditional in Phase 2 (no env-var gate); the
+        # actual work skips itself when ``observer`` is unset.
         self._observer = observer
         self._rollout_discovery = rollout_discovery
 
@@ -897,7 +835,6 @@ class RunManager:
             command=command,
             event_bus=self._event_bus,
             process_factory=self._process_factory,
-            stdout_parsers=self._stdout_parsers,
             observer=self._observer,
             rollout_discovery=self._rollout_discovery,
         )

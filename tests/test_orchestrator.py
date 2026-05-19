@@ -17,9 +17,6 @@ from agent_harness.orchestrator import (
     RunManager,
     RunProcess,
     SubmitResult,
-    default_stdout_parsers,
-    parse_claude_stream_line,
-    parse_codex_stream_line,
 )
 
 
@@ -390,7 +387,10 @@ def test_external_resume_requires_expected_session_id_prefix() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_process_publishes_stdout_and_stderr_deltas_then_completion() -> None:
+async def test_run_process_publishes_process_stderr_and_completion() -> None:
+    """Phase 2: stdout non-JSON lines do not travel the event bus
+    (no message.delta). Stderr lines emit ``process.stderr`` with a
+    ``{text: ...}`` payload."""
     bus = InMemoryEventBus()
     session = make_session()
     run = make_run(session)
@@ -414,13 +414,11 @@ async def test_run_process_publishes_stdout_and_stderr_deltas_then_completion() 
     assert result.status == "completed"
     assert [event.event for event in events] == [
         "run.started",
-        "message.delta",
-        "message.delta",
+        "process.stderr",
         "run.completed",
     ]
-    assert events[1].data == {"stream": "stdout", "text": "hello"}
-    assert events[2].data == {"stream": "stderr", "text": "warn"}
-    assert events[3].data == {"returncode": 0}
+    assert events[1].data == {"text": "warn"}
+    assert events[2].data == {"returncode": 0}
 
 
 @pytest.mark.asyncio
@@ -446,7 +444,7 @@ async def test_run_process_publishes_failed_for_nonzero_exit() -> None:
 
     events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     assert result.status == "failed"
-    assert [event.event for event in events] == ["run.started", "message.delta", "run.failed"]
+    assert [event.event for event in events] == ["run.started", "process.stderr", "run.failed"]
     assert events[-1].data == {"returncode": 2}
 
 
@@ -475,142 +473,14 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
     assert events[-1].event == "run.interrupted"
 
 
-def test_default_stdout_parsers_registers_codex_only() -> None:
-    # Claude stdout remains delta-only for message events because the
-    # transcript observer can tag claude events with the harness session id.
-    # It still needs a stdout parser for the result/end_turn lifecycle hook.
-    assert default_stdout_parsers() == {
-        "codex": parse_codex_stream_line,
-        "claude-code": parse_claude_stream_line,
-    }
-
-
-def test_parse_codex_stream_line_extracts_agent_message() -> None:
-    record = {
-        "type": "item.completed",
-        "item": {"id": "item_0", "type": "agent_message", "text": "hello from codex"},
-    }
-
-    events = parse_codex_stream_line(json.dumps(record))
-
-    assert len(events) == 1
-    name, data = events[0]
-    assert name == "message"
-    assert data["source_type"] == "agent_message"
-    assert data["message"]["role"] == "assistant"
-    assert data["message"]["model"] is None
-    assert data["message"]["blocks"] == [{"type": "text", "text": "hello from codex"}]
-
-
-def test_parse_codex_stream_line_emits_end_turn_sentinel() -> None:
-    events = parse_codex_stream_line(json.dumps({"type": "turn.completed"}))
-
-    assert events == [(orchestrator._END_TURN_EVENT, {})]
-
-
-def test_parse_codex_stream_line_ignores_tool_use_records() -> None:
-    for record in (
-        {"type": "thread.started", "thread_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4"},
-        {"type": "turn.started"},
-        {
-            "type": "item.completed",
-            "item": {"type": "command_execution", "command": "true", "status": "completed"},
-        },
-        {"type": "item.completed", "item": {"type": "web_search", "query": "docs"}},
-    ):
-        assert parse_codex_stream_line(json.dumps(record)) == []
-
-
-def test_parse_codex_stream_line_ignores_malformed_json_and_empty_messages() -> None:
-    assert parse_codex_stream_line("not json") == []
-    assert parse_codex_stream_line("") == []
-    assert parse_codex_stream_line(json.dumps({"type": "item.completed"})) == []
-    assert parse_codex_stream_line(json.dumps({"type": "item.completed", "item": {}})) == []
-    assert parse_codex_stream_line(
-        json.dumps({"type": "item.completed", "item": {"type": "agent_message"}})
-    ) == []
-    assert parse_codex_stream_line(
-        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": ""}})
-    ) == []
-
-
-@pytest.mark.asyncio
-async def test_run_process_emits_structured_message_for_codex_agent_message_stdout() -> None:
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    assistant_line = json.dumps(
-        {
-            "type": "item.completed",
-            "item": {"id": "item_0", "type": "agent_message", "text": "hello from codex"},
-        }
-    ).encode()
-    process = FakeProcess(stdout=[assistant_line + b"\n"], returncode=0)
-    factory = FakeFactory(process)
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
-            event_bus=bus,
-            process_factory=factory,
-        ).run()
-    )
-    await asyncio.sleep(0)
-    process.finish()
-    result = await asyncio.wait_for(task, timeout=1)
-
-    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
-    assert result.status == "completed"
-    assert [event.event for event in events] == [
-        "run.started",
-        "message.delta",
-        "message",
-        "run.completed",
-    ]
-    assert events[1].data == {"stream": "stdout", "text": assistant_line.decode()}
-    assert events[2].session_id == session.id
-    assert events[2].run_id == run.id
-    assert events[2].data["message"]["role"] == "assistant"
-    assert events[2].data["message"]["blocks"] == [{"type": "text", "text": "hello from codex"}]
-
-
-@pytest.mark.asyncio
-async def test_run_process_leaves_external_codex_stdout_delta_only() -> None:
-    bus = InMemoryEventBus()
-    session = make_session("codex").model_copy(update={"origin": "external", "id": "codex_external"})
-    run = make_run(session, origin="external")
-    assistant_line = json.dumps(
-        {
-            "type": "item.completed",
-            "item": {"id": "item_0", "type": "agent_message", "text": "hello from codex"},
-        }
-    ).encode()
-    process = FakeProcess(stdout=[assistant_line + b"\n"], returncode=0)
-    factory = FakeFactory(process)
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("codex", "exec", "resume", "--json", "external", "hello")),
-            event_bus=bus,
-            process_factory=factory,
-        ).run()
-    )
-    await asyncio.sleep(0)
-    process.finish()
-    await asyncio.wait_for(task, timeout=1)
-
-    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
-    assert [event.event for event in events] == ["run.started", "message.delta", "run.completed"]
-
-
 @pytest.mark.asyncio
 async def test_external_codex_turn_completed_does_not_arm_end_turn_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """External codex sessions (origin=external) do NOT run through the
+    end-turn detector — Phase 2 keeps the harness-origin gate, so a
+    ``turn.completed`` in an externally-managed codex stdout doesn't
+    arm the supervisor's cleanup watchdog."""
     monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
     monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
     bus = InMemoryEventBus()
@@ -649,51 +519,9 @@ async def test_external_codex_turn_completed_does_not_arm_end_turn_watchdog(
 
     events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     assert result.status == "completed"
-    assert [event.event for event in events] == ["run.started", "message.delta", "run.completed"]
-
-
-@pytest.mark.asyncio
-async def test_run_process_does_not_emit_message_event_for_claude_stdout() -> None:
-    # Claude --print stdout is mirrored as message.delta lines but must NOT
-    # publish "message" events: the file-watching observer is the single
-    # source of message events. Emitting from both paths produces every
-    # assistant turn twice on the SSE stream (see bug investigation in
-    # ses_fd2a57b5a06d4b14abd86af1f4a53647).
-    bus = InMemoryEventBus()
-    session = make_session("claude-code")
-    run = make_run(session)
-    assistant_line = json.dumps(
-        {
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "model": "claude-sonnet-4-6",
-                "content": [{"type": "text", "text": "pong"}],
-            },
-        }
-    ).encode()
-    process = FakeProcess(stdout=[assistant_line + b"\n"], returncode=0)
-    factory = FakeFactory(process)
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("claude", "--print")),
-            event_bus=bus,
-            process_factory=factory,
-        ).run()
-    )
-    await asyncio.sleep(0)
-    process.finish()
-    await asyncio.wait_for(task, timeout=1)
-
-    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
-    event_names = [event.event for event in events]
-    assert "message" not in event_names, (
-        f"RunProcess must not emit message events from stdout (got {event_names})"
-    )
-    assert event_names == ["run.started", "message.delta", "run.completed"]
+    # No message.delta from stdout, no process.stderr (we didn't write
+    # to stderr), just lifecycle events.
+    assert [event.event for event in events] == ["run.started", "run.completed"]
 
 
 @pytest.mark.asyncio
@@ -861,13 +689,18 @@ async def test_run_process_idle_timeout_fires_after_threshold(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_run_process_idle_timeout_resets_on_activity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 2: stdout non-JSON lines are silent on the bus (no
+    message.delta) so they can't tick the idle watchdog anymore. The
+    activity stream the supervisor still controls is stderr —
+    ``process.stderr`` is in ``_ACTIVITY_EVENTS``. Long-running codex
+    runs typically emit periodic stderr; the watchdog resets on each."""
     monkeypatch.setattr(orchestrator, "IDLE_TIMEOUT_SECONDS", 30 * 60, raising=False)
     monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
     bus = InMemoryEventBus()
     session = make_session()
     run = make_run(session)
     clock = FakeClock()
-    process = FakeProcess(stdout=[], close_stdout=False)
+    process = FakeProcess(stdout=[], stderr=[], close_stdout=False, close_stderr=False)
     install_fake_process_group(monkeypatch, process)
 
     task = asyncio.create_task(
@@ -884,15 +717,16 @@ async def test_run_process_idle_timeout_resets_on_activity(monkeypatch: pytest.M
     await flush_asyncio()
 
     clock.advance(25 * 60)
-    process.stdout.push(b"still working\n")
+    process.stderr.push(b"still working\n")
     await flush_asyncio()
     clock.advance(25 * 60)
-    process.stdout.push(b"still working again\n")
+    process.stderr.push(b"still working again\n")
     await flush_asyncio()
 
     assert process.group_signals == []
     process.finish()
     process.stdout.close()
+    process.stderr.close()
     await asyncio.wait_for(task, timeout=1)
 
 
@@ -1209,21 +1043,14 @@ class _RecordingDiscovery:
 
 
 @pytest.mark.asyncio
-async def test_run_process_pre_binds_claude_rollout_when_flag_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When the env var is set, RunProcess should compute the claude
-    deterministic path via the discovery + call observer.bind_rollout.
-
-    The session_id passed to ``discover_claude`` is the 8-4-4-4-12
-    dashed UUID derived from ``session.id`` (matching what claude
-    writes on disk), NOT the harness's ``ses_<hex>`` form.
-    """
+async def test_run_process_pre_binds_claude_rollout() -> None:
+    """Phase 2: claude pre-bind is unconditional for harness sessions
+    (no env-var gate). The session_id passed to ``discover_claude`` is
+    the 8-4-4-4-12 dashed UUID derived from ``session.id`` (matching
+    what claude writes on disk), NOT the harness's ``ses_<hex>`` form."""
     from pathlib import Path
 
     from agent_harness.orchestrator import _harness_session_id_as_uuid
-
-    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
 
     bus = InMemoryEventBus()
     session = make_session("claude-code")
@@ -1255,166 +1082,9 @@ async def test_run_process_pre_binds_claude_rollout_when_flag_enabled(
         {"session_id": expected_uuid, "cwd": Path("/workspace/project")}
     ]
     assert observer.bindings == [(claude_path, session.id)]
-
-
-@pytest.mark.asyncio
-async def test_run_process_pre_binds_codex_rollout_when_flag_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Codex pre-bind runs synchronously inside ``run()`` between spawn
-    and the stream-task setup. By the time the run loop starts waiting
-    on the subprocess, the binding is in place — no race against
-    watchfiles."""
-    from pathlib import Path
-
-    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
-
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    process = FakeProcess(returncode=0)
-    factory = FakeFactory(process)
-    observer = _RecordingObserver()
-    codex_path = Path("/tmp/codex-pre-bind.jsonl")
-    discovery = _RecordingDiscovery(codex_path=codex_path)
-
-    rp = RunProcess(
-        session=session,
-        run=run,
-        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
-        event_bus=bus,
-        process_factory=factory,
-        observer=observer,
-        rollout_discovery=discovery,
-    )
-    task = asyncio.create_task(rp.run())
-    process.finish()
-    await asyncio.wait_for(task, timeout=1)
-
-    assert len(discovery.codex_calls) == 1
-    assert discovery.codex_calls[0]["pid"] == process.pid
-    # Bind fired (before run finished); unbind on terminal-state cleanup
-    # has since cleared the orchestrator-side tracker, but the
-    # observer.bind_rollout call was already recorded.
-    assert (codex_path, session.id) in observer.bindings
-
-
-@pytest.mark.asyncio
-async def test_run_process_unbinds_rollout_on_terminal_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Once the run reaches a terminal state, RunProcess must call
-    ``observer.unbind_rollout`` so the binding map stays bounded — one
-    entry per active run, not per all runs ever."""
-    from pathlib import Path
-
-    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
-
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    process = FakeProcess(returncode=0)
-    factory = FakeFactory(process)
-    observer = _RecordingObserver()
-    codex_path = Path("/tmp/codex-unbind.jsonl")
-    discovery = _RecordingDiscovery(codex_path=codex_path)
-
-    rp = RunProcess(
-        session=session,
-        run=run,
-        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
-        event_bus=bus,
-        process_factory=factory,
-        observer=observer,
-        rollout_discovery=discovery,
-    )
-    task = asyncio.create_task(rp.run())
-    process.finish()
-    await asyncio.wait_for(task, timeout=1)
-
-    assert observer.bindings == [(codex_path, session.id)]
-    assert observer.unbindings == [codex_path]
-
-
-@pytest.mark.asyncio
-async def test_run_process_does_not_pre_bind_when_flag_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", raising=False)
-
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    process = FakeProcess(returncode=0)
-    factory = FakeFactory(process)
-    observer = _RecordingObserver()
-    discovery = _RecordingDiscovery()
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
-            event_bus=bus,
-            process_factory=factory,
-            observer=observer,
-            rollout_discovery=discovery,
-        ).run()
-    )
-    for _ in range(3):
-        await asyncio.sleep(0)
-    process.finish()
-    await asyncio.wait_for(task, timeout=1)
-
-    assert observer.bindings == []
-    assert discovery.codex_calls == []
-    assert discovery.claude_calls == []
-
-
-@pytest.mark.asyncio
-async def test_run_process_continues_when_discover_codex_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If codex fd discovery times out or errors, the run must still
-    complete normally — pre-binding is best-effort. A run.warning event
-    surfaces the failure so operators can investigate."""
-    from agent_harness.rollout_discovery import RolloutDiscoveryError
-
-    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
-
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    process = FakeProcess(returncode=0)
-    factory = FakeFactory(process)
-    observer = _RecordingObserver()
-    discovery = _RecordingDiscovery(
-        codex_error=RolloutDiscoveryError("fd never appeared for pid=12345")
-    )
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
-            event_bus=bus,
-            process_factory=factory,
-            observer=observer,
-            rollout_discovery=discovery,
-        ).run()
-    )
-    for _ in range(5):
-        await asyncio.sleep(0)
-    process.finish()
-    result = await asyncio.wait_for(task, timeout=1)
-
-    assert result.status == "completed"
-    assert observer.bindings == []
-
-    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
-    warnings = [e for e in events if e.event == "run.warning"]
-    assert warnings, [e.event for e in events]
-    assert "discovery" in warnings[0].data.get("reason", "").lower() or warnings[0].data.get("error_type")
+    # On terminal-state cleanup, claude's bound path is unbound — keeps
+    # observer._path_to_session bounded across the harness lifetime.
+    assert observer.unbindings == [claude_path]
 
 
 # --- Phase 2: supervisor stops emitting message.delta; new process.stderr -----

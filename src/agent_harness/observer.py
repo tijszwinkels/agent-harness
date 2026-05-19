@@ -33,7 +33,12 @@ from agent_harness.repository import (
     MaterializationDeferred,
     SessionNotFoundError,
 )
-from agent_harness.usage import parse_claude_usage, parse_codex_token_count
+from agent_harness.usage import (
+    parse_claude_context_snapshot,
+    parse_claude_usage,
+    parse_codex_context_snapshot,
+    parse_codex_token_count,
+)
 
 try:
     from watchfiles import awatch
@@ -1057,13 +1062,23 @@ def _parse_claude_record(
         # ``run.usage`` event with ``run_id=None`` — ``publish_line``
         # resolves the active run id before publishing.
         if record_type == "assistant":
-            usage = parse_claude_usage(message.get("usage"))
+            raw_usage = message.get("usage")
+            usage = parse_claude_usage(raw_usage)
             if usage is not None:
+                # Snapshot rides on the same run.usage event (option A
+                # from the spec; matches the existing context_window
+                # pattern). ``parse_claude_context_snapshot`` returns
+                # 0 for an all-zero usage block — skip emission in
+                # that case so the materializer doesn't overwrite an
+                # earlier real snapshot with a meaningless zero.
+                snapshot = parse_claude_context_snapshot(raw_usage)
+                context_used = snapshot if snapshot else None
                 events.append(
                     _run_usage_event(
                         identity=identity,
                         usage=usage,
                         context_window=None,
+                        context_used=context_used,
                         offset=offset,
                     )
                 )
@@ -1117,12 +1132,19 @@ def _parse_codex_record(
     # ``(None, None)`` for that case and we skip emission.
     if record_type == "event_msg" and payload_type == "token_count":
         usage, context_window = parse_codex_token_count(payload)
-        if usage is not None or context_window is not None:
+        # Snapshot from total_token_usage rides on the same run.usage
+        # event (option A; matches the existing context_window
+        # pattern). Returns None when info is missing/null/zero — the
+        # _run_usage_event omission then preserves any earlier
+        # snapshot on the session.
+        context_used = parse_codex_context_snapshot(payload)
+        if usage is not None or context_window is not None or context_used is not None:
             events.append(
                 _run_usage_event(
                     identity=identity,
                     usage=usage or Usage(),
                     context_window=context_window,
+                    context_used=context_used,
                     offset=offset,
                 )
             )
@@ -1308,16 +1330,25 @@ def _run_usage_event(
     identity: TranscriptIdentity,
     usage: Usage,
     context_window: int | None,
+    context_used: int | None,
     offset: int | None,
 ) -> Event:
     """Build a ``run.usage`` event with ``run_id=None``.
 
     The parser has no repository access; ``publish_line`` resolves the
     active run id for the session and stamps it on the event before
-    publishing. Carries ``context_window`` for codex (option (b) of
-    the Phase 3 spec's open question: usage and window share one
-    event so the materializer updates both Run.usage and Session.stats
-    in a single pass).
+    publishing. The event carries three sibling fields that the
+    materializer applies in one pass:
+
+    - ``usage`` (additive on Run.usage + Session.stats.tokens)
+    - ``context_window`` (overwrite Session.stats.context_window;
+      codex-only)
+    - ``context_used`` (overwrite Session.stats.context_used; both
+      backends — option A from specs/2026-05-19-context-used.md)
+
+    Omitting an optional field from event.data preserves any prior
+    value on Session.stats — only writes that observe a fresh value
+    move the snapshot.
     """
     data: dict[str, Any] = {
         **_source_data(identity, offset=offset),
@@ -1325,6 +1356,8 @@ def _run_usage_event(
     }
     if context_window is not None:
         data["context_window"] = context_window
+    if context_used is not None:
+        data["context_used"] = context_used
     return Event(
         event="run.usage",
         session_id=identity.session_id,

@@ -229,6 +229,22 @@ class ExternalTranscriptObserver:
         # tail_file tick for the same path. Distinct from
         # ``_path_to_session``: that's "matched, route to session_id";
         # this is "checked, falls through to filename pattern".
+        #
+        # TODO(phase-3+): two known edges worth hardening (Aegis-flagged
+        # worth-notings on PR #14):
+        # (a) Cache poisoning when a tail_file fires BEFORE the
+        #     expectation is registered. Production is shielded because
+        #     ``_pre_register_codex_expectation_if_codex`` runs before
+        #     ``_process_factory(...)``, but the docstring promises
+        #     content-based race-tolerance. Consider clearing this
+        #     cache on every new ``expect_codex_rollout``, or only
+        #     memoizing the "no session_meta head" structural case
+        #     (not the "no expectation matched right now" case).
+        # (b) For genuinely-external codex rollouts (no expectation
+        #     will ever be registered), this cache accumulates one
+        #     entry per rollout the observer ever encounters. Bounded
+        #     by the rollout's own lifecycle, but worth a periodic
+        #     sweep on long-running harnesses.
         self._codex_resolution_cache: dict[Path, bool] = {}
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the

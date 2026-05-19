@@ -1456,6 +1456,49 @@ async def test_expect_codex_rollout_closest_timestamp_wins(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_expect_codex_rollout_equidistant_tiebreaker(tmp_path) -> None:
+    """When two expectations sit equidistant from the rollout's
+    session_meta timestamp, the earliest-registered one wins.
+
+    Python's stable sort gives us this for free: in
+    ``_find_matching_expectation`` we sort by absolute delta, and ties
+    preserve insertion order. This test locks the contract in so a
+    future refactor (e.g. switching to a min-heap) can't silently
+    flip the tiebreaker behavior — which would steal codex rollouts
+    from the first spawn in a back-to-back same-cwd race.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    observer = ExternalTranscriptObserver(bus, clock=clock)
+
+    # Both expectations registered at the SAME instant. (Same clock
+    # value; no advance between calls.)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_earliest")
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_later")
+
+    # Rollout's session_meta ts is exactly the registration instant —
+    # both expectations are equidistant (delta = 0).
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0108-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:30:00.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published
+    for event in published:
+        assert event.session_id == "ses_earliest", event
+
+
+@pytest.mark.asyncio
 async def test_expectation_expires_after_ttl(tmp_path) -> None:
     """An expectation that's been sitting for longer than the TTL must
     NOT match a freshly-arriving rollout. Falls through to filename."""

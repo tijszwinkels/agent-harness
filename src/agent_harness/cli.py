@@ -85,11 +85,13 @@ def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings
         kwargs["event_bus"] = event_bus
     if args.execute_runs:
         kwargs["event_bus"] = event_bus
-        # The observer is constructed by api.py's lifespan and late-bound
-        # onto RunManager via ``set_observer``. A default ``RolloutDiscovery``
-        # is wired here so the env-var-gated pre-binding path is reachable
-        # in production once the observer arrives. Discovery without an
-        # observer is a no-op (RunProcess gates on both being present).
+        # The observer is constructed by api.py's lifespan and
+        # late-bound onto RunManager via ``set_observer``. A default
+        # ``RolloutDiscovery`` is wired here so claude pre-bind (the
+        # only RolloutDiscovery consumer post-Phase-2) is reachable
+        # once the observer arrives. Codex pre-bind uses the
+        # observer's expectation registry directly — no discovery
+        # involvement.
         kwargs["run_manager"] = RunManager(
             event_bus=event_bus,
             rollout_discovery=RolloutDiscovery(),

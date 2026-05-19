@@ -417,10 +417,11 @@ def _lifespan(
             try:
                 observer_settings.validate()
                 observer = ExternalTranscriptObserver(event_bus, repository=repository)
-                # Phase 1 pre-binding: hand the live observer to the
-                # RunManager so RunProcess can call ``bind_rollout``.
-                # The env-var gate inside RunProcess still decides
-                # whether any probing actually happens.
+                # Hand the live observer to the RunManager so
+                # RunProcess can call ``bind_rollout`` (claude pre-bind)
+                # and ``expect_codex_rollout`` (codex pre-bind). Both
+                # paths are unconditional for harness-origin sessions
+                # — pre-bind is always on as of Phase 2.
                 if run_manager is not None:
                     setter = getattr(run_manager, "set_observer", None)
                     if callable(setter):

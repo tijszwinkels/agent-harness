@@ -67,60 +67,6 @@ def test_sqlite_repository_persists_materialized_external_events_after_reopen(tm
     reopened.close()
 
 
-def test_sqlite_repository_append_event_materializes_messages(tmp_path) -> None:
-    db_path = tmp_path / "harness.db"
-    repository = open_sqlite_repository(db_path)
-    session = repository.create_session(
-        CreateSessionRequest(
-            backend="codex",
-            model="gpt-5.4",
-            project=Project(path="/repo", name="repo"),
-        )
-    )
-    message = Message(role="assistant", blocks=[{"type": "text", "text": "observed"}])
-
-    published = repository.append_event(
-        Event(event="message", session_id=session.id, data={"message": message.model_dump(mode="json")})
-    )
-    repository.close()
-
-    reopened = open_sqlite_repository(db_path)
-
-    assert published.sequence == 1
-    assert [event.sequence for event in reopened.list_events(session_id=session.id)] == [1]
-    messages = reopened.list_messages(session.id)
-    assert [item.id for item in messages] == [message.id]
-    assert messages[0].blocks[0].text == "observed"
-    assert reopened.get_session(session.id).stats.messages == 1
-    reopened.close()
-
-
-def test_sqlite_repository_append_event_preserves_repeated_live_messages(tmp_path) -> None:
-    repository = open_sqlite_repository(tmp_path / "harness.db")
-    session = repository.create_session(
-        CreateSessionRequest(
-            backend="codex",
-            model="gpt-5.4",
-            project=Project(path="/repo", name="repo"),
-        )
-    )
-
-    first = Message(role="assistant", blocks=[{"type": "text", "text": "Done"}])
-    second = Message(role="assistant", blocks=[{"type": "text", "text": "Done"}])
-    repository.append_event(
-        Event(event="message", session_id=session.id, run_id="run_1", data={"message": first.model_dump(mode="json")})
-    )
-    repository.append_event(
-        Event(event="message", session_id=session.id, run_id="run_2", data={"message": second.model_dump(mode="json")})
-    )
-
-    messages = repository.list_messages(session.id)
-    assert [message.id for message in messages] == [first.id, second.id]
-    assert [message.blocks[0].text for message in messages] == ["Done", "Done"]
-    assert repository.get_session(session.id).stats.messages == 2
-    repository.close()
-
-
 def test_sqlite_repository_append_event_allocates_next_sequence_after_reopen(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)
@@ -709,3 +655,46 @@ def test_observer_offsets_table_creation_is_idempotent_on_legacy_db(tmp_path) ->
         assert repo.get_observer_offsets() == {"/transcripts/a.jsonl": 42}
     finally:
         repo.close()
+
+
+def test_sqlite_repository_append_event_no_longer_materializes_message(tmp_path) -> None:
+    """Phase 2: ``append_event`` is a pure event-row insert. The
+    message-materialization carve-out (previously gated on
+    ``data.origin != "external"``) is removed; the observer's
+    ``materialize_event`` path is now the sole writer to the messages
+    table. The event row itself is still inserted, but the messages
+    table stays empty until materialize_event runs."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path="/repo", name="repo"),
+            )
+        )
+        message = Message(role="assistant", blocks=[{"type": "text", "text": "should not materialize"}])
+
+        published = repository.append_event(
+            Event(
+                event="message",
+                session_id=session.id,
+                data={"message": message.model_dump(mode="json")},
+            )
+        )
+
+        # Event row was inserted (the durable bus relies on this).
+        assert published.sequence is not None
+        events = repository.list_events(session_id=session.id)
+        assert any(e.event == "message" for e in events)
+
+        # But the message did NOT land in the messages table — that's
+        # the observer's job now via ``materialize_event``. The session
+        # also kept its baseline (one user message from create_run-less
+        # path; here zero because we didn't call create_run).
+        messages = repository.list_messages(session.id)
+        assert messages == []
+        # The default stats.messages from create_session is 0.
+        assert repository.get_session(session.id).stats.messages == 0
+    finally:
+        repository.close()

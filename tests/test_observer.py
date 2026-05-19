@@ -1306,3 +1306,348 @@ async def test_unbound_rollout_falls_back_to_filename_pattern(tmp_path) -> None:
     assert published
     for event in published:
         assert event.session_id == expected_id, event
+
+
+# --- Phase 2: codex rollout expectation registry -------------------------
+
+
+def _write_codex_rollout_with_session_meta(
+    base_dir: Path,
+    *,
+    rollout_uuid: str,
+    cwd: str,
+    session_meta_ts: str,
+    body_lines: list[str] | None = None,
+) -> Path:
+    transcript = (
+        base_dir / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    session_meta_line = (
+        '{"timestamp":"' + session_meta_ts + '","type":"session_meta",'
+        '"payload":{"id":"' + rollout_uuid + '","timestamp":"' + session_meta_ts + '",'
+        '"cwd":"' + cwd + '"}}'
+    )
+    default_body = [
+        '{"type":"turn_context","payload":{"cwd":"' + cwd + '","model":"gpt-5.4"}}',
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}',
+    ]
+    lines = [session_meta_line] + (body_lines if body_lines is not None else default_body)
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return transcript
+
+
+@pytest.mark.asyncio
+async def test_expect_codex_rollout_matches_by_cwd_and_timestamp(tmp_path) -> None:
+    """The orchestrator registers an expectation at codex spawn time;
+    the observer matches incoming rollouts against active expectations
+    by ``session_meta.cwd`` + a ±30s timestamp window."""
+    from datetime import UTC, datetime
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(bus, clock=lambda: fixed_now)
+
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_harness_match")
+
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0100-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:30:05.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published, "expected events to be published from the matched rollout"
+    for event in published:
+        assert event.session_id == "ses_harness_match", event
+
+
+@pytest.mark.asyncio
+async def test_expect_codex_rollout_falls_through_when_cwd_differs(tmp_path) -> None:
+    """Expectation for cwd A; rollout under cwd B. The observer must
+    fall back to the filename-pattern path (external codex_<uuid> row),
+    leaving the expectation unconsumed for the real rollout that may
+    still arrive."""
+    from datetime import UTC, datetime
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(bus, clock=lambda: fixed_now)
+    observer.expect_codex_rollout(cwd=Path("/repo-a"), session_id="ses_harness_a")
+
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0101-0000-0000-0000-000000000000",
+        cwd="/repo-b",
+        session_meta_ts="2026-05-19T10:30:05.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    expected_id = "codex_019e0101-0000-0000-0000-000000000000"
+    assert published
+    for event in published:
+        assert event.session_id == expected_id, event
+
+
+@pytest.mark.asyncio
+async def test_expect_codex_rollout_falls_through_when_timestamp_outside_window(tmp_path) -> None:
+    """Expectation registered now; rollout's session_meta timestamp is
+    far in the future (well past the ±30s window). Falls through."""
+    from datetime import UTC, datetime
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(bus, clock=lambda: fixed_now)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_harness_stale")
+
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0102-0000-0000-0000-000000000000",
+        cwd="/repo",
+        # 5 minutes after the expectation was registered — outside the
+        # 30s match window.
+        session_meta_ts="2026-05-19T10:35:00.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    expected_id = "codex_019e0102-0000-0000-0000-000000000000"
+    assert published
+    for event in published:
+        assert event.session_id == expected_id, event
+
+
+@pytest.mark.asyncio
+async def test_expect_codex_rollout_closest_timestamp_wins(tmp_path) -> None:
+    """Two expectations with the same cwd, registered a few seconds
+    apart; one rollout arrives whose session_meta timestamp is closer
+    to the second expectation. The second one must win."""
+    from datetime import UTC, datetime, timedelta
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    observer = ExternalTranscriptObserver(bus, clock=clock)
+
+    # First spawn at t=0
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_first")
+    # Second spawn at t=+10s
+    now = base + timedelta(seconds=10)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_second")
+
+    # Rollout arrives with session_meta ts at t=+11s — much closer to
+    # the second expectation than the first.
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0103-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:30:11.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published
+    for event in published:
+        assert event.session_id == "ses_second", event
+
+
+@pytest.mark.asyncio
+async def test_expect_codex_rollout_equidistant_tiebreaker(tmp_path) -> None:
+    """When two expectations sit equidistant from the rollout's
+    session_meta timestamp, the earliest-registered one wins.
+
+    Python's stable sort gives us this for free: in
+    ``_find_matching_expectation`` we sort by absolute delta, and ties
+    preserve insertion order. This test locks the contract in so a
+    future refactor (e.g. switching to a min-heap) can't silently
+    flip the tiebreaker behavior — which would steal codex rollouts
+    from the first spawn in a back-to-back same-cwd race.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    observer = ExternalTranscriptObserver(bus, clock=clock)
+
+    # Both expectations registered at the SAME instant. (Same clock
+    # value; no advance between calls.)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_earliest")
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_later")
+
+    # Rollout's session_meta ts is exactly the registration instant —
+    # both expectations are equidistant (delta = 0).
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0108-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:30:00.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published
+    for event in published:
+        assert event.session_id == "ses_earliest", event
+
+
+@pytest.mark.asyncio
+async def test_expectation_expires_after_ttl(tmp_path) -> None:
+    """An expectation that's been sitting for longer than the TTL must
+    NOT match a freshly-arriving rollout. Falls through to filename."""
+    from datetime import UTC, datetime, timedelta
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    observer = ExternalTranscriptObserver(
+        bus, clock=clock, expectation_ttl_seconds=10.0
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_expired")
+
+    # 60s later — well past the 10s TTL.
+    now = base + timedelta(seconds=60)
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0104-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:31:00.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    expected_id = "codex_019e0104-0000-0000-0000-000000000000"
+    assert published
+    for event in published:
+        assert event.session_id == expected_id, event
+
+
+@pytest.mark.asyncio
+async def test_expectation_matches_after_partial_ttl_elapsed(tmp_path) -> None:
+    """Regression guard for the TTL/window asymmetry. The expectation
+    TTL (60s default) must be strictly greater than the timestamp
+    match window (30s) — otherwise a slow codex spawn whose
+    ``session_meta.timestamp`` is still within the window from
+    ``registered_at`` would find the expectation already evicted,
+    silently fall through to filename-pattern, and re-instate the
+    Heron-PR-#12 dupe-session symptom.
+
+    Scenario: expectation registered at t=0; rollout flushed at t=25s
+    with ``session_meta.timestamp`` matching the registration time.
+    25s is past the (insufficient) old 10s TTL but well inside the
+    timestamp-window — match must succeed under Phase 2's 60s TTL.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    # Use the production default TTL (60s) — this is the contract
+    # under test.
+    observer = ExternalTranscriptObserver(bus, clock=clock)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_slow_codex")
+
+    # 25s later: slow codex spawn has finally flushed session_meta.
+    # Within the 60s TTL; the rollout's session_meta timestamp matches
+    # the original registration time (well within the 30s window).
+    now = base + timedelta(seconds=25)
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid="019e0107-0000-0000-0000-000000000000",
+        cwd="/repo",
+        session_meta_ts="2026-05-19T10:30:00.000Z",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published
+    for event in published:
+        assert event.session_id == "ses_slow_codex", event
+
+
+@pytest.mark.asyncio
+async def test_session_meta_peek_returns_none_for_partial_flush(tmp_path) -> None:
+    """First line of the rollout has no trailing newline yet (codex is
+    still writing). The observer must not match an expectation against
+    incomplete data — it returns no events and waits for the next
+    tail_file tick. The expectation stays alive for that retry."""
+    from datetime import UTC, datetime
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(bus, clock=lambda: fixed_now)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_partial")
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0105-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    # First line is partial (no trailing newline).
+    rollout.write_text(
+        '{"timestamp":"2026-05-19T10:30:00Z","type":"session_meta","payload":'
+        '{"id":"019e0105-0000-0000-0000-000000000000","cwd":"/re',
+        encoding="utf-8",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published == []
+
+    # Now the writer flushes the rest. tail_file picks up where it left
+    # off; the expectation should still match.
+    rollout.write_text(
+        '{"timestamp":"2026-05-19T10:30:00Z","type":"session_meta","payload":'
+        '{"id":"019e0105-0000-0000-0000-000000000000",'
+        '"timestamp":"2026-05-19T10:30:00Z","cwd":"/repo"}}\n'
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    published = await observer.tail_file(rollout)
+    assert published
+    for event in published:
+        assert event.session_id == "ses_partial", event
+
+
+@pytest.mark.asyncio
+async def test_session_meta_peek_skips_non_session_meta_first_line(tmp_path) -> None:
+    """When the first complete line is not a ``session_meta`` record,
+    the observer can't extract cwd/timestamp from it, so the
+    expectation can't be matched. Behavior falls back to filename."""
+    from datetime import UTC, datetime
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(bus, clock=lambda: fixed_now)
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id="ses_no_meta")
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0106-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    published = await observer.tail_file(rollout)
+    expected_id = "codex_019e0106-0000-0000-0000-000000000000"
+    assert published
+    for event in published:
+        assert event.session_id == expected_id, event

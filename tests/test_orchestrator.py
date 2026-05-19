@@ -1438,3 +1438,162 @@ async def test_codex_run_unbinds_path_on_terminal_state(tmp_path) -> None:
     assert observer._path_to_session == {}, (
         f"path bindings leaked after terminal state: {observer._path_to_session}"
     )
+
+
+# --- Phase 4: watchdog rewires to observer-emitted run.end_turn --------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_triggers_on_observer_run_end_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 4: the post-end_turn cleanup watchdog subscribes to the
+    event bus (filtered by ``session_id`` + ``data.run_id``) instead
+    of polling an internal stdout-derived signal. A ``run.end_turn``
+    event published via the bus must arm the SIGTERM grace timer."""
+    from agent_harness.events import InMemoryEventBus
+    from agent_harness.models import Event
+    from agent_harness.orchestrator import END_TURN_GRACE_SECONDS
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(stdout=[], close_stdout=False, exit_on_sigterm=True)
+    install_fake_process_group(monkeypatch, process)
+    clock = FakeClock()
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    task = asyncio.create_task(rp.run())
+    # Let the watchdog tasks start.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Publish an observer-side run.end_turn through the bus.
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "codex"},
+        )
+    )
+    # Wait for the watchdog to observe it.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Past the post-end_turn grace — SIGTERM should fire.
+    clock.advance(END_TURN_GRACE_SECONDS + 1)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert signal.SIGTERM in process.group_signals
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_run_end_turn_for_other_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog filters by ``data.run_id``. A ``run.end_turn`` for
+    a different run (same session, different id) must NOT arm this
+    RunProcess's cleanup."""
+    from agent_harness.events import InMemoryEventBus
+    from agent_harness.models import Event
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(stdout=[], close_stdout=False)
+    install_fake_process_group(monkeypatch, process)
+    clock = FakeClock()
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    task = asyncio.create_task(rp.run())
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # Publish run.end_turn for a different run.
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id="run_some_other_run",
+            data={"backend": "codex"},
+        )
+    )
+    # Advance well past the grace window.
+    clock.advance(120)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    # No SIGTERM fired — our run wasn't the target.
+    assert process.group_signals == []
+
+    process.finish()
+    process.stdout.close()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_stream_lines_no_longer_runs_stdout_parser() -> None:
+    """Phase 4 removes the supervisor's stdout end-turn detection. The
+    stream pump runs the heartbeat tick + stderr ``process.stderr``
+    forwarding only; no parsing, no ``_end_turn_event`` set.
+    Regression guard against re-introducing the dual-path detector."""
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    end_turn_line = json.dumps(
+        {"type": "result", "subtype": "success", "stop_reason": "end_turn"}
+    ).encode()
+    process = FakeProcess(stdout=[end_turn_line + b"\n"], returncode=0)
+    factory = FakeFactory(process)
+    clock = FakeClock()
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("claude", "--print"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=factory,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    task = asyncio.create_task(rp.run())
+    for _ in range(6):
+        await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    # The stdout end-turn line did NOT set the supervisor's internal
+    # signal: Phase 4 deleted that codepath. The end_turn_event
+    # attribute may not even exist anymore. If it does, it stays unset.
+    assert not getattr(rp, "_end_turn_event", asyncio.Event()).is_set()
+
+
+# --- Phase 4: drift guard ---------------------------------------------------
+
+
+def test_session_does_not_carry_codex_internal_id() -> None:
+    """Phase 4: ``Session.codex_internal_id`` is retired. The field
+    only ever lived on the abandoned PR #12 branch (never merged to
+    main); Phase 1's expectation registry made it redundant. Lock in
+    its absence."""
+    fields = Session.model_fields
+    assert "codex_internal_id" not in fields, (
+        f"Session.codex_internal_id should be retired; fields={list(fields)}"
+    )

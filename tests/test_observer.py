@@ -1833,3 +1833,180 @@ async def test_observer_skips_usage_publish_when_no_active_run(tmp_path) -> None
 
     usage_events = [e for e in published if e.event == "run.usage"]
     assert usage_events == []
+
+
+# --- Phase 4: observer emits run.end_turn ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_run_end_turn_for_claude_assistant_with_end_turn_stop_reason(tmp_path) -> None:
+    """A claude rollout's ``assistant`` record with
+    ``message.stop_reason == "end_turn"`` must produce a ``run.end_turn``
+    event keyed to the session's active harness run. This drives the
+    watchdog's post-end-turn cleanup grace via the event bus (Phase 4
+    moves end-turn detection out of the supervisor's stdout pump)."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-opus-4-7",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    raw = session.id.removeprefix("ses_")
+    claude_uuid = (
+        f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    )
+    rollout = (
+        tmp_path / ".claude" / "projects" / "-repo" / f"{claude_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
+        '"message":{"role":"assistant","model":"claude-opus",'
+        '"content":[{"type":"text","text":"done"}],'
+        '"stop_reason":"end_turn",'
+        '"usage":{"input_tokens":1,"output_tokens":1}}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    published = await observer.tail_file(rollout)
+
+    end_turns = [e for e in published if e.event == "run.end_turn"]
+    assert end_turns, [e.event for e in published]
+    assert end_turns[0].session_id == session.id
+    assert end_turns[0].run_id == run.id
+
+
+@pytest.mark.asyncio
+async def test_observer_emits_run_end_turn_for_codex_task_complete(tmp_path) -> None:
+    """Codex's ``event_msg/task_complete`` payload signals the end of
+    a turn. The observer publishes a ``run.end_turn`` event with the
+    active run id — same wire shape as the claude path."""
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    rollout_uuid = "019e0400-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"task_complete"}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    observer.bind_rollout(rollout, session.id)
+
+    published = await observer.tail_file(rollout)
+
+    end_turns = [e for e in published if e.event == "run.end_turn"]
+    assert end_turns, [e.event for e in published]
+    assert end_turns[0].run_id == run.id
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_emit_run_end_turn_without_active_run(tmp_path) -> None:
+    """Pure-external session with no harness Run can't attribute the
+    end-turn to anything — observer skips emission. Same gap shape as
+    ``run.usage`` (Falcon's worth-noting #1 from PR #11)."""
+    repository = InMemoryRepository()
+
+    rollout_uuid = "019e0401-0000-0000-0000-000000000000"
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"task_complete"}}\n',
+        encoding="utf-8",
+    )
+
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+    published = await observer.tail_file(rollout)
+
+    end_turns = [e for e in published if e.event == "run.end_turn"]
+    assert end_turns == []
+
+
+# --- Phase 4: turn_context no longer warns -----------------------------------
+
+
+def test_parser_does_not_warn_on_turn_context_without_payload_type(caplog) -> None:
+    """Codex's ``turn_context`` record (no payload.type, just cwd +
+    model) is a known-skipped shape — the observer extracts the
+    session info via ``_session_event_if_complete`` and shouldn't log
+    an ``Unsupported Codex transcript shape`` warning for it.
+    Orion's worth-noting #3 on PR #15."""
+    import logging
+
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026,
+            month=5,
+            day=19,
+            timestamp="2026-05-19T10-30-00",
+            rollout_uuid="019e0402-0000-0000-0000-000000000000",
+            home="/tmp/home",
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        parse_transcript_record(
+            {"type": "turn_context", "payload": {"cwd": "/repo", "model": "gpt-5.4"}},
+            identity=identity,
+        )
+
+    assert "Unsupported Codex transcript shape" not in caplog.text
+
+
+# --- Phase 4: _source_data origin tag cleanup --------------------------------
+
+
+def test_source_data_does_not_carry_origin_external_tag() -> None:
+    """Phase 4: ``_source_data`` no longer stamps ``origin: "external"``
+    on every transcript-derived event. The tag was load-bearing under
+    Phase 2's dual-path materialization (storage carve-outs gated on
+    it) but Phase 3's single materialization point removed that need.
+
+    Verify the helper produces a payload without the key — backend,
+    transcript_path, and optional offset remain."""
+    from agent_harness.observer import _source_data
+
+    identity = transcript_identity_from_path(
+        codex_transcript_path(
+            year=2026, month=5, day=19,
+            timestamp="2026-05-19T10-30-00",
+            rollout_uuid="019e0403-0000-0000-0000-000000000000",
+            home="/tmp/home",
+        )
+    )
+    data = _source_data(identity, offset=42)
+    assert "origin" not in data
+    assert data["backend"] == "codex"
+    assert data["offset"] == 42
+    assert "transcript_path" in data

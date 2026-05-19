@@ -1002,17 +1002,21 @@ async def test_run_manager_refuses_to_interrupt_active_external_runs() -> None:
 class _RecordingObserver:
     """Minimal stand-in for ``ExternalTranscriptObserver``. The
     orchestrator's pre-bind path calls ``bind_rollout`` at spawn and
-    ``unbind_rollout`` once the run reaches a terminal state."""
+    ``unbind_session`` once the run reaches a terminal state."""
 
     def __init__(self) -> None:
         self.bindings: list[tuple[object, str]] = []
         self.unbindings: list[object] = []
+        self.unbound_sessions: list[str] = []
 
     def bind_rollout(self, path, session_id: str) -> None:
         self.bindings.append((path, session_id))
 
     def unbind_rollout(self, path) -> None:
         self.unbindings.append(path)
+
+    def unbind_session(self, session_id: str) -> None:
+        self.unbound_sessions.append(session_id)
 
 
 class _RecordingDiscovery:
@@ -1082,9 +1086,11 @@ async def test_run_process_pre_binds_claude_rollout() -> None:
         {"session_id": expected_uuid, "cwd": Path("/workspace/project")}
     ]
     assert observer.bindings == [(claude_path, session.id)]
-    # On terminal-state cleanup, claude's bound path is unbound — keeps
-    # observer._path_to_session bounded across the harness lifetime.
-    assert observer.unbindings == [claude_path]
+    # On terminal-state cleanup, every binding for this session is
+    # evicted via ``unbind_session`` — keeps observer._path_to_session
+    # bounded across the harness lifetime. The session-keyed eviction
+    # converges the claude and codex cleanup codepaths.
+    assert observer.unbound_sessions == [session.id]
 
 
 # --- Phase 2: supervisor stops emitting message.delta; new process.stderr -----
@@ -1093,13 +1099,18 @@ async def test_run_process_pre_binds_claude_rollout() -> None:
 class _ExpectationRecordingObserver:
     """Phase 2 stand-in for ``ExternalTranscriptObserver``. Replaces the
     Phase 1 ``bind_rollout`` + ``unbind_rollout`` orchestrator surface
-    with ``expect_codex_rollout`` for the new spawn-side contract."""
+    with ``expect_codex_rollout`` for the new spawn-side contract.
+
+    Records ``unbind_session`` for the terminal-state cleanup path
+    that converges claude + codex evictions.
+    """
 
     def __init__(self) -> None:
         self.expectations: list[tuple[object, str]] = []
         # Phase 1 plumbing — claude pre-bind is unchanged in Phase 2.
         self.bindings: list[tuple[object, str]] = []
         self.unbindings: list[object] = []
+        self.unbound_sessions: list[str] = []
 
     def expect_codex_rollout(self, *, cwd, session_id: str) -> None:
         self.expectations.append((cwd, session_id))
@@ -1109,6 +1120,9 @@ class _ExpectationRecordingObserver:
 
     def unbind_rollout(self, path) -> None:
         self.unbindings.append(path)
+
+    def unbind_session(self, session_id: str) -> None:
+        self.unbound_sessions.append(session_id)
 
 
 @pytest.mark.asyncio
@@ -1285,10 +1299,13 @@ async def test_pre_bind_codex_registers_expectation() -> None:
     assert observer.expectations == [
         (Path("/workspace/project"), session.id)
     ]
-    # No bind/unbind for codex anymore — the expectation registry
-    # replaces the bind_rollout codepath for codex spawns.
+    # No path-keyed bind/unbind on the codex spawn side (the
+    # expectation registry handles routing). But terminal-state
+    # cleanup still calls ``unbind_session`` so any path the
+    # observer bound from a content-match gets evicted.
     assert observer.bindings == []
     assert observer.unbindings == []
+    assert observer.unbound_sessions == [session.id]
 
 
 @pytest.mark.asyncio
@@ -1346,3 +1363,78 @@ async def test_stream_lines_updates_last_activity_on_stdout(
     # stdout heartbeat — observer is still the sole message writer.
     events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     assert all(e.event != "message.delta" for e in events), [e.event for e in events]
+
+
+@pytest.mark.asyncio
+async def test_codex_run_unbinds_path_on_terminal_state(tmp_path) -> None:
+    """Regression for Aegis finding #3: under Phase 2, codex matches
+    populate ``observer._path_to_session`` via content-match — the
+    orchestrator never sees the path. The terminal-state cleanup must
+    walk by session_id (``observer.unbind_session``) so the entry
+    actually gets evicted. Without this, every codex harness run
+    leaked one ``_path_to_session`` entry for the life of the
+    process.
+
+    Uses a real observer (not the recording fake) so the assertion
+    pokes into the actual map state.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from agent_harness.observer import ExternalTranscriptObserver
+
+    bus = InMemoryEventBus()
+    base = datetime(2026, 5, 19, 10, 30, 0, tzinfo=UTC)
+    now = base
+
+    def clock() -> datetime:
+        return now
+
+    observer = ExternalTranscriptObserver(bus, clock=clock)
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+
+    # Set up a rollout the observer will content-match against the
+    # expectation the orchestrator is about to register.
+    rollout_uuid = "019e0200-0000-0000-0000-000000000000"
+    transcript = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / f"rollout-2026-05-19T10-30-00-{rollout_uuid}.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"timestamp":"2026-05-19T10:30:00.000Z","type":"session_meta",'
+        '"payload":{"id":"' + rollout_uuid + '",'
+        '"timestamp":"2026-05-19T10:30:00.000Z","cwd":"' + session.project.path + '"}}\n'
+        '{"type":"turn_context","payload":{"cwd":"' + session.project.path + '","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd=session.project.path),
+        event_bus=bus,
+        process_factory=factory,
+        observer=observer,
+    )
+
+    task = asyncio.create_task(rp.run())
+    # Let pre-bind register the expectation, then materialize the
+    # binding by tailing the rollout.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await observer.tail_file(transcript)
+
+    # Sanity: the content-match landed a path binding.
+    assert observer._path_to_session, "expectation match should have recorded a binding"
+
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    # Terminal-state cleanup must have evicted the binding.
+    assert observer._path_to_session == {}, (
+        f"path bindings leaked after terminal state: {observer._path_to_session}"
+    )

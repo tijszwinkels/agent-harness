@@ -274,16 +274,44 @@ class ExternalTranscriptObserver:
     def unbind_rollout(self, path: str | Path) -> None:
         """Drop a previously-bound path from the resolver map.
 
-        Called by the orchestrator when a harness run reaches a terminal
-        state. Without eviction, ``_path_to_session`` would grow by one
-        entry per harness run across the whole harness lifetime — each
-        codex run opens a fresh rollout file, and bindings for finished
-        runs are dead weight. Idempotent: missing entries are a no-op.
+        Used for explicit path-based eviction (claude pre-bind knows
+        the exact path it bound). Codex matches go through
+        ``unbind_session`` instead — the orchestrator doesn't know
+        which rollout path the observer ended up matching. Idempotent.
         """
         self._path_to_session.pop(Path(path), None)
         # Forget any "checked-no-match" memoization too, so a fresh
         # session_meta peek can run if the rollout reappears.
         self._codex_resolution_cache.pop(Path(path), None)
+
+    def unbind_session(self, session_id: str) -> None:
+        """Evict every path binding pointing at ``session_id``.
+
+        Called by the orchestrator's ``RunProcess.run()`` finally
+        block unconditionally for harness-origin sessions. Walks
+        ``_path_to_session`` and removes any entry whose value matches.
+        This is the cleanup hook for codex (where the observer
+        records the binding from the content-matched rollout path
+        the orchestrator never sees), but it also covers the claude
+        path uniformly so the two backends converge on one eviction
+        codepath.
+
+        Without this hook ``_path_to_session`` would grow by one
+        entry per codex harness run across the whole harness lifetime
+        — each codex run opens a fresh rollout file and the binding
+        for the finished run is dead weight. Same growth pattern
+        Phase 1 fixed for claude; Phase 2 introduces the
+        codex-side variant that needed its own eviction. Idempotent:
+        no matching paths is a no-op.
+        """
+        to_remove = [
+            path
+            for path, bound_sid in self._path_to_session.items()
+            if bound_sid == session_id
+        ]
+        for path in to_remove:
+            self._path_to_session.pop(path, None)
+            self._codex_resolution_cache.pop(path, None)
 
     def expect_codex_rollout(self, *, cwd: Path | str, session_id: str) -> None:
         """Register a hint that a codex rollout matching ``cwd`` is about

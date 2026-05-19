@@ -352,11 +352,13 @@ class RunProcess:
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
         finally:
             await self._finish_watchdogs(watchdog_tasks)
-            # Drop the rollout binding now that the subprocess is done —
-            # keeps observer._path_to_session bounded across the harness
-            # lifetime (one entry per *active* harness run, not per all
-            # runs ever).
-            self._unbind_rollout_if_bound()
+            # Drop every rollout binding pointing at this session —
+            # keeps ``observer._path_to_session`` bounded across the
+            # harness lifetime (one entry per *active* harness run,
+            # not per all runs ever). Covers claude (path-bound at
+            # spawn) and codex (path bound by the observer at
+            # expectation-match time) through a single eviction call.
+            self._unbind_rollouts_for_session()
 
         if self._interrupted:
             await self._publish("run.interrupted", {"returncode": returncode})
@@ -470,17 +472,33 @@ class RunProcess:
             path,
         )
 
-    def _unbind_rollout_if_bound(self) -> None:
-        path = self._bound_rollout_path
-        if path is None or self._observer is None:
+    def _unbind_rollouts_for_session(self) -> None:
+        """Terminal-state cleanup hook.
+
+        Calls ``observer.unbind_session`` unconditionally for
+        harness-origin sessions so both claude (path-bound at spawn,
+        ``_bound_rollout_path`` tracked here) and codex (path bound by
+        the observer from the matched expectation, NOT visible to the
+        orchestrator) converge on the same eviction path. The
+        observer walks ``_path_to_session`` for entries whose value
+        equals ``self.session.id`` and removes them.
+
+        Idempotent; falls back to ``unbind_rollout`` for the
+        deprecated path-keyed cleanup if the observer doesn't support
+        the session-keyed API (test fakes pre-this-fix).
+        """
+        if self._observer is None or self.session.origin != "harness":
+            self._bound_rollout_path = None
             return
         try:
-            self._observer.unbind_rollout(path)
+            unbind_session = getattr(self._observer, "unbind_session", None)
+            if callable(unbind_session):
+                unbind_session(self.session.id)
+            elif self._bound_rollout_path is not None:
+                self._observer.unbind_rollout(self._bound_rollout_path)
         except Exception:
             logger.exception(
-                "Failed to unbind rollout: session=%s path=%s",
-                self.session.id,
-                path,
+                "Failed to unbind rollouts for session=%s", self.session.id
             )
         finally:
             self._bound_rollout_path = None

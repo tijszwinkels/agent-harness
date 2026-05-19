@@ -1159,3 +1159,258 @@ async def test_run_manager_refuses_to_interrupt_active_external_runs() -> None:
 
     process.finish()
     await asyncio.wait_for(manager.wait(external_run.id), timeout=1)
+
+
+# --- Phase 1: rollout pre-binding (flag-gated) ---------------------------
+
+
+class _RecordingObserver:
+    """Minimal stand-in for ``ExternalTranscriptObserver``. The
+    orchestrator's pre-bind path calls ``bind_rollout`` at spawn and
+    ``unbind_rollout`` once the run reaches a terminal state."""
+
+    def __init__(self) -> None:
+        self.bindings: list[tuple[object, str]] = []
+        self.unbindings: list[object] = []
+
+    def bind_rollout(self, path, session_id: str) -> None:
+        self.bindings.append((path, session_id))
+
+    def unbind_rollout(self, path) -> None:
+        self.unbindings.append(path)
+
+
+class _RecordingDiscovery:
+    def __init__(
+        self,
+        *,
+        claude_path=None,
+        codex_path=None,
+        codex_error: Exception | None = None,
+    ) -> None:
+        from pathlib import Path
+
+        self._claude = claude_path or Path("/tmp/fake-claude-rollout.jsonl")
+        self._codex = codex_path or Path("/tmp/fake-codex-rollout.jsonl")
+        self._codex_error = codex_error
+        self.claude_calls: list[dict] = []
+        self.codex_calls: list[dict] = []
+
+    def discover_claude(self, *, session_id: str, cwd):
+        self.claude_calls.append({"session_id": session_id, "cwd": cwd})
+        return self._claude
+
+    async def discover_codex(self, *, pid: int, cwd, timeout_seconds: float = 5.0, poll_interval: float = 0.05):
+        self.codex_calls.append({"pid": pid, "cwd": cwd})
+        if self._codex_error is not None:
+            raise self._codex_error
+        return self._codex
+
+
+@pytest.mark.asyncio
+async def test_run_process_pre_binds_claude_rollout_when_flag_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the env var is set, RunProcess should compute the claude
+    deterministic path via the discovery + call observer.bind_rollout.
+
+    The session_id passed to ``discover_claude`` is the 8-4-4-4-12
+    dashed UUID derived from ``session.id`` (matching what claude
+    writes on disk), NOT the harness's ``ses_<hex>`` form.
+    """
+    from pathlib import Path
+
+    from agent_harness.orchestrator import _harness_session_id_as_uuid
+
+    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
+
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+    observer = _RecordingObserver()
+    claude_path = Path("/tmp/claude-pre-bind.jsonl")
+    discovery = _RecordingDiscovery(claude_path=claude_path)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+            observer=observer,
+            rollout_discovery=discovery,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    expected_uuid = _harness_session_id_as_uuid(session.id)
+    assert discovery.claude_calls == [
+        {"session_id": expected_uuid, "cwd": Path("/workspace/project")}
+    ]
+    assert observer.bindings == [(claude_path, session.id)]
+
+
+@pytest.mark.asyncio
+async def test_run_process_pre_binds_codex_rollout_when_flag_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex pre-bind runs synchronously inside ``run()`` between spawn
+    and the stream-task setup. By the time the run loop starts waiting
+    on the subprocess, the binding is in place — no race against
+    watchfiles."""
+    from pathlib import Path
+
+    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+    observer = _RecordingObserver()
+    codex_path = Path("/tmp/codex-pre-bind.jsonl")
+    discovery = _RecordingDiscovery(codex_path=codex_path)
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=factory,
+        observer=observer,
+        rollout_discovery=discovery,
+    )
+    task = asyncio.create_task(rp.run())
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert len(discovery.codex_calls) == 1
+    assert discovery.codex_calls[0]["pid"] == process.pid
+    # Bind fired (before run finished); unbind on terminal-state cleanup
+    # has since cleared the orchestrator-side tracker, but the
+    # observer.bind_rollout call was already recorded.
+    assert (codex_path, session.id) in observer.bindings
+
+
+@pytest.mark.asyncio
+async def test_run_process_unbinds_rollout_on_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the run reaches a terminal state, RunProcess must call
+    ``observer.unbind_rollout`` so the binding map stays bounded — one
+    entry per active run, not per all runs ever."""
+    from pathlib import Path
+
+    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+    observer = _RecordingObserver()
+    codex_path = Path("/tmp/codex-unbind.jsonl")
+    discovery = _RecordingDiscovery(codex_path=codex_path)
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=factory,
+        observer=observer,
+        rollout_discovery=discovery,
+    )
+    task = asyncio.create_task(rp.run())
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert observer.bindings == [(codex_path, session.id)]
+    assert observer.unbindings == [codex_path]
+
+
+@pytest.mark.asyncio
+async def test_run_process_does_not_pre_bind_when_flag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", raising=False)
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+    observer = _RecordingObserver()
+    discovery = _RecordingDiscovery()
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+            observer=observer,
+            rollout_discovery=discovery,
+        ).run()
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    process.finish()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert observer.bindings == []
+    assert discovery.codex_calls == []
+    assert discovery.claude_calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_process_continues_when_discover_codex_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If codex fd discovery times out or errors, the run must still
+    complete normally — pre-binding is best-effort. A run.warning event
+    surfaces the failure so operators can investigate."""
+    from agent_harness.rollout_discovery import RolloutDiscoveryError
+
+    monkeypatch.setenv("AGENT_HARNESS_ROLLOUT_PRE_BIND", "1")
+
+    bus = InMemoryEventBus()
+    session = make_session("codex")
+    run = make_run(session)
+    process = FakeProcess(returncode=0)
+    factory = FakeFactory(process)
+    observer = _RecordingObserver()
+    discovery = _RecordingDiscovery(
+        codex_error=RolloutDiscoveryError("fd never appeared for pid=12345")
+    )
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
+            event_bus=bus,
+            process_factory=factory,
+            observer=observer,
+            rollout_discovery=discovery,
+        ).run()
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result.status == "completed"
+    assert observer.bindings == []
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    warnings = [e for e in events if e.event == "run.warning"]
+    assert warnings, [e.event for e in events]
+    assert "discovery" in warnings[0].data.get("reason", "").lower() or warnings[0].data.get("error_type")

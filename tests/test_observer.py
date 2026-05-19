@@ -1158,3 +1158,151 @@ async def test_watch_service_runs_freshness_tick_alongside_watcher(tmp_path) -> 
     finally:
         watcher_done.set()
         await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_bind_rollout_predates_file_creation(tmp_path) -> None:
+    """The orchestrator pre-binds a rollout path to a harness session id
+    BEFORE the CLI subprocess has created the file. When ``tail_file``
+    later sees the path, events must attach to the bound session id —
+    not to the synthesized ``ses_<hex>``/``codex_<uuid>`` derived from
+    the filename pattern."""
+    bus = InMemoryEventBus()
+    repository = InMemoryRepository()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+
+    # Pre-bind a codex rollout path to a specific harness session id.
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0010-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    harness_session_id = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    observer.bind_rollout(rollout, harness_session_id)
+
+    # Now write the file's content. tail_file should attribute events
+    # to the bound id.
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n',
+        encoding="utf-8",
+    )
+
+    published = await observer.tail_file(rollout)
+
+    assert published, "expected at least one event from a complete rollout"
+    for event in published:
+        assert event.session_id == harness_session_id, event
+
+
+@pytest.mark.asyncio
+async def test_bind_rollout_overwrites_prior_binding(tmp_path) -> None:
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus)
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0011-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    observer.bind_rollout(rollout, "ses_first")
+    observer.bind_rollout(rollout, "ses_second")
+
+    published = await observer.tail_file(rollout)
+    for event in published:
+        assert event.session_id == "ses_second", event
+
+
+@pytest.mark.asyncio
+async def test_bind_rollout_suppresses_synthetic_session_updated(tmp_path) -> None:
+    """A bound codex rollout must NOT emit the synthetic
+    ``session.updated`` (origin=external) event that the parser would
+    normally produce for a fresh codex transcript. The harness session
+    is already in the repository under the bound id; emitting an
+    origin=external session.updated against it would travel the bus to
+    bridge subscribers and confuse them, even though the materialize
+    layer's origin-downgrade guard prevents the actual upsert."""
+    bus = InMemoryEventBus()
+    repository = InMemoryRepository()
+    observer = ExternalTranscriptObserver(bus, repository=repository)
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0020-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    harness_session_id = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    observer.bind_rollout(rollout, harness_session_id)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    published = await observer.tail_file(rollout)
+
+    # No synthetic session.updated for the bound path's first parse.
+    assert [e.event for e in published] == ["message"]
+    assert published[0].session_id == harness_session_id
+
+
+@pytest.mark.asyncio
+async def test_unbind_rollout_removes_mapping(tmp_path) -> None:
+    """After ``unbind_rollout``, the resolver must fall through to the
+    filename-pattern path on subsequent tails. This is how the
+    orchestrator keeps ``_path_to_session`` bounded — one entry per
+    *active* harness run, not per all runs ever."""
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus)
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0021-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    observer.bind_rollout(rollout, "ses_bound")
+    observer.unbind_rollout(rollout)
+    # Idempotent: a second unbind on a missing path is a no-op.
+    observer.unbind_rollout(rollout)
+
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+    published = await observer.tail_file(rollout)
+    expected_id = "codex_019e0021-0000-0000-0000-000000000000"
+    assert published
+    for event in published:
+        assert event.session_id == expected_id, event
+
+
+@pytest.mark.asyncio
+async def test_unbound_rollout_falls_back_to_filename_pattern(tmp_path) -> None:
+    """Regression guard: when no pre-binding exists, the observer must
+    keep deriving the session id from the rollout filename as today."""
+    bus = InMemoryEventBus()
+    observer = ExternalTranscriptObserver(bus)
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "19"
+        / "rollout-2026-05-19T10-30-00-019e0012-0000-0000-0000-000000000000.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    published = await observer.tail_file(rollout)
+    expected_id = "codex_019e0012-0000-0000-0000-000000000000"
+    assert published
+    for event in published:
+        assert event.session_id == expected_id, event

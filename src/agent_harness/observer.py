@@ -57,6 +57,14 @@ class TranscriptIdentity:
     backend: BackendName
     path: Path
     session_id: str
+    # True when ``session_id`` came from an orchestrator-side
+    # ``bind_rollout`` (i.e. routes to a harness session id) rather
+    # than from the filename pattern. Suppresses the synthetic
+    # ``session.updated`` (origin=external) the parser would otherwise
+    # emit — that session already exists and is harness-owned. The
+    # repository's origin-downgrade guard would skip the upsert, but
+    # the event still travels the bus and confuses subscribers.
+    is_rebound: bool = False
 
 
 class ObserverOffsetStore(Protocol):
@@ -147,6 +155,15 @@ class ExternalTranscriptObserver:
         self._pending_materialization: dict[str, list[Event]] = {}
         self._idle_after = timedelta(seconds=idle_after_seconds)
         self._clock = clock or utc_now
+        # Pre-bindings populated by the orchestrator's spawn path (via
+        # ``bind_rollout``). When the observer later sees a rollout
+        # path, a binding here wins over the filename-pattern lookup —
+        # which lets harness-origin runs attribute events to their own
+        # session id even when the backend can't pin the rollout uuid
+        # at spawn time (codex). Pre-binding before the file exists is
+        # supported: the binding is consulted only when ``tail_file``
+        # encounters the path.
+        self._path_to_session: dict[Path, str] = {}
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
         # threshold flips silent sessions to idle; a fresh event on an idle
@@ -177,10 +194,44 @@ class ExternalTranscriptObserver:
             # exactly once, which is the desired migration behavior.
             self._last_event_at[session.id] = session.updated_at
 
+    def bind_rollout(self, path: str | Path, session_id: str) -> None:
+        """Pre-register a path → harness-session-id mapping.
+
+        Called by the orchestrator immediately after (or before) a CLI
+        subprocess spawns. When ``tail_file`` later encounters
+        ``path``, it uses ``session_id`` instead of deriving one from
+        the filename pattern. Idempotent: a second call for the same
+        path overwrites the prior binding.
+        """
+        self._path_to_session[Path(path)] = session_id
+
+    def unbind_rollout(self, path: str | Path) -> None:
+        """Drop a previously-bound path from the resolver map.
+
+        Called by the orchestrator when a harness run reaches a terminal
+        state. Without eviction, ``_path_to_session`` would grow by one
+        entry per harness run across the whole harness lifetime — each
+        codex run opens a fresh rollout file, and bindings for finished
+        runs are dead weight. Idempotent: missing entries are a no-op.
+        """
+        self._path_to_session.pop(Path(path), None)
+
+    def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity:
+        base = transcript_identity_from_path(transcript_path)
+        bound = self._path_to_session.get(transcript_path)
+        if bound is None or bound == base.session_id:
+            return base
+        return TranscriptIdentity(
+            backend=base.backend,
+            path=transcript_path,
+            session_id=bound,
+            is_rebound=True,
+        )
+
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)
         try:
-            identity = transcript_identity_from_path(transcript_path)
+            identity = self._resolve_identity(transcript_path)
         except ValueError:
             logger.warning("Unsupported transcript path: %s", transcript_path)
             return []
@@ -226,7 +277,7 @@ class ExternalTranscriptObserver:
             logger.debug("Skipping duplicate transcript offset: path=%s offset=%s", transcript_path, offset)
             return []
 
-        resolved_identity = identity or transcript_identity_from_path(transcript_path)
+        resolved_identity = identity or self._resolve_identity(transcript_path)
         published: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
             published_event = await self._event_bus.publish(event)
@@ -683,6 +734,15 @@ def _session_event_if_complete(
     offset: int | None,
 ) -> list[Event]:
     if not cwd or not model:
+        return []
+    # When the identity was rebound to a harness session id via
+    # ``observer.bind_rollout``, the harness session already exists and
+    # is owned by the orchestrator. Synthesizing an ``origin=external``
+    # session.updated event would be a redundant write at materialize
+    # time (the origin-downgrade guard skips it) but the event still
+    # flows through the bus to bridge subscribers — who'd see the
+    # harness session flip to ``origin=external``. Skip emission.
+    if identity.is_rebound:
         return []
 
     session = Session(

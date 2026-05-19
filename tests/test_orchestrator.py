@@ -8,7 +8,7 @@ import pytest
 
 import agent_harness.orchestrator as orchestrator
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import Message, Project, Run, Session
+from agent_harness.models import Event, Message, Project, Run, Session
 from agent_harness.orchestrator import (
     ClaudeCodeCommandBuilder,
     CommandBuildError,
@@ -474,13 +474,16 @@ async def test_run_manager_interrupts_owned_processes_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_external_codex_turn_completed_does_not_arm_end_turn_watchdog(
+async def test_external_codex_codex_completed_stdout_does_not_arm_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """External codex sessions (origin=external) do NOT run through the
-    end-turn detector — Phase 2 keeps the harness-origin gate, so a
-    ``turn.completed`` in an externally-managed codex stdout doesn't
-    arm the supervisor's cleanup watchdog."""
+    """External codex sessions: legacy ``turn.completed`` stdout
+    payload is no longer parsed by the supervisor (Phase 4 retired
+    the detector). The watchdog now subscribes to observer-emitted
+    ``run.end_turn`` events on the bus, but no such event fires for
+    this external-only setup — no rollout is being tailed by an
+    observer in this fixture. Regression guard: just stdout activity
+    on an external run must NOT trigger the watchdog SIGTERM."""
     monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
     monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
     bus = InMemoryEventBus()
@@ -504,38 +507,36 @@ async def test_external_codex_turn_completed_does_not_arm_end_turn_watchdog(
     task = asyncio.create_task(run_process.run())
     await flush_asyncio()
 
-    assert run_process._end_turn_event.is_set() is False
-
     clock.advance(60)
     await flush_asyncio()
     clock.advance(60)
     await flush_asyncio()
 
     assert process.group_signals == []
-    assert run_process._end_turn_event.is_set() is False
 
     process.finish()
     result = await asyncio.wait_for(task, timeout=1)
 
     events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
     assert result.status == "completed"
-    # No message.delta from stdout, no process.stderr (we didn't write
-    # to stderr), just lifecycle events.
+    # No message.delta (Phase 2), no process.stderr (we didn't write
+    # to stderr), no run.usage / run.end_turn (no observer in this
+    # fixture). Just lifecycle events.
     assert [event.event for event in events] == ["run.started", "run.completed"]
 
 
 @pytest.mark.asyncio
 async def test_run_process_kills_after_end_turn_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 4: end-turn signal arrives via the event bus (observer
+    publishes ``run.end_turn``). The grace + SIGTERM + SIGKILL ladder
+    is unchanged from earlier phases."""
     monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
     monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
     bus = InMemoryEventBus()
     session = make_session("claude-code")
     run = make_run(session)
     clock = FakeClock()
-    end_turn_line = json.dumps(
-        {"type": "result", "subtype": "success", "stop_reason": "end_turn"}
-    ).encode()
-    process = FakeProcess(stdout=[end_turn_line + b"\n"])
+    process = FakeProcess(stdout=[])
     install_fake_process_group(monkeypatch, process)
 
     task = asyncio.create_task(
@@ -548,6 +549,17 @@ async def test_run_process_kills_after_end_turn_grace(monkeypatch: pytest.Monkey
             clock=clock,
             sleep=clock.sleep,
         ).run()
+    )
+    await flush_asyncio()
+
+    # Observer-side end-turn published on the bus.
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "claude-code"},
+        )
     )
     await flush_asyncio()
 
@@ -732,15 +744,15 @@ async def test_run_process_idle_timeout_resets_on_activity(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 async def test_run_process_uses_process_group_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Watchdog uses ``killpg`` against the process group. Phase 4:
+    end-turn arrives via the event bus instead of stdout-parsed
+    signal — same SIGTERM/SIGKILL semantics."""
     monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
     bus = InMemoryEventBus()
     session = make_session("claude-code")
     run = make_run(session)
     clock = FakeClock()
-    end_turn_line = json.dumps(
-        {"type": "result", "subtype": "success", "stop_reason": "end_turn"}
-    ).encode()
-    process = FakeProcess(stdout=[end_turn_line + b"\n"], pid=24680, exit_on_sigterm=True)
+    process = FakeProcess(stdout=[], pid=24680, exit_on_sigterm=True)
     calls = install_fake_process_group(monkeypatch, process, pgid=13579)
 
     task = asyncio.create_task(
@@ -755,39 +767,26 @@ async def test_run_process_uses_process_group_signals(monkeypatch: pytest.Monkey
         ).run()
     )
     await flush_asyncio()
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "claude-code"},
+        )
+    )
+    await flush_asyncio()
     clock.advance(20)
     await asyncio.wait_for(task, timeout=1)
 
     assert calls == [(13579, signal.SIGTERM)]
 
 
-@pytest.mark.asyncio
-async def test_codex_end_turn_stop_signal_is_turn_completed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    clock = FakeClock()
-    process = FakeProcess(stdout=[b'{"type":"turn.completed"}\n'], exit_on_sigterm=True)
-    install_fake_process_group(monkeypatch, process)
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("codex", "exec", "--json", "hello")),
-            event_bus=bus,
-            process_factory=FakeFactory(process),
-            clock=clock,
-            sleep=clock.sleep,
-        ).run()
-    )
-    await flush_asyncio()
-    clock.advance(20)
-    result = await asyncio.wait_for(task, timeout=1)
-
-    assert result.status == "interrupted"
-    assert process.group_signals == [signal.SIGTERM]
+# Phase 4 deleted: ``test_codex_end_turn_stop_signal_is_turn_completed``
+# (codex stdout-side ``turn.completed`` detection is gone — observer
+# emits ``run.end_turn`` from ``event_msg/task_complete``;
+# ``test_observer_emits_run_end_turn_for_codex_task_complete``
+# covers the new path).
 
 
 class FakeFactoryQueue:
@@ -1184,91 +1183,16 @@ async def test_run_process_emits_process_stderr_for_stderr_lines() -> None:
     assert all(e.event != "message.delta" for e in events)
 
 
-@pytest.mark.asyncio
-async def test_run_process_still_detects_end_turn_for_watchdog_codex(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The end-turn signal that drives the post-end_turn cleanup
-    watchdog must still fire when codex emits ``turn.completed`` on
-    stdout. (Phase 3 will rewire this to come from the observer; for
-    now the stdout signal is what we have.)"""
-    import json as _json
-
-    from agent_harness.orchestrator import END_TURN_GRACE_SECONDS, END_TURN_HARD_KILL_AFTER_SECONDS
-
-    bus = InMemoryEventBus()
-    session = make_session("codex")
-    run = make_run(session)
-    process = FakeProcess(
-        stdout=[(_json.dumps({"type": "turn.completed"}) + "\n").encode()],
-        returncode=0,
-        exit_on_sigterm=True,
-    )
-    factory = FakeFactory(process)
-    clock = FakeClock()
-    install_fake_process_group(monkeypatch, process)
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("codex", "exec", "hi"), cwd="/workspace/project"),
-            event_bus=bus,
-            process_factory=factory,
-            clock=clock,
-            sleep=clock.sleep,
-        ).run()
-    )
-    # Let the stdout line be ingested.
-    for _ in range(5):
-        await asyncio.sleep(0)
-    # Past the post-end_turn grace window — SIGTERM should fire.
-    clock.advance(END_TURN_GRACE_SECONDS + 1)
-    await asyncio.wait_for(task, timeout=2)
-
-    assert signal.SIGTERM in process.group_signals
-
-
-@pytest.mark.asyncio
-async def test_run_process_still_detects_end_turn_for_watchdog_claude(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same watchdog signal for claude (``result`` + stop_reason=end_turn)."""
-    import json as _json
-
-    from agent_harness.orchestrator import END_TURN_GRACE_SECONDS
-
-    bus = InMemoryEventBus()
-    session = make_session("claude-code")
-    run = make_run(session)
-    process = FakeProcess(
-        stdout=[
-            (_json.dumps({"type": "result", "stop_reason": "end_turn"}) + "\n").encode()
-        ],
-        returncode=0,
-        exit_on_sigterm=True,
-    )
-    factory = FakeFactory(process)
-    clock = FakeClock()
-    install_fake_process_group(monkeypatch, process)
-
-    task = asyncio.create_task(
-        RunProcess(
-            session=session,
-            run=run,
-            command=ProcessCommand(argv=("claude", "--print"), cwd="/workspace/project"),
-            event_bus=bus,
-            process_factory=factory,
-            clock=clock,
-            sleep=clock.sleep,
-        ).run()
-    )
-    for _ in range(5):
-        await asyncio.sleep(0)
-    clock.advance(END_TURN_GRACE_SECONDS + 1)
-    await asyncio.wait_for(task, timeout=2)
-
-    assert signal.SIGTERM in process.group_signals
+# Phase 4 deleted: ``test_run_process_still_detects_end_turn_for_watchdog_codex``
+# and ``test_run_process_still_detects_end_turn_for_watchdog_claude``.
+# Both were Phase 2 tests for the supervisor's stdout-side
+# end-turn detector — that detector is gone (Phase 4). The
+# equivalent coverage now lives in
+# ``test_watchdog_triggers_on_observer_run_end_turn`` (observer
+# publishes ``run.end_turn`` via the bus; watchdog subscribes and
+# arms its grace timer) and
+# ``test_watchdog_ignores_run_end_turn_for_other_runs`` (filter
+# coverage).
 
 
 @pytest.mark.asyncio
@@ -1458,7 +1382,10 @@ async def test_watchdog_triggers_on_observer_run_end_turn(
     bus = InMemoryEventBus()
     session = make_session("codex")
     run = make_run(session)
-    process = FakeProcess(stdout=[], close_stdout=False, exit_on_sigterm=True)
+    # ``close_stdout=True`` (default) pushes EOF so the stream-pump
+    # task exits — needed for ``_finish_streams`` to complete after
+    # the SIGTERM-driven wait_task return.
+    process = FakeProcess(stdout=[], exit_on_sigterm=True)
     install_fake_process_group(monkeypatch, process)
     clock = FakeClock()
 
@@ -1472,7 +1399,7 @@ async def test_watchdog_triggers_on_observer_run_end_turn(
         sleep=clock.sleep,
     )
     task = asyncio.create_task(rp.run())
-    # Let the watchdog tasks start.
+    # Let the watchdog tasks start and the subscription register.
     for _ in range(5):
         await asyncio.sleep(0)
 
@@ -1509,7 +1436,10 @@ async def test_watchdog_ignores_run_end_turn_for_other_runs(
     bus = InMemoryEventBus()
     session = make_session("codex")
     run = make_run(session)
-    process = FakeProcess(stdout=[], close_stdout=False)
+    # ``close_stdout=False`` keeps the stream-pump alive; tests
+    # finishes by calling ``process.finish()`` + ``stdout.close()``
+    # below so ``_finish_streams`` can complete.
+    process = FakeProcess(stdout=[], stderr=[], close_stdout=False, close_stderr=False)
     install_fake_process_group(monkeypatch, process)
     clock = FakeClock()
 
@@ -1545,6 +1475,7 @@ async def test_watchdog_ignores_run_end_turn_for_other_runs(
 
     process.finish()
     process.stdout.close()
+    process.stderr.close()
     await asyncio.wait_for(task, timeout=1)
 
 

@@ -99,7 +99,13 @@ class RolloutDiscovery:
     def discover_claude(self, *, session_id: str, cwd: Path) -> Path:
         """Compute the deterministic claude-code rollout path.
 
-        The path is ``<projects_root>/<slugified-cwd>/<session_id>.jsonl``.
+        The path is ``<projects_root>/<slugified-cwd>/<session_id>.jsonl``,
+        where ``session_id`` is the claude session id **as it appears in
+        the rollout filename** — i.e. the 8-4-4-4-12 dashed UUID that
+        the orchestrator passes via ``--session-id``. The harness's own
+        ``ses_<hex>`` form must be converted by the caller before
+        calling here (see ``orchestrator._pre_bind_claude``).
+
         Returns the path even if the file does not yet exist — the
         observer's binding map records the path; ``tail_file`` will pick
         up content once claude flushes its first line.

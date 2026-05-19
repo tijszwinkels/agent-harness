@@ -57,6 +57,14 @@ class TranscriptIdentity:
     backend: BackendName
     path: Path
     session_id: str
+    # True when ``session_id`` came from an orchestrator-side
+    # ``bind_rollout`` (i.e. routes to a harness session id) rather
+    # than from the filename pattern. Suppresses the synthetic
+    # ``session.updated`` (origin=external) the parser would otherwise
+    # emit — that session already exists and is harness-owned. The
+    # repository's origin-downgrade guard would skip the upsert, but
+    # the event still travels the bus and confuses subscribers.
+    is_rebound: bool = False
 
 
 class ObserverOffsetStore(Protocol):
@@ -197,6 +205,17 @@ class ExternalTranscriptObserver:
         """
         self._path_to_session[Path(path)] = session_id
 
+    def unbind_rollout(self, path: str | Path) -> None:
+        """Drop a previously-bound path from the resolver map.
+
+        Called by the orchestrator when a harness run reaches a terminal
+        state. Without eviction, ``_path_to_session`` would grow by one
+        entry per harness run across the whole harness lifetime — each
+        codex run opens a fresh rollout file, and bindings for finished
+        runs are dead weight. Idempotent: missing entries are a no-op.
+        """
+        self._path_to_session.pop(Path(path), None)
+
     def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity:
         base = transcript_identity_from_path(transcript_path)
         bound = self._path_to_session.get(transcript_path)
@@ -206,6 +225,7 @@ class ExternalTranscriptObserver:
             backend=base.backend,
             path=transcript_path,
             session_id=bound,
+            is_rebound=True,
         )
 
     async def tail_file(self, path: str | Path) -> list[Event]:
@@ -714,6 +734,15 @@ def _session_event_if_complete(
     offset: int | None,
 ) -> list[Event]:
     if not cwd or not model:
+        return []
+    # When the identity was rebound to a harness session id via
+    # ``observer.bind_rollout``, the harness session already exists and
+    # is owned by the orchestrator. Synthesizing an ``origin=external``
+    # session.updated event would be a redundant write at materialize
+    # time (the origin-downgrade guard skips it) but the event still
+    # flows through the bus to bridge subscribers — who'd see the
+    # harness session flip to ``origin=external``. Skip emission.
+    if identity.is_rebound:
         return []
 
     session = Session(

@@ -336,7 +336,10 @@ class RunProcess:
         # to happen. Defaults are ``None``; the env-var gate stays off.
         self._observer = observer
         self._rollout_discovery = rollout_discovery
-        self._codex_bind_task: asyncio.Task[None] | None = None
+        # Set to the bound rollout path once pre-bind succeeds, so
+        # ``run()``'s finally block can unbind on terminal-state
+        # cleanup (keeps observer._path_to_session bounded).
+        self._bound_rollout_path: Path | None = None
 
     async def run(self) -> RunProcessResult:
         await self._publish("run.started", {})
@@ -371,7 +374,11 @@ class RunProcess:
             return RunProcessResult(run_id=self.run_record.id, status="failed", error=str(exc))
         finally:
             await self._finish_watchdogs(watchdog_tasks)
-            await self._cancel_codex_bind_task()
+            # Drop the rollout binding now that the subprocess is done —
+            # keeps observer._path_to_session bounded across the harness
+            # lifetime (one entry per *active* harness run, not per all
+            # runs ever).
+            self._unbind_rollout_if_bound()
 
         if self._interrupted:
             await self._publish("run.interrupted", {"returncode": returncode})
@@ -409,11 +416,14 @@ class RunProcess:
                 self._pre_bind_claude()
                 return
             if backend == "codex":
-                # codex opens its rollout fd a few hundred ms after spawn;
-                # poll asynchronously so we don't block the run loop.
-                self._codex_bind_task = asyncio.create_task(
-                    self._pre_bind_codex(process.pid)
-                )
+                # Run synchronously so the binding is in place before
+                # the observer's watchfiles loop fires on codex's first
+                # session_meta flush. Adds ~100-300ms to spawn but
+                # eliminates the dual-row race: if the bind landed
+                # AFTER tail_file, the observer would attribute the
+                # first events to the synthesized ``codex_<uuid>``
+                # external row and a phantom session would survive.
+                await self._pre_bind_codex(process.pid)
                 return
         except Exception:
             # Pre-bind is best-effort. Existing filename-pattern flow
@@ -439,10 +449,25 @@ class RunProcess:
                 self.session.id,
             )
             return
+        # Claude writes the rollout under the dashed-UUID stem it was
+        # invoked with (orchestrator builds ``--session-id <uuid>``).
+        # Bind under that exact filename — using the harness's
+        # ``ses_<hex>`` form here would silently miss the file the
+        # observer actually sees on disk.
+        try:
+            claude_uuid = _harness_session_id_as_uuid(self.session.id)
+        except CommandBuildError as exc:
+            logger.warning(
+                "Skipping claude rollout pre-bind: cannot derive UUID; session=%s error=%s",
+                self.session.id,
+                exc,
+            )
+            return
         path = self._rollout_discovery.discover_claude(
-            session_id=self.session.id, cwd=Path(cwd_str)
+            session_id=claude_uuid, cwd=Path(cwd_str)
         )
         self._observer.bind_rollout(path, self.session.id)
+        self._bound_rollout_path = path
         logger.debug(
             "Claude rollout pre-bound: session=%s path=%s",
             self.session.id,
@@ -495,6 +520,7 @@ class RunProcess:
             )
             return
         self._observer.bind_rollout(path, self.session.id)
+        self._bound_rollout_path = path
         logger.debug(
             "Codex rollout pre-bound: session=%s pid=%s path=%s",
             self.session.id,
@@ -502,15 +528,20 @@ class RunProcess:
             path,
         )
 
-    async def _cancel_codex_bind_task(self) -> None:
-        task = self._codex_bind_task
-        if task is None or task.done():
+    def _unbind_rollout_if_bound(self) -> None:
+        path = self._bound_rollout_path
+        if path is None or self._observer is None:
             return
-        task.cancel()
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            self._observer.unbind_rollout(path)
+        except Exception:
+            logger.exception(
+                "Failed to unbind rollout: session=%s path=%s",
+                self.session.id,
+                path,
+            )
+        finally:
+            self._bound_rollout_path = None
 
     def _stream_tasks(self, process: ManagedProcess) -> list[asyncio.Task[None]]:
         tasks: list[asyncio.Task[None]] = []
@@ -764,18 +795,15 @@ class RunManager:
         # which would race on the shared claude-code rollout JSONL.
         self._active_run_by_session: dict[str, str] = {}
         self._queues: dict[str, deque[_QueuedRun]] = {}
-        # Optional wiring for the Phase 1 rollout pre-binding path. Either
-        # both are set (production: cli wires the live observer + a
-        # default RolloutDiscovery) or both are None (back-compat for
-        # callers / tests that don't need pre-binding). The env-var gate
-        # in RunProcess decides at run() time whether to actually probe.
+        # Optional wiring for the Phase 1 rollout pre-binding path. The
+        # production cli wires only ``rollout_discovery`` here — the
+        # observer is constructed later inside FastAPI's lifespan and
+        # late-bound via ``set_observer`` (see api.py). Tests usually
+        # pass both directly. The env-var gate in RunProcess decides at
+        # run() time whether to actually probe; either or both being
+        # ``None`` is a valid configuration (pre-bind is skipped).
         self._observer = observer
         self._rollout_discovery = rollout_discovery
-        if (self._observer is None) != (self._rollout_discovery is None):
-            logger.warning(
-                "RunManager constructed with only one of observer / rollout_discovery; "
-                "pre-binding will be skipped (both must be provided)."
-            )
 
     def set_observer(self, observer: Any) -> None:
         """Late binder used by api.py's lifespan: observer is constructed

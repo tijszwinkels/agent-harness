@@ -147,6 +147,15 @@ class ExternalTranscriptObserver:
         self._pending_materialization: dict[str, list[Event]] = {}
         self._idle_after = timedelta(seconds=idle_after_seconds)
         self._clock = clock or utc_now
+        # Pre-bindings populated by the orchestrator's spawn path (via
+        # ``bind_rollout``). When the observer later sees a rollout
+        # path, a binding here wins over the filename-pattern lookup —
+        # which lets harness-origin runs attribute events to their own
+        # session id even when the backend can't pin the rollout uuid
+        # at spawn time (codex). Pre-binding before the file exists is
+        # supported: the binding is consulted only when ``tail_file``
+        # encounters the path.
+        self._path_to_session: dict[Path, str] = {}
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
         # threshold flips silent sessions to idle; a fresh event on an idle
@@ -177,10 +186,32 @@ class ExternalTranscriptObserver:
             # exactly once, which is the desired migration behavior.
             self._last_event_at[session.id] = session.updated_at
 
+    def bind_rollout(self, path: str | Path, session_id: str) -> None:
+        """Pre-register a path → harness-session-id mapping.
+
+        Called by the orchestrator immediately after (or before) a CLI
+        subprocess spawns. When ``tail_file`` later encounters
+        ``path``, it uses ``session_id`` instead of deriving one from
+        the filename pattern. Idempotent: a second call for the same
+        path overwrites the prior binding.
+        """
+        self._path_to_session[Path(path)] = session_id
+
+    def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity:
+        base = transcript_identity_from_path(transcript_path)
+        bound = self._path_to_session.get(transcript_path)
+        if bound is None or bound == base.session_id:
+            return base
+        return TranscriptIdentity(
+            backend=base.backend,
+            path=transcript_path,
+            session_id=bound,
+        )
+
     async def tail_file(self, path: str | Path) -> list[Event]:
         transcript_path = Path(path)
         try:
-            identity = transcript_identity_from_path(transcript_path)
+            identity = self._resolve_identity(transcript_path)
         except ValueError:
             logger.warning("Unsupported transcript path: %s", transcript_path)
             return []
@@ -226,7 +257,7 @@ class ExternalTranscriptObserver:
             logger.debug("Skipping duplicate transcript offset: path=%s offset=%s", transcript_path, offset)
             return []
 
-        resolved_identity = identity or transcript_identity_from_path(transcript_path)
+        resolved_identity = identity or self._resolve_identity(transcript_path)
         published: list[Event] = []
         for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
             published_event = await self._event_bus.publish(event)

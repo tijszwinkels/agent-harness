@@ -338,13 +338,17 @@ class ExternalTranscriptObserver:
         # long uptime, a periodic sweep could be added (not load-bearing
         # today).
         self._codex_resolution_cache: dict[Path, bool] = {}
-        # Per-session set of codex_resume_id UUIDs the observer has
-        # already published a ``session.updated`` event for. Idempotency
-        # guard: a re-tail of an already-bound rollout (observer
-        # restart, or watchfiles firing twice on the same write) must
-        # not produce duplicate session.updated events
-        # (specs/2026-05-21-codex-resume.md). Cleared when an
-        # ``unbind_*`` evicts the binding.
+        # Set of ``{session_id}:{rollout_uuid}`` dedupe keys the
+        # observer has already published a ``session.updated`` event
+        # for. Idempotency guard: a re-tail of an already-bound
+        # rollout (observer restart, or watchfiles firing twice on
+        # the same write) must not produce duplicate session.updated
+        # events (specs/2026-05-21-codex-resume.md).
+        # ``unbind_session`` evicts every entry prefixed with the
+        # session id; ``unbind_rollout`` evicts the entry matching
+        # the rollout's UUID. Halcyon's NEEDS-FIX on PR #18 closed
+        # the leak; before that, the set grew one-entry-per-run for
+        # the observer's lifetime.
         self._codex_resume_id_published: set[str] = set()
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
@@ -446,10 +450,20 @@ class ExternalTranscriptObserver:
         ``unbind_session`` instead — the orchestrator doesn't know
         which rollout path the observer ended up matching. Idempotent.
         """
-        self._path_to_session.pop(Path(path), None)
+        resolved_path = Path(path)
+        bound_session = self._path_to_session.pop(resolved_path, None)
         # Forget any "checked-no-match" memoization too, so a fresh
         # session_meta peek can run if the rollout reappears.
-        self._codex_resolution_cache.pop(Path(path), None)
+        self._codex_resolution_cache.pop(resolved_path, None)
+        # Halcyon's NEEDS-FIX on PR #18: also drop the matching
+        # codex_resume_id dedupe entry so the docstring's "cleared
+        # when an ``unbind_*`` evicts the binding" claim is true and
+        # the set stays bounded across long uptimes.
+        match = _CODEX_ROLLOUT_RE.match(resolved_path.name)
+        if match is not None and bound_session is not None:
+            self._codex_resume_id_published.discard(
+                f"{bound_session}:{match.group('uuid')}"
+            )
 
     def unbind_session(self, session_id: str) -> None:
         """Evict every path binding pointing at ``session_id``.
@@ -479,6 +493,16 @@ class ExternalTranscriptObserver:
         for path in to_remove:
             self._path_to_session.pop(path, None)
             self._codex_resolution_cache.pop(path, None)
+        # Halcyon's NEEDS-FIX on PR #18: drop every dedupe entry
+        # belonging to this session — without this the set grew
+        # monotonically (one entry per codex run per session) for
+        # the observer's lifetime, contradicting the docstring's
+        # eviction promise and leaking memory across long uptimes.
+        prefix = f"{session_id}:"
+        self._codex_resume_id_published = {
+            key for key in self._codex_resume_id_published
+            if not key.startswith(prefix)
+        }
 
     def expect_codex_rollout(self, *, cwd: Path | str, session_id: str) -> None:
         """Register a hint that a codex rollout matching ``cwd`` is about

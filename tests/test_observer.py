@@ -1338,6 +1338,97 @@ def _write_codex_rollout_with_session_meta(
 
 
 @pytest.mark.asyncio
+async def test_unbind_session_clears_codex_resume_id_published_dedupe(tmp_path) -> None:
+    """Halcyon's NEEDS-FIX on PR #18: the
+    ``_codex_resume_id_published`` set docstring promised eviction on
+    unbind but neither ``unbind_session`` nor ``unbind_rollout``
+    actually cleared it. The set grew monotonically across the
+    observer's lifetime (one entry per codex run per session). The
+    functional impact was benign — each new rollout uses a fresh
+    UUID so dedupe keys diverged — but the docstring lied and memory
+    leaked. After this fix, unbinding a session evicts all of its
+    dedupe keys."""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0d00-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T12:00:05.000Z",
+    )
+    await observer.tail_file(rollout)
+
+    # Dedupe key was populated during binding.
+    dedupe_key = f"{session.id}:{rollout_uuid}"
+    assert dedupe_key in observer._codex_resume_id_published
+
+    # End-of-run hook calls unbind_session — clear the dedupe entries.
+    observer.unbind_session(session.id)
+    assert dedupe_key not in observer._codex_resume_id_published
+
+
+@pytest.mark.asyncio
+async def test_unbind_rollout_clears_codex_resume_id_published_dedupe(tmp_path) -> None:
+    """Parallel coverage: ``unbind_rollout`` (path-keyed eviction)
+    also clears the dedupe entry for the bound (session, UUID) pair.
+    Used by the claude pre-bind path; covers codex too if the
+    orchestrator ever falls back to path-based eviction."""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 12, 5, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0d01-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T12:05:05.000Z",
+    )
+    await observer.tail_file(rollout)
+
+    dedupe_key = f"{session.id}:{rollout_uuid}"
+    assert dedupe_key in observer._codex_resume_id_published
+
+    observer.unbind_rollout(rollout)
+    assert dedupe_key not in observer._codex_resume_id_published
+
+
+@pytest.mark.asyncio
 async def test_observer_populates_codex_resume_id_on_runtime_discovered_external(tmp_path) -> None:
     """Halcyon's NEEDS-FIX on PR #18: the Option A backfill only fires
     in ``__init__``, but external codex rollouts that appear AFTER

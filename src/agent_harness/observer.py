@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
+_CODEX_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 # Claude rollout record-types we intentionally drop on the floor.
 # Phase 4 audit: every entry here has a "record genuinely doesn't
 # carry message-shaped content for us" rationale — not "avoid
@@ -328,6 +331,58 @@ class ExternalTranscriptObserver:
         # observer offset persistence (d7658fd) means existing transcripts
         # are not re-scanned, so _last_event_at would stay empty for them.
         self._seed_last_event_at_from_repository()
+        # Option A backfill (specs/2026-05-21-codex-resume.md): populate
+        # codex_resume_id on existing external codex sessions whose
+        # field is None. One-shot per process startup.
+        self._backfill_codex_resume_id_from_external_ids()
+
+    def _backfill_codex_resume_id_from_external_ids(self) -> None:
+        """Populate ``Session.codex_resume_id`` on existing
+        external-origin codex sessions where it's still None. The
+        UUID is encoded in the ``codex_<uuid>`` session id (see
+        ``external_session_id_from_codex_path``); one regex match per
+        candidate row, then ``upsert_session`` writes the modified
+        Session back. Idempotent: rows whose field is already set are
+        skipped. Harness-origin and non-codex rows are left alone (the
+        observer's binding path handles harness codex; claude has no
+        codex resume semantics).
+
+        Spec: specs/2026-05-21-codex-resume.md option A.
+        """
+        if self._repository is None:
+            return
+        try:
+            sessions = self._repository.list_sessions()
+        except Exception:
+            logger.exception("Failed to backfill codex_resume_id from repository")
+            return
+        for session in sessions:
+            if session.backend != "codex":
+                continue
+            if session.origin != "external":
+                continue
+            if session.codex_resume_id is not None:
+                continue
+            if not session.id.startswith("codex_"):
+                continue
+            resume_id = session.id.removeprefix("codex_")
+            if not _CODEX_UUID_RE.fullmatch(resume_id):
+                # Defensive: a stray non-UUID id sneaking in (e.g.
+                # legacy data) shouldn't crash backfill. Skip and log.
+                logger.warning(
+                    "Skipping codex_resume_id backfill for non-UUID id: %s",
+                    session.id,
+                )
+                continue
+            try:
+                self._repository.upsert_session(
+                    session.model_copy(update={"codex_resume_id": resume_id})
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to write back codex_resume_id for session %s",
+                    session.id,
+                )
 
     def _seed_last_event_at_from_repository(self) -> None:
         if self._repository is None:

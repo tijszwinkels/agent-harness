@@ -1337,6 +1337,77 @@ def _write_codex_rollout_with_session_meta(
     return transcript
 
 
+def test_observer_seeds_codex_resume_id_for_external_sessions_on_restart() -> None:
+    """Option A backfill (specs/2026-05-21-codex-resume.md): existing
+    external-origin codex sessions encode the rollout UUID in their
+    ``codex_<uuid>`` id. On observer construction (process startup)
+    the backfill populates codex_resume_id from that prefix so the
+    next CodexCommandBuilder.build can pick exec resume — no
+    schema change, no second observer pass."""
+    repository = InMemoryRepository()
+    # Seed two external codex sessions: one missing codex_resume_id
+    # (pre-feature row), one already populated (idempotent skip).
+    pre_feature = Session(
+        id="codex_019e0700-0000-0000-0000-000000000000",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        origin="external",
+    )
+    assert pre_feature.codex_resume_id is None
+    repository.upsert_session(pre_feature)
+
+    already_set = Session(
+        id="codex_019e0701-0000-0000-0000-000000000000",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo2", name="repo2"),
+        origin="external",
+        codex_resume_id="overridden-do-not-touch",
+    )
+    repository.upsert_session(already_set)
+
+    # Constructing the observer runs the seeding hooks.
+    bus = InMemoryEventBus()
+    ExternalTranscriptObserver(bus, repository=repository)
+
+    after_pre = repository.get_session(pre_feature.id)
+    assert after_pre.codex_resume_id == "019e0700-0000-0000-0000-000000000000"
+    # Already-set row must NOT be overwritten by the backfill.
+    after_already = repository.get_session(already_set.id)
+    assert after_already.codex_resume_id == "overridden-do-not-touch"
+
+
+def test_observer_backfill_skips_harness_origin_and_non_codex_sessions() -> None:
+    """Backfill must NOT touch harness-origin sessions (their
+    codex_resume_id is set by the observer on binding, not derived
+    from the id) and must NOT touch claude sessions (no codex resume
+    semantics at all)."""
+    repository = InMemoryRepository()
+    harness_codex = Session(
+        id="ses_019e070200000000000000000000000a",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        origin="harness",
+    )
+    external_claude = Session(
+        id="claude_019e0703-0000-0000-0000-000000000000",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo2", name="repo2"),
+        origin="external",
+    )
+    repository.upsert_session(harness_codex)
+    repository.upsert_session(external_claude)
+
+    bus = InMemoryEventBus()
+    ExternalTranscriptObserver(bus, repository=repository)
+
+    assert repository.get_session(harness_codex.id).codex_resume_id is None
+    assert repository.get_session(external_claude.id).codex_resume_id is None
+
+
 @pytest.mark.asyncio
 async def test_observer_populates_codex_resume_id_on_codex_binding(tmp_path) -> None:
     """When the observer matches a codex rollout to a harness session

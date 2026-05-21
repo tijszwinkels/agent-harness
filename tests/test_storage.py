@@ -219,6 +219,97 @@ def test_materialize_session_updated_creates_when_session_absent(tmp_path) -> No
     repository.close()
 
 
+def test_materialize_harness_to_harness_preserves_codex_resume_id_on_none_incoming() -> None:
+    """Halcyon's NEEDS-FIX on PR #18: a status-flip event whose
+    payload was built from a stale snapshot (read BEFORE
+    ``_maybe_publish_codex_resume_id`` wrote the field) carries
+    ``codex_resume_id=None``. The harness→harness materializer
+    branch must NOT clobber an already-set codex_resume_id when the
+    incoming payload's field is None — mirrors the existing
+    ``stats``-preservation pattern.
+
+    Concrete race: ``_maybe_publish_status_flip`` (running↔idle
+    transition triggered by ``freshness_tick``) emits a
+    ``session.updated`` after the resume-id event landed; without
+    this guard the status-flip wipes the just-written
+    codex_resume_id back to None."""
+    from agent_harness.repository import InMemoryRepository
+
+    repo = InMemoryRepository()
+    session_id = "ses_019e0e0000000000000000000000000a"
+    # Existing harness session has codex_resume_id set (observer's
+    # binding emission already landed).
+    existing = Session(
+        id=session_id,
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        status="running",
+        origin="harness",
+        codex_resume_id="019e0e00-0000-0000-0000-000000000000",
+    )
+    repo.upsert_session(existing)
+
+    # Incoming harness session.updated event (e.g. a status flip)
+    # was built from a snapshot taken BEFORE the resume-id event
+    # landed — so it carries codex_resume_id=None.
+    incoming = existing.model_copy(
+        update={"status": "idle", "codex_resume_id": None}
+    )
+    repo.materialize_event(
+        Event(
+            event="session.updated",
+            session_id=session_id,
+            data={"session": incoming.model_dump(mode="json")},
+        )
+    )
+
+    after = repo.get_session(session_id)
+    # The status flip MUST land (the incoming event's purpose).
+    assert after.status == "idle"
+    # But the just-set codex_resume_id MUST survive.
+    assert after.codex_resume_id == "019e0e00-0000-0000-0000-000000000000"
+
+
+def test_materialize_harness_to_harness_preserves_codex_resume_id_sqlite(tmp_path) -> None:
+    """Parallel SQLite coverage: both materializer paths must
+    implement identical preservation semantics — otherwise a
+    DurableEventBus deployment would have the leak the in-memory
+    test guards against."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    try:
+        session_id = "ses_019e0e0100000000000000000000000b"
+        existing = Session(
+            id=session_id,
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+            status="running",
+            origin="harness",
+            codex_resume_id="019e0e01-0000-0000-0000-000000000000",
+        )
+        repository.upsert_session(existing)
+
+        incoming = existing.model_copy(
+            update={"status": "idle", "codex_resume_id": None}
+        )
+        repository.materialize_event(
+            Event(
+                event="session.updated",
+                session_id=session_id,
+                data={"session": incoming.model_dump(mode="json")},
+            ),
+            store_event=False,
+        )
+
+        after = repository.get_session(session_id)
+        assert after.status == "idle"
+        assert after.codex_resume_id == "019e0e01-0000-0000-0000-000000000000"
+    finally:
+        repository.close()
+
+
 def test_materialize_session_updated_allows_observer_updates_to_external(tmp_path) -> None:
     """For an existing origin=external session, the observer is the source
     of truth — later session.updated events should still flow through

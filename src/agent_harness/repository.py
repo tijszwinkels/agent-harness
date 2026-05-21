@@ -311,8 +311,28 @@ class InMemoryRepository:
                     # The Phase 1 origin-downgrade guard
                     # (external→harness rejected) stays intact: only
                     # matching-origin incoming events fire this branch.
+                    #
+                    # The harness→harness reach is broader than just
+                    # codex_resume_id propagation — once enabled, any
+                    # observer-emitted session.updated for a harness
+                    # session can land here (e.g.
+                    # ``_maybe_publish_status_flip``'s running↔idle
+                    # transitions). Halcyon's NEEDS-FIX on PR #18:
+                    # a status-flip event whose payload was built
+                    # from a snapshot read BEFORE the resume-id
+                    # event landed would carry
+                    # ``codex_resume_id=None`` and clobber the
+                    # just-written field. Preserve existing
+                    # codex_resume_id whenever the incoming is None,
+                    # mirroring the stats pattern above.
+                    updates: dict[str, object] = {"stats": existing.stats}
+                    if (
+                        incoming.codex_resume_id is None
+                        and existing.codex_resume_id is not None
+                    ):
+                        updates["codex_resume_id"] = existing.codex_resume_id
                     self.upsert_session(
-                        incoming.model_copy(update={"stats": existing.stats})
+                        incoming.model_copy(update=updates)
                     )
             return
 

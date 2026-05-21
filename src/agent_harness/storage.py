@@ -536,8 +536,23 @@ class SQLiteRepository:
                         # The Phase 1 origin-downgrade guard
                         # (external→harness rejected) stays intact:
                         # only matching-origin incoming fires here.
+                        #
+                        # Halcyon's NEEDS-FIX on PR #18: also
+                        # preserve existing.codex_resume_id when the
+                        # incoming payload's field is None — a
+                        # ``_maybe_publish_status_flip`` event whose
+                        # payload was built BEFORE the resume-id
+                        # event landed would otherwise clobber the
+                        # just-written field. Same shape as the
+                        # stats preservation.
+                        updates: dict[str, object] = {"stats": existing.stats}
+                        if (
+                            incoming.codex_resume_id is None
+                            and existing.codex_resume_id is not None
+                        ):
+                            updates["codex_resume_id"] = existing.codex_resume_id
                         self._upsert_session(
-                            incoming.model_copy(update={"stats": existing.stats})
+                            incoming.model_copy(update=updates)
                         )
                 return
 

@@ -1338,6 +1338,105 @@ def _write_codex_rollout_with_session_meta(
 
 
 @pytest.mark.asyncio
+async def test_observer_populates_codex_resume_id_on_codex_binding(tmp_path) -> None:
+    """When the observer matches a codex rollout to a harness session
+    expectation, it must persist the rollout UUID onto
+    ``Session.codex_resume_id`` so the next ``CodexCommandBuilder.build``
+    can pick ``codex exec resume <uuid>`` and the model retains
+    multi-turn context. The UUID comes from the rollout filename
+    (``rollout-<ts>-<UUID>.jsonl``). Spec: specs/2026-05-21-codex-resume.md"""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    # Sanity: codex_resume_id starts None (harness origin, no run yet).
+    assert session.codex_resume_id is None
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0500-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T10:30:05.000Z",
+    )
+
+    await observer.tail_file(rollout)
+
+    after = repository.get_session(session.id)
+    assert after.codex_resume_id == rollout_uuid
+    # Origin must remain harness — observer must NOT downgrade it.
+    assert after.origin == "harness"
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_re_emit_codex_resume_id_when_already_set(tmp_path) -> None:
+    """Idempotency: a second tail of an already-bound rollout (e.g.
+    observer restart re-scans the file) must NOT re-emit the
+    session.updated event for codex_resume_id. Without this guard a
+    bridge subscriber would see duplicate session.updated events for
+    every restart that re-reads the file."""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0501-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T10:30:05.000Z",
+    )
+
+    first = await observer.tail_file(rollout)
+    first_updates = [
+        e for e in first
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("codex_resume_id") == rollout_uuid
+    ]
+    assert len(first_updates) == 1, [e.event for e in first]
+
+    # Second tail of the same path (no new lines, no new content).
+    second = await observer.tail_file(rollout)
+    second_updates = [
+        e for e in second
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("codex_resume_id") == rollout_uuid
+    ]
+    assert second_updates == []
+
+
+@pytest.mark.asyncio
 async def test_expect_codex_rollout_matches_by_cwd_and_timestamp(tmp_path) -> None:
     """The orchestrator registers an expectation at codex spawn time;
     the observer matches incoming rollouts against active expectations

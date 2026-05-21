@@ -309,6 +309,14 @@ class ExternalTranscriptObserver:
         # long uptime, a periodic sweep could be added (not load-bearing
         # today).
         self._codex_resolution_cache: dict[Path, bool] = {}
+        # Per-session set of codex_resume_id UUIDs the observer has
+        # already published a ``session.updated`` event for. Idempotency
+        # guard: a re-tail of an already-bound rollout (observer
+        # restart, or watchfiles firing twice on the same write) must
+        # not produce duplicate session.updated events
+        # (specs/2026-05-21-codex-resume.md). Cleared when an
+        # ``unbind_*`` evicts the binding.
+        self._codex_resume_id_published: set[str] = set()
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
         # threshold flips silent sessions to idle; a fresh event on an idle
@@ -576,6 +584,18 @@ class ExternalTranscriptObserver:
             return []
 
         published: list[Event] = []
+        # specs/2026-05-21-codex-resume.md: once a codex rollout has
+        # been bound to a harness session (``is_rebound`` after
+        # ``_resolve_codex_identity`` consumed an expectation), persist
+        # the rollout UUID onto the session so the next
+        # CodexCommandBuilder.build can pick ``codex exec resume``. Run
+        # before line-by-line publish so the resume_id is durable even
+        # if the rest of the tail aborts mid-flight.
+        resume_event = await self._maybe_publish_codex_resume_id(
+            transcript_path, identity,
+        )
+        if resume_event is not None:
+            published.append(resume_event)
         try:
             with transcript_path.open("rb") as transcript:
                 transcript.seek(self._state.next_offset(transcript_path))
@@ -722,6 +742,62 @@ class ExternalTranscriptObserver:
                 identity=None,
                 offset=None,
             )
+
+    async def _maybe_publish_codex_resume_id(
+        self,
+        transcript_path: Path,
+        identity: TranscriptIdentity,
+    ) -> Event | None:
+        """Persist the rollout UUID onto the bound session's
+        ``codex_resume_id``. Emits at most ONCE per (session, UUID)
+        pair: the in-memory ``_codex_resume_id_published`` set
+        deduplicates against re-tails (observer restart, watchfiles
+        firing twice), and a runtime check against the repository
+        deduplicates against already-set rows (process restart with a
+        warm SQLite DB).
+
+        Only fires for codex rollouts that resolved via the
+        expectation-matching path (``is_rebound`` + backend=codex).
+        Pure-external codex rollouts route through the backfill on
+        startup (option A from the spec); harness sessions whose
+        binding got dropped will re-emit on the next bound rollout.
+        """
+        if identity.backend != "codex" or not identity.is_rebound:
+            return None
+        if self._repository is None:
+            return None
+        match = _CODEX_ROLLOUT_RE.match(transcript_path.name)
+        if match is None:
+            return None
+        resume_id = match.group("uuid")
+        # In-memory idempotency: skip if we've already published this
+        # exact (session, UUID) pair in the current process.
+        dedupe_key = f"{identity.session_id}:{resume_id}"
+        if dedupe_key in self._codex_resume_id_published:
+            return None
+        try:
+            session = self._repository.get_session(identity.session_id)
+        except SessionNotFoundError:
+            return None
+        if session.codex_resume_id == resume_id:
+            # Already persisted (e.g. process restart, DB carried the
+            # field forward) — record the in-memory dedupe key so
+            # future re-tails short-circuit before the DB read.
+            self._codex_resume_id_published.add(dedupe_key)
+            return None
+        updated = session.model_copy(
+            update={"codex_resume_id": resume_id, "updated_at": self._clock()},
+        )
+        data: dict[str, Any] = {
+            **_source_data(identity, offset=None),
+            "session": updated.model_dump(mode="json"),
+        }
+        published = await self._publish_via_bus(
+            Event(event="session.updated", session_id=session.id, data=data)
+        )
+        if published is not None:
+            self._codex_resume_id_published.add(dedupe_key)
+        return published
 
     async def _maybe_publish_status_flip(
         self,

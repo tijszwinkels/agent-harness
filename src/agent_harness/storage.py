@@ -524,6 +524,21 @@ class SQLiteRepository:
                         self._upsert_session(
                             incoming.model_copy(update={"stats": existing.stats})
                         )
+                    elif existing.origin == "harness" and incoming.origin == "harness":
+                        # Harness→harness update: observer emits this
+                        # to set Session.codex_resume_id after a codex
+                        # rollout binds to a harness session
+                        # (specs/2026-05-21-codex-resume.md). Same
+                        # stats-preservation guard as the external
+                        # branch — incoming has a zero-valued stats
+                        # block and we mustn't wipe the accumulated
+                        # tokens / context_window / context_used.
+                        # The Phase 1 origin-downgrade guard
+                        # (external→harness rejected) stays intact:
+                        # only matching-origin incoming fires here.
+                        self._upsert_session(
+                            incoming.model_copy(update={"stats": existing.stats})
+                        )
                 return
 
             if event.event in RUN_LIFECYCLE_EVENTS:

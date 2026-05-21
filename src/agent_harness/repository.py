@@ -298,6 +298,22 @@ class InMemoryRepository:
                     self.upsert_session(
                         incoming.model_copy(update={"stats": existing.stats})
                     )
+                elif existing.origin == "harness" and incoming.origin == "harness":
+                    # Harness→harness update: the observer emits this
+                    # path to set Session.codex_resume_id after a
+                    # codex rollout binds to a harness session
+                    # (specs/2026-05-21-codex-resume.md). Apply the
+                    # same stats-preservation guard that the external
+                    # branch uses — a fresh-constructed Session has
+                    # a zero SessionStats(), and we mustn't wipe the
+                    # accumulated tokens / context_window /
+                    # context_used the harness has already gathered.
+                    # The Phase 1 origin-downgrade guard
+                    # (external→harness rejected) stays intact: only
+                    # matching-origin incoming events fire this branch.
+                    self.upsert_session(
+                        incoming.model_copy(update={"stats": existing.stats})
+                    )
             return
 
         if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:

@@ -162,6 +162,18 @@ class Session(HarnessModel):
     # (`--dangerously-skip-permissions` for claude-code,
     # `--dangerously-bypass-approvals-and-sandbox` for codex).
     bypass_permissions: bool = False
+    # Codex rollout UUID used by CodexCommandBuilder to select
+    # ``codex exec resume <uuid>`` over a fresh ``codex exec``. Set
+    # once by the observer when it extracts the UUID from a bound
+    # rollout's filename (harness origin) or by the startup backfill
+    # (external origin — UUID is encoded in ``codex_<uuid>`` ids).
+    # ``None`` for non-codex sessions and for codex sessions whose
+    # first run hasn't completed binding yet. The field is mutated
+    # exactly once; subsequent observations of the same rollout leave
+    # it alone. Distinct from the retired ``codex_internal_id``
+    # diagnostic field (PR #12 / Phase 4) — this one is the live
+    # resume key.
+    codex_resume_id: str | None = None
 
 
 class Event(HarnessModel):

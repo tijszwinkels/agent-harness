@@ -103,3 +103,26 @@ def test_run_model_defaults_to_queued_lifecycle() -> None:
 def test_create_run_request_requires_message_text() -> None:
     with pytest.raises(ValidationError):
         CreateRunRequest(message="")
+
+
+def test_session_carries_codex_resume_id_default_none() -> None:
+    """Session.codex_resume_id defaults to None and round-trips. Set
+    by the observer once a codex rollout's UUID is extractable from
+    its filename; used by CodexCommandBuilder to pick exec resume
+    over fresh exec. Spec: specs/2026-05-21-codex-resume.md"""
+    session = Session(
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/tmp/proj", name="proj"),
+    )
+    assert session.codex_resume_id is None
+
+    resumed = session.model_copy(
+        update={"codex_resume_id": "019e0500-0000-0000-0000-000000000000"}
+    )
+    assert resumed.codex_resume_id == "019e0500-0000-0000-0000-000000000000"
+    # Round-trip through JSON to confirm the field is part of the wire shape.
+    payload = resumed.model_dump(mode="json")
+    assert payload["codex_resume_id"] == "019e0500-0000-0000-0000-000000000000"
+    rehydrated = Session.model_validate(payload)
+    assert rehydrated.codex_resume_id == resumed.codex_resume_id

@@ -396,6 +396,14 @@ components:
           $ref: "#/components/schemas/Origin"
         stats:
           $ref: "#/components/schemas/SessionStats"
+        codex_resume_id:
+          type: [string, "null"]
+          description: |
+            Codex rollout UUID. Used by CodexCommandBuilder to pick `codex exec resume <uuid>` over
+            a fresh `codex exec`. Set once by the observer when binding extracts the UUID from the
+            rollout filename (harness origin), or by the startup backfill from `codex_<uuid>` ids
+            (external origin). Null on non-codex sessions and on codex sessions whose first run
+            hasn't yet completed binding.
 
     Run:
       type: object

@@ -17,6 +17,7 @@ from agent_harness.orchestrator import (
     RunManager,
     RunProcess,
     SubmitResult,
+    validate_session_resume_target,
 )
 
 
@@ -171,8 +172,16 @@ def test_codex_command_builder_uses_exec_json_mode_and_project_cwd() -> None:
 
 
 def test_codex_command_builder_resumes_external_codex_session() -> None:
+    # External codex sessions get codex_resume_id populated by the
+    # startup backfill (Option A — derived from the ``codex_<uuid>``
+    # session id). The builder reads codex_resume_id, not the id
+    # prefix; both are set here to mirror the runtime state.
     session = make_session("codex").model_copy(
-        update={"id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4", "origin": "external"}
+        update={
+            "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4",
+            "origin": "external",
+            "codex_resume_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4",
+        }
     )
     run = make_run(session)
     message = Message.user("append this")
@@ -316,6 +325,7 @@ def test_codex_command_builder_appends_dangerously_bypass_on_external_resume_whe
         update={
             "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4",
             "origin": "external",
+            "codex_resume_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4",
             "bypass_permissions": True,
         }
     )
@@ -378,12 +388,108 @@ def test_claude_code_command_builder_appends_dangerously_skip_on_external_resume
     assert skip_idx < resume_idx
 
 
-def test_external_resume_requires_expected_session_id_prefix() -> None:
-    session = make_session("codex").model_copy(update={"id": "external_without_backend_prefix", "origin": "external"})
-    run = make_run(session)
+def test_validate_session_resume_target_requires_codex_resume_id_on_external() -> None:
+    """Preflight check on the API layer: an external codex session
+    that's somehow missing codex_resume_id (backfill failed, or row
+    pre-dates the field's introduction in an out-of-order migration)
+    must error out before the builder runs — falling through to fresh
+    exec would silently lose the external rollout's prior context.
 
+    Replaces the old ``test_external_resume_requires_expected_session_id_prefix``
+    which validated the same precondition via the (now-deleted)
+    ``_external_resume_id`` helper's id-prefix check."""
+    session = make_session("codex").model_copy(
+        update={
+            "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4",
+            "origin": "external",
+            "codex_resume_id": None,
+        }
+    )
     with pytest.raises(CommandBuildError, match="Cannot resume external codex session"):
-        CodexCommandBuilder().build(session=session, run=run, message=Message.user("hello"))
+        validate_session_resume_target(session)
+
+
+# --- codex_resume_id unified field (specs/2026-05-21-codex-resume.md) -------
+#
+# CodexCommandBuilder.build collapses around session.codex_resume_id:
+# present → `codex exec resume <uuid>`; absent → fresh `codex exec`.
+# Replaces the separate origin==external branch + _external_resume_id
+# helper, which only fixed the external case and left harness-origin
+# multi-turn runs starting fresh-spawn every time.
+
+
+def test_codex_command_uses_exec_resume_when_resume_id_present() -> None:
+    """Harness-origin codex session with codex_resume_id set
+    (observer populated it after binding extracted the UUID from the
+    bound rollout filename). The builder must select
+    ``codex exec resume <uuid>`` — without this the model loses
+    context across runs."""
+    session = make_session("codex").model_copy(
+        update={"codex_resume_id": "019e0500-0000-0000-0000-000000000000"},
+    )
+    run = make_run(session)
+    command = CodexCommandBuilder().build(
+        session=session, run=run, message=Message.user("follow-up turn"),
+    )
+    assert command.argv == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "019e0500-0000-0000-0000-000000000000",
+        "follow-up turn",
+    )
+    assert command.cwd == "/workspace/project"
+
+
+def test_codex_command_uses_fresh_exec_when_resume_id_absent() -> None:
+    """First harness-origin codex run: the observer hasn't yet bound
+    a rollout to the session, so codex_resume_id is None. The builder
+    must spawn fresh `codex exec` — the observer will populate the
+    field after the rollout file appears."""
+    session = make_session("codex")  # codex_resume_id defaults to None
+    run = make_run(session)
+    command = CodexCommandBuilder().build(
+        session=session, run=run, message=Message.user("first turn"),
+    )
+    assert command.argv == (
+        "codex",
+        "exec",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "first turn",
+    )
+
+
+def test_codex_command_uses_resume_for_external_origin_via_unified_field() -> None:
+    """External-origin codex session: the startup backfill populated
+    codex_resume_id from the ``codex_<uuid>`` session id. The builder
+    branches on the unified field, NOT on origin — the two code paths
+    that used to live here (origin==external vs harness) collapse."""
+    session = make_session("codex").model_copy(
+        update={
+            "id": "codex_019e07c3-4682-7ff1-99e8-948e64bb70c4",
+            "origin": "external",
+            "codex_resume_id": "019e07c3-4682-7ff1-99e8-948e64bb70c4",
+        }
+    )
+    run = make_run(session)
+    command = CodexCommandBuilder().build(
+        session=session, run=run, message=Message.user("continue this"),
+    )
+    assert command.argv == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "019e07c3-4682-7ff1-99e8-948e64bb70c4",
+        "continue this",
+    )
 
 
 @pytest.mark.asyncio

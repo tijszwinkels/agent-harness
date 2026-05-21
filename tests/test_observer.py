@@ -1455,6 +1455,88 @@ async def test_observer_populates_codex_resume_id_on_codex_binding(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_codex_multi_turn_resumes_after_observer_binding_pineapple(tmp_path) -> None:
+    """End-to-end PINEAPPLE-shaped test (the spec's canonical multi-
+    turn proof): observer binds the codex rollout → codex_resume_id
+    populated → CodexCommandBuilder.build on turn 2 picks
+    ``codex exec resume <uuid>``. Without this PR's wiring, turn 2
+    would spawn a fresh codex with no prior context — the latent bug
+    Aster found in vivo on 2026-05-21.
+    Spec: specs/2026-05-21-codex-resume.md"""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+    from agent_harness.orchestrator import CodexCommandBuilder
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    turn1_run = repository.create_run(
+        session.id, CreateRunRequest(message="Remember the word PINEAPPLE.")
+    )
+    repository.start_run(session.id, turn1_run.id)
+
+    builder = CodexCommandBuilder()
+
+    # Turn 1 build happens BEFORE the observer has bound a rollout —
+    # codex_resume_id is still None, so the command is fresh exec.
+    turn1_command = builder.build(
+        session=repository.get_session(session.id),
+        run=turn1_run,
+        message=Message.user("Remember the word PINEAPPLE."),
+    )
+    assert "resume" not in turn1_command.argv
+
+    # Simulate codex writing its rollout while turn 1 runs. The
+    # orchestrator's spawn path registered the expectation; the
+    # observer matches it on the rollout's session_meta.
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0aa0-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T10:30:05.000Z",
+    )
+    await observer.tail_file(rollout)
+
+    # Turn 2: the user asks codex to recall PINEAPPLE. With the
+    # observer's session.updated event applied, codex_resume_id is
+    # set and the builder picks exec resume — the model SEES turn 1's
+    # context.
+    turn2_run = repository.create_run(
+        session.id,
+        CreateRunRequest(message="What word did I ask you to remember?"),
+    )
+    repository.start_run(session.id, turn2_run.id)
+    turn2_command = builder.build(
+        session=repository.get_session(session.id),
+        run=turn2_run,
+        message=Message.user("What word did I ask you to remember?"),
+    )
+    assert turn2_command.argv == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        rollout_uuid,
+        "What word did I ask you to remember?",
+    )
+
+
+@pytest.mark.asyncio
 async def test_observer_does_not_re_emit_codex_resume_id_when_already_set(tmp_path) -> None:
     """Idempotency: a second tail of an already-bound rollout (e.g.
     observer restart re-scans the file) must NOT re-emit the

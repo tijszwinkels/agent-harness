@@ -1337,6 +1337,48 @@ def _write_codex_rollout_with_session_meta(
     return transcript
 
 
+@pytest.mark.asyncio
+async def test_observer_populates_codex_resume_id_on_runtime_discovered_external(tmp_path) -> None:
+    """Halcyon's NEEDS-FIX on PR #18: the Option A backfill only fires
+    in ``__init__``, but external codex rollouts that appear AFTER
+    observer startup get synthesized in ``_session_event_if_complete``
+    with codex_resume_id=None. The next POST /v1/runs against that
+    session hits ``validate_session_resume_target`` and dies with
+    "Cannot resume external codex session" — a regression vs the
+    pre-PR behavior where ``_external_resume_id`` derived the UUID at
+    command-build time. Runtime-discovered external rows must arrive
+    with codex_resume_id already set, mirroring the backfill."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 11, 0, 0, tzinfo=UTC)
+    # Observer starts BEFORE the rollout exists — no backfill candidate.
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+
+    # Now a fresh external codex rollout appears (no expectation
+    # registered → routes via filename pattern → external session row).
+    rollout_uuid = "019e0c00-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T11:00:05.000Z",
+    )
+
+    await observer.tail_file(rollout)
+
+    external_id = f"codex_{rollout_uuid}"
+    session = repository.get_session(external_id)
+    assert session.codex_resume_id == rollout_uuid, (
+        "Runtime-discovered external codex session must carry "
+        "codex_resume_id; otherwise validate_session_resume_target "
+        "rejects the next POST /v1/runs (Halcyon's NEEDS-FIX)."
+    )
+
+
 def test_observer_seeds_codex_resume_id_for_external_sessions_on_restart() -> None:
     """Option A backfill (specs/2026-05-21-codex-resume.md): existing
     external-origin codex sessions encode the rollout UUID in their

@@ -53,6 +53,32 @@ _CODEX_ROLLOUT_RE = re.compile(
 _CODEX_UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def _codex_resume_id_from_external_session_id(session_id: str) -> str | None:
+    """Derive the codex rollout UUID from an external session id.
+
+    External codex sessions encode the rollout UUID directly in the
+    session id (``codex_<uuid>`` — see
+    ``external_session_id_from_codex_path``). Returns the UUID when the
+    id matches that shape; ``None`` otherwise so callers can fall
+    through cleanly for non-external rows or malformed ids.
+
+    Shared by the Option A startup backfill
+    (``_backfill_codex_resume_id_from_external_ids``) and the
+    runtime-discovery path (``_session_event_if_complete``) so newly
+    appearing external codex rollouts arrive with codex_resume_id
+    already populated. Halcyon's NEEDS-FIX on PR #18: without this
+    inline derivation, ``validate_session_resume_target`` rejects the
+    next POST /v1/runs because the synthesized Session carries
+    ``codex_resume_id=None``.
+    """
+    if not session_id.startswith("codex_"):
+        return None
+    candidate = session_id.removeprefix("codex_")
+    if not _CODEX_UUID_RE.fullmatch(candidate):
+        return None
+    return candidate
 # Claude rollout record-types we intentionally drop on the floor.
 # Phase 4 audit: every entry here has a "record genuinely doesn't
 # carry message-shaped content for us" rationale — not "avoid
@@ -363,12 +389,11 @@ class ExternalTranscriptObserver:
                 continue
             if session.codex_resume_id is not None:
                 continue
-            if not session.id.startswith("codex_"):
-                continue
-            resume_id = session.id.removeprefix("codex_")
-            if not _CODEX_UUID_RE.fullmatch(resume_id):
-                # Defensive: a stray non-UUID id sneaking in (e.g.
-                # legacy data) shouldn't crash backfill. Skip and log.
+            resume_id = _codex_resume_id_from_external_session_id(session.id)
+            if resume_id is None:
+                # Defensive: a stray non-codex_ or non-UUID id sneaking
+                # in (e.g. legacy data) shouldn't crash backfill. Skip
+                # and log.
                 logger.warning(
                     "Skipping codex_resume_id backfill for non-UUID id: %s",
                     session.id,
@@ -1405,6 +1430,19 @@ def _session_event_if_complete(
     if identity.is_rebound:
         return []
 
+    # External codex rollouts encode the rollout UUID in the session
+    # id. Populate codex_resume_id inline so the synthesized row
+    # arrives at the materializer ready for ``codex exec resume`` —
+    # the next POST /v1/runs would otherwise be rejected by
+    # ``validate_session_resume_target``. The Option A startup
+    # backfill handles rows that pre-date this code; the inline path
+    # here handles rows discovered after observer construction.
+    # Halcyon's NEEDS-FIX on PR #18.
+    codex_resume_id: str | None = None
+    if identity.backend == "codex":
+        codex_resume_id = _codex_resume_id_from_external_session_id(
+            identity.session_id,
+        )
     session = Session(
         id=identity.session_id,
         backend=identity.backend,
@@ -1412,6 +1450,7 @@ def _session_event_if_complete(
         project=Project(path=cwd, name=Path(cwd).name or cwd),
         status="running",
         origin="external",
+        codex_resume_id=codex_resume_id,
     )
     return [
         Event(

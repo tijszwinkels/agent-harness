@@ -492,6 +492,36 @@ def test_codex_command_uses_resume_for_external_origin_via_unified_field() -> No
     )
 
 
+def test_codex_command_resumes_harness_origin_independent_of_origin_field() -> None:
+    """Regression pin for the persona-loss bug (specs/2026-05-21-codex-resume.md).
+
+    On main the resume gate was ``session.origin == "external"``, so a
+    *harness*-origin follow-up run NEVER emitted a resume token — codex
+    wrote a brand-new rollout every turn and the model lost all prior
+    context, including the turn-1 persona kickoff. This test asserts the
+    gate is now origin-independent: a harness-origin session with
+    ``codex_resume_id`` set MUST resume the exact UUID. Asserting
+    ``origin == "harness"`` explicitly is the load-bearing part — it
+    fails the moment anyone re-couples the gate to origin."""
+    session = make_session("codex").model_copy(
+        update={"codex_resume_id": "019e0500-0000-0000-0000-0000000000aa"},
+    )
+    assert session.origin == "harness"
+    run = make_run(session)
+
+    command = CodexCommandBuilder().build(
+        session=session, run=run, message=Message.user("what is your name?"),
+    )
+
+    assert "resume" in command.argv
+    resume_idx = command.argv.index("resume")
+    # `codex exec resume <uuid> <text>` — uuid follows the model flag,
+    # prompt is the final positional.
+    assert command.argv[:resume_idx] == ("codex", "exec")
+    assert "019e0500-0000-0000-0000-0000000000aa" in command.argv
+    assert command.argv[-1] == "what is your name?"
+
+
 @pytest.mark.asyncio
 async def test_run_process_publishes_process_stderr_and_completion() -> None:
     """Phase 2: stdout non-JSON lines do not travel the event bus

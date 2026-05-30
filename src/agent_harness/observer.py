@@ -174,8 +174,12 @@ class CodexRolloutExpectation:
     expectations by ``session_meta.cwd`` + a ±30s timestamp window —
     content-based, not timing-based, so a watchfiles inotify firing
     BEFORE the orchestrator's spawn-side handoff can still resolve
-    correctly. Expectations have a TTL so a failed/cancelled spawn
-    doesn't leave a permanent ghost hint.
+    correctly. When the timestamp window misses — notably for
+    ``codex exec resume <uuid>``, which reuses the original rollout and
+    freezes ``session_meta.timestamp`` at first-creation time — the
+    observer falls back to matching the rollout's filename UUID against
+    the target session's ``codex_resume_id``. Expectations have a TTL so
+    a failed/cancelled spawn doesn't leave a permanent ghost hint.
     """
 
     cwd: Path
@@ -583,8 +587,23 @@ class ExternalTranscriptObserver:
             cwd=peek.cwd, timestamp=peek.timestamp
         )
         if expectation is None:
-            self._codex_resolution_cache[transcript_path] = True
-            return base
+            # ``codex exec resume <uuid>`` reuses the original rollout
+            # file and never rewrites its ``session_meta`` timestamp, so
+            # an expectation registered minutes after the rollout was
+            # first created falls outside the ±30s ``session_meta``
+            # window above. Fall back to the unambiguous resume signal:
+            # the rollout's UUID equals the resumed session's
+            # ``codex_resume_id``. Without this, every resumed turn's
+            # events were misattributed to a synthetic external
+            # ``codex_<uuid>`` row and the harness session's resumed-turn
+            # answers materialized empty (live defect
+            # ses_47d554abc7224cc4b4ac9ac209279cb2).
+            expectation = self._find_resume_expectation(
+                transcript_path, cwd=peek.cwd
+            )
+            if expectation is None:
+                self._codex_resolution_cache[transcript_path] = True
+                return base
 
         self._consume_expectation(expectation)
         self._path_to_session[transcript_path] = expectation.session_id
@@ -594,6 +613,60 @@ class ExternalTranscriptObserver:
             session_id=expectation.session_id,
             is_rebound=True,
         )
+
+    def _find_resume_expectation(
+        self, transcript_path: Path, *, cwd: str
+    ) -> CodexRolloutExpectation | None:
+        """Match a resumed rollout by UUID rather than timestamp.
+
+        Returns the active expectation for ``cwd`` whose target session
+        carries this rollout's UUID as its ``codex_resume_id`` — i.e.
+        the session the orchestrator launched via
+        ``codex exec resume <uuid>``. The timestamp window doesn't help
+        here because codex freezes ``session_meta.timestamp`` at the
+        rollout's original creation time, so resumes drift arbitrarily
+        far from the expectation's registration time.
+        """
+        if self._repository is None:
+            return None
+        match = _CODEX_ROLLOUT_RE.match(transcript_path.name)
+        if match is None:
+            return None
+        resume_id = match.group("uuid")
+        cwd_path = Path(cwd)
+        # Mirror ``_purge_expired_expectations`` expiry semantics on the
+        # observer's injected clock so this method is correct even if a
+        # caller hasn't just purged.
+        now = self._clock()
+        matches = [
+            exp
+            for exp in self._codex_expectations
+            if exp.cwd == cwd_path
+            and exp.expires_at > now
+            and self._session_resume_id(exp.session_id) == resume_id
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # Distinct harness sessions carry distinct codex_resume_ids,
+            # so this is impossible in practice — surface degenerate or
+            # injected data instead of silently picking the first.
+            logger.warning(
+                "multiple active codex expectations match resume_id=%s "
+                "in cwd=%s; sessions=%s — returning first",
+                resume_id,
+                cwd_path,
+                [exp.session_id for exp in matches],
+            )
+        return matches[0]
+
+    def _session_resume_id(self, session_id: str) -> str | None:
+        """``codex_resume_id`` for ``session_id``, or ``None`` if the
+        session has vanished from the repository."""
+        try:
+            return self._repository.get_session(session_id).codex_resume_id
+        except SessionNotFoundError:
+            return None
 
     def _purge_expired_expectations(self) -> None:
         now = self._clock()

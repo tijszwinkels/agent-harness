@@ -87,7 +87,16 @@ class CodexCommandBuilder:
             if session.bypass_permissions
             else ()
         )
-        if session.origin == "external":
+        # Unified resume gate: present codex_resume_id → resume,
+        # absent → fresh exec. The field is populated by the observer
+        # when binding extracts the UUID from a bound rollout's
+        # filename (harness origin) or by the startup backfill from
+        # ``codex_<uuid>`` ids (external origin). Replaces the prior
+        # split between an origin==external branch and a no-resume
+        # harness branch — the harness side never resumed at all,
+        # which is why multi-turn codex runs lost context across
+        # turns (spec: 2026-05-21-codex-resume.md).
+        if session.codex_resume_id is not None:
             return ProcessCommand(
                 argv=(
                     "codex",
@@ -97,7 +106,7 @@ class CodexCommandBuilder:
                     "--model",
                     session.model,
                     *bypass,
-                    _external_resume_id(session, prefix="codex_"),
+                    session.codex_resume_id,
                     text,
                 ),
                 cwd=session.project.path,
@@ -196,7 +205,14 @@ def validate_session_resume_target(session: Session) -> None:
     if session.origin != "external":
         return
     if session.backend == "codex":
-        _external_resume_id(session, prefix="codex_")
+        # External codex sessions must carry codex_resume_id (set by
+        # the startup backfill from the ``codex_<uuid>`` id). Falling
+        # through to fresh exec on an external session would silently
+        # discard the rollout's prior context.
+        if session.codex_resume_id is None:
+            raise CommandBuildError(
+                f"Cannot resume external codex session from id {session.id}",
+            )
         return
     if session.backend == "claude-code":
         # Validates session.id resolves to a claude UUID under any of the
@@ -914,16 +930,6 @@ def _message_text(message: Message) -> str:
     if not text:
         raise ValueError("Message must include at least one text block for CLI launch")
     return text
-
-
-def _external_resume_id(session: Session, *, prefix: str) -> str:
-    if session.id.startswith(prefix):
-        resume_id = session.id.removeprefix(prefix)
-        if resume_id:
-            return resume_id
-
-    backend = "claude" if prefix == "claude_" else prefix.rstrip("_")
-    raise CommandBuildError(f"Cannot resume external {backend} session from id {session.id}")
 
 
 def _format_timestamp(value: datetime) -> str:

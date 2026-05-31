@@ -1338,6 +1338,391 @@ def _write_codex_rollout_with_session_meta(
 
 
 @pytest.mark.asyncio
+async def test_unbind_session_clears_codex_resume_id_published_dedupe(tmp_path) -> None:
+    """Halcyon's NEEDS-FIX on PR #18: the
+    ``_codex_resume_id_published`` set docstring promised eviction on
+    unbind but neither ``unbind_session`` nor ``unbind_rollout``
+    actually cleared it. The set grew monotonically across the
+    observer's lifetime (one entry per codex run per session). The
+    functional impact was benign — each new rollout uses a fresh
+    UUID so dedupe keys diverged — but the docstring lied and memory
+    leaked. After this fix, unbinding a session evicts all of its
+    dedupe keys."""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 12, 0, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0d00-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T12:00:05.000Z",
+    )
+    await observer.tail_file(rollout)
+
+    # Dedupe key was populated during binding.
+    dedupe_key = f"{session.id}:{rollout_uuid}"
+    assert dedupe_key in observer._codex_resume_id_published
+
+    # End-of-run hook calls unbind_session — clear the dedupe entries.
+    observer.unbind_session(session.id)
+    assert dedupe_key not in observer._codex_resume_id_published
+
+
+@pytest.mark.asyncio
+async def test_unbind_rollout_clears_codex_resume_id_published_dedupe(tmp_path) -> None:
+    """Parallel coverage: ``unbind_rollout`` (path-keyed eviction)
+    also clears the dedupe entry for the bound (session, UUID) pair.
+    Used by the claude pre-bind path; covers codex too if the
+    orchestrator ever falls back to path-based eviction."""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 12, 5, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0d01-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T12:05:05.000Z",
+    )
+    await observer.tail_file(rollout)
+
+    dedupe_key = f"{session.id}:{rollout_uuid}"
+    assert dedupe_key in observer._codex_resume_id_published
+
+    observer.unbind_rollout(rollout)
+    assert dedupe_key not in observer._codex_resume_id_published
+
+
+@pytest.mark.asyncio
+async def test_observer_populates_codex_resume_id_on_runtime_discovered_external(tmp_path) -> None:
+    """Halcyon's NEEDS-FIX on PR #18: the Option A backfill only fires
+    in ``__init__``, but external codex rollouts that appear AFTER
+    observer startup get synthesized in ``_session_event_if_complete``
+    with codex_resume_id=None. The next POST /v1/runs against that
+    session hits ``validate_session_resume_target`` and dies with
+    "Cannot resume external codex session" — a regression vs the
+    pre-PR behavior where ``_external_resume_id`` derived the UUID at
+    command-build time. Runtime-discovered external rows must arrive
+    with codex_resume_id already set, mirroring the backfill."""
+    from datetime import UTC, datetime
+
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 11, 0, 0, tzinfo=UTC)
+    # Observer starts BEFORE the rollout exists — no backfill candidate.
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+
+    # Now a fresh external codex rollout appears (no expectation
+    # registered → routes via filename pattern → external session row).
+    rollout_uuid = "019e0c00-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T11:00:05.000Z",
+    )
+
+    await observer.tail_file(rollout)
+
+    external_id = f"codex_{rollout_uuid}"
+    session = repository.get_session(external_id)
+    assert session.codex_resume_id == rollout_uuid, (
+        "Runtime-discovered external codex session must carry "
+        "codex_resume_id; otherwise validate_session_resume_target "
+        "rejects the next POST /v1/runs (Halcyon's NEEDS-FIX)."
+    )
+
+
+def test_observer_seeds_codex_resume_id_for_external_sessions_on_restart() -> None:
+    """Option A backfill (specs/2026-05-21-codex-resume.md): existing
+    external-origin codex sessions encode the rollout UUID in their
+    ``codex_<uuid>`` id. On observer construction (process startup)
+    the backfill populates codex_resume_id from that prefix so the
+    next CodexCommandBuilder.build can pick exec resume — no
+    schema change, no second observer pass."""
+    repository = InMemoryRepository()
+    # Seed two external codex sessions: one missing codex_resume_id
+    # (pre-feature row), one already populated (idempotent skip).
+    pre_feature = Session(
+        id="codex_019e0700-0000-0000-0000-000000000000",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        origin="external",
+    )
+    assert pre_feature.codex_resume_id is None
+    repository.upsert_session(pre_feature)
+
+    already_set = Session(
+        id="codex_019e0701-0000-0000-0000-000000000000",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo2", name="repo2"),
+        origin="external",
+        codex_resume_id="overridden-do-not-touch",
+    )
+    repository.upsert_session(already_set)
+
+    # Constructing the observer runs the seeding hooks.
+    bus = InMemoryEventBus()
+    ExternalTranscriptObserver(bus, repository=repository)
+
+    after_pre = repository.get_session(pre_feature.id)
+    assert after_pre.codex_resume_id == "019e0700-0000-0000-0000-000000000000"
+    # Already-set row must NOT be overwritten by the backfill.
+    after_already = repository.get_session(already_set.id)
+    assert after_already.codex_resume_id == "overridden-do-not-touch"
+
+
+def test_observer_backfill_skips_harness_origin_and_non_codex_sessions() -> None:
+    """Backfill must NOT touch harness-origin sessions (their
+    codex_resume_id is set by the observer on binding, not derived
+    from the id) and must NOT touch claude sessions (no codex resume
+    semantics at all)."""
+    repository = InMemoryRepository()
+    harness_codex = Session(
+        id="ses_019e070200000000000000000000000a",
+        backend="codex",
+        model="gpt-5.4",
+        project=Project(path="/repo", name="repo"),
+        origin="harness",
+    )
+    external_claude = Session(
+        id="claude_019e0703-0000-0000-0000-000000000000",
+        backend="claude-code",
+        model="claude-opus-4-7",
+        project=Project(path="/repo2", name="repo2"),
+        origin="external",
+    )
+    repository.upsert_session(harness_codex)
+    repository.upsert_session(external_claude)
+
+    bus = InMemoryEventBus()
+    ExternalTranscriptObserver(bus, repository=repository)
+
+    assert repository.get_session(harness_codex.id).codex_resume_id is None
+    assert repository.get_session(external_claude.id).codex_resume_id is None
+
+
+@pytest.mark.asyncio
+async def test_observer_populates_codex_resume_id_on_codex_binding(tmp_path) -> None:
+    """When the observer matches a codex rollout to a harness session
+    expectation, it must persist the rollout UUID onto
+    ``Session.codex_resume_id`` so the next ``CodexCommandBuilder.build``
+    can pick ``codex exec resume <uuid>`` and the model retains
+    multi-turn context. The UUID comes from the rollout filename
+    (``rollout-<ts>-<UUID>.jsonl``). Spec: specs/2026-05-21-codex-resume.md"""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    # Sanity: codex_resume_id starts None (harness origin, no run yet).
+    assert session.codex_resume_id is None
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0500-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T10:30:05.000Z",
+    )
+
+    await observer.tail_file(rollout)
+
+    after = repository.get_session(session.id)
+    assert after.codex_resume_id == rollout_uuid
+    # Origin must remain harness — observer must NOT downgrade it.
+    assert after.origin == "harness"
+
+
+@pytest.mark.asyncio
+async def test_codex_multi_turn_resumes_after_observer_binding_pineapple(tmp_path) -> None:
+    """End-to-end PINEAPPLE-shaped test (the spec's canonical multi-
+    turn proof): observer binds the codex rollout → codex_resume_id
+    populated → CodexCommandBuilder.build on turn 2 picks
+    ``codex exec resume <uuid>``. Without this PR's wiring, turn 2
+    would spawn a fresh codex with no prior context — the latent bug
+    Aster found in vivo on 2026-05-21.
+    Spec: specs/2026-05-21-codex-resume.md"""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+    from agent_harness.orchestrator import CodexCommandBuilder
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    turn1_run = repository.create_run(
+        session.id, CreateRunRequest(message="Remember the word PINEAPPLE.")
+    )
+    repository.start_run(session.id, turn1_run.id)
+
+    builder = CodexCommandBuilder()
+
+    # Turn 1 build happens BEFORE the observer has bound a rollout —
+    # codex_resume_id is still None, so the command is fresh exec.
+    turn1_command = builder.build(
+        session=repository.get_session(session.id),
+        run=turn1_run,
+        message=Message.user("Remember the word PINEAPPLE."),
+    )
+    assert "resume" not in turn1_command.argv
+
+    # Simulate codex writing its rollout while turn 1 runs. The
+    # orchestrator's spawn path registered the expectation; the
+    # observer matches it on the rollout's session_meta.
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0aa0-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T10:30:05.000Z",
+    )
+    await observer.tail_file(rollout)
+
+    # Turn 2: the user asks codex to recall PINEAPPLE. With the
+    # observer's session.updated event applied, codex_resume_id is
+    # set and the builder picks exec resume — the model SEES turn 1's
+    # context.
+    turn2_run = repository.create_run(
+        session.id,
+        CreateRunRequest(message="What word did I ask you to remember?"),
+    )
+    repository.start_run(session.id, turn2_run.id)
+    turn2_command = builder.build(
+        session=repository.get_session(session.id),
+        run=turn2_run,
+        message=Message.user("What word did I ask you to remember?"),
+    )
+    assert turn2_command.argv == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        rollout_uuid,
+        "What word did I ask you to remember?",
+    )
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_re_emit_codex_resume_id_when_already_set(tmp_path) -> None:
+    """Idempotency: a second tail of an already-bound rollout (e.g.
+    observer restart re-scans the file) must NOT re-emit the
+    session.updated event for codex_resume_id. Without this guard a
+    bridge subscriber would see duplicate session.updated events for
+    every restart that re-reads the file."""
+    from datetime import UTC, datetime
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    repository.create_run(session.id, CreateRunRequest(message="turn 1"))
+
+    bus = InMemoryEventBus()
+    fixed_now = datetime(2026, 5, 21, 10, 30, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: fixed_now,
+    )
+    observer.expect_codex_rollout(cwd=Path("/repo"), session_id=session.id)
+
+    rollout_uuid = "019e0501-0000-0000-0000-000000000000"
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=rollout_uuid,
+        cwd="/repo",
+        session_meta_ts="2026-05-21T10:30:05.000Z",
+    )
+
+    first = await observer.tail_file(rollout)
+    first_updates = [
+        e for e in first
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("codex_resume_id") == rollout_uuid
+    ]
+    assert len(first_updates) == 1, [e.event for e in first]
+
+    # Second tail of the same path (no new lines, no new content).
+    second = await observer.tail_file(rollout)
+    second_updates = [
+        e for e in second
+        if e.event == "session.updated"
+        and e.data.get("session", {}).get("codex_resume_id") == rollout_uuid
+    ]
+    assert second_updates == []
+
+
+@pytest.mark.asyncio
 async def test_expect_codex_rollout_matches_by_cwd_and_timestamp(tmp_path) -> None:
     """The orchestrator registers an expectation at codex spawn time;
     the observer matches incoming rollouts against active expectations
@@ -2427,3 +2812,222 @@ async def test_expect_codex_rollout_invalidates_resolution_cache(tmp_path) -> No
     assert published2, "expected at least one event after the new line"
     for event in published2:
         assert event.session_id == "ses_late_arrival", event
+
+
+# --- regression: resumed codex turns must materialize their text -------------
+#
+# Live defect (ses_47d554abc7224cc4b4ac9ac209279cb2): a codex-backed
+# harness session whose first turn (`codex exec`) delivered its reply
+# fine, but every SUBSEQUENT turn (`codex exec resume <uuid>`) appended
+# to the SAME rollout file and materialized as EMPTY assistant text —
+# the bridge posted only the operator mention with no body.
+#
+# Root cause: codex never rewrites the rollout's ``session_meta``
+# timestamp on resume, so the expectation registered at resume time
+# (minutes after the rollout was first created) fell OUTSIDE the ±30s
+# ``session_meta`` matching window in ``_resolve_codex_identity``. The
+# resumed turn's events were attributed to a synthesized external
+# ``codex_<uuid>`` row instead of the bound harness session, leaving
+# the harness session's resumed-turn answers empty.
+
+_CODEX_RESUME_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "examples" / "fixtures" / "codex-resume-empty-msg.jsonl"
+)
+
+
+def _assistant_texts(messages) -> list[str]:
+    texts: list[str] = []
+    for message in messages:
+        if message.role != "assistant":
+            continue
+        for block in message.blocks:
+            if getattr(block, "type", None) == "text" and block.text:
+                texts.append(block.text)
+    return texts
+
+
+@pytest.mark.asyncio
+async def test_resumed_codex_turns_materialize_assistant_text(tmp_path) -> None:
+    """Replay the frozen ``codex exec resume`` rollout across three
+    harness runs and assert ALL THREE assistant answers materialize on
+    the harness session — not just the first turn.
+
+    The fixture is the real rollout from the live defect: three
+    ``task_started``/``task_complete`` turns appended to a single file
+    whose ``session_meta`` timestamp never moves. We drive the observer
+    the way the orchestrator does — register a fresh expectation per
+    run, tail the (now longer) file, then ``unbind_session`` in the
+    run's finally block — with resume timestamps two and four minutes
+    after the rollout was first created, i.e. well outside the ±30s
+    ``session_meta`` window."""
+    from datetime import UTC, datetime, timedelta
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+    from agent_harness.storage import open_sqlite_repository
+
+    import json
+
+    lines = [
+        line
+        for line in _CODEX_RESUME_FIXTURE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    records = [json.loads(line) for line in lines]
+    rollout_uuid = records[0]["payload"]["id"]
+    cwd = records[0]["payload"]["cwd"]
+    # The three ``task_complete`` events bookend the three turns; the
+    # line index just past each is the cut point for an incremental tail.
+    turn_ends = [
+        index + 1
+        for index, record in enumerate(records)
+        if record.get("type") == "event_msg"
+        and record.get("payload", {}).get("type") == "task_complete"
+    ]
+    assert len(turn_ends) == 3, "fixture must contain exactly three turns"
+
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    bus = DurableEventBus(repository)
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path=cwd, name=Path(cwd).name),
+        )
+    )
+
+    # Rollout's first event timestamp — frozen across every resume.
+    rollout_created = datetime(2026, 5, 30, 12, 57, 18, tzinfo=UTC)
+    now_box = [rollout_created]
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: now_box[0]
+    )
+
+    rollout = (
+        tmp_path / ".codex" / "sessions" / "2026" / "05" / "30"
+        / f"rollout-2026-05-30T12-57-18-{rollout_uuid}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+
+    def write_through(line_count: int) -> None:
+        rollout.write_text("\n".join(lines[:line_count]) + "\n", encoding="utf-8")
+
+    # Turn 1 is `codex exec` (registered ~when the rollout is created);
+    # turns 2 and 3 are `codex exec resume` two/four minutes later.
+    run_clocks = [
+        rollout_created,
+        rollout_created + timedelta(minutes=2),
+        rollout_created + timedelta(minutes=4),
+    ]
+    for turn_index, (run_clock, end_line) in enumerate(zip(run_clocks, turn_ends)):
+        now_box[0] = run_clock
+        repository.create_run(
+            session.id, CreateRunRequest(message=f"turn {turn_index + 1}")
+        )
+        observer.expect_codex_rollout(cwd=Path(cwd), session_id=session.id)
+        write_through(end_line)
+        await observer.tail_file(rollout)
+        # Orchestrator's per-run finally block.
+        observer.unbind_session(session.id)
+
+    texts = _assistant_texts(repository.list_messages(session.id))
+    assert len(texts) == 3, (
+        "all three resumed assistant answers must materialize on the "
+        f"harness session, got {len(texts)}: {[t[:40] for t in texts]}"
+    )
+    assert texts[0].startswith("Hi Tijs."), texts[0][:60]
+    assert texts[1].startswith("Executive summary:"), texts[1][:60]
+    assert texts[2].startswith("You’re right to question that:"), texts[2][:60]
+
+    # The resumed turns must NOT leak into a synthesized external row.
+    from agent_harness.repository import SessionNotFoundError
+
+    with pytest.raises(SessionNotFoundError):
+        repository.get_session(f"codex_{rollout_uuid}")
+
+
+@pytest.mark.asyncio
+async def test_resume_uuid_discriminates_concurrent_same_cwd_sessions(
+    tmp_path,
+) -> None:
+    """Two harness sessions resuming in the SAME cwd must not steal each
+    other's reappearing rollout.
+
+    This pins the load-bearing discriminator of ``_find_resume_expectation``:
+    when the ±30s ``session_meta`` window misses for BOTH active
+    expectations (frozen resume timestamp), the rollout binds to the
+    session whose ``codex_resume_id`` equals the rollout's filename UUID —
+    not merely the first same-cwd expectation. Session A's rollout
+    reappears; it must materialize A's text and leave B uncorrupted.
+    """
+    from datetime import UTC, datetime, timedelta
+    from agent_harness.models import CreateRunRequest, CreateSessionRequest
+    from agent_harness.repository import SessionNotFoundError
+
+    repository = InMemoryRepository()
+    bus = InMemoryEventBus()
+    cwd = "/repo"
+
+    def make_session(resume_id: str) -> Session:
+        session = repository.create_session(
+            CreateSessionRequest(
+                backend="codex",
+                model="gpt-5.4",
+                project=Project(path=cwd, name="repo"),
+            )
+        )
+        repository.create_run(session.id, CreateRunRequest(message="turn"))
+        # A prior turn already bound this session to its own rollout,
+        # so codex_resume_id is set — the resume discriminator.
+        repository.upsert_session(
+            repository.get_session(session.id).model_copy(
+                update={"codex_resume_id": resume_id}
+            )
+        )
+        return session
+
+    uuid_a = "019e0a00-0000-0000-0000-00000000000a"
+    uuid_b = "019e0b00-0000-0000-0000-00000000000b"
+    session_a = make_session(uuid_a)
+    session_b = make_session(uuid_b)
+
+    # Register both expectations at ``now``; both stay active (TTL 60s).
+    now = datetime(2026, 5, 30, 12, 0, 0, tzinfo=UTC)
+    observer = ExternalTranscriptObserver(
+        bus, repository=repository, clock=lambda: now
+    )
+    observer.expect_codex_rollout(cwd=Path(cwd), session_id=session_a.id)
+    observer.expect_codex_rollout(cwd=Path(cwd), session_id=session_b.id)
+
+    # A's rollout reappears. Its frozen session_meta timestamp sits 45s
+    # before registration — outside the ±30s window — so the timestamp
+    # path misses and the UUID fallback must do the work.
+    frozen_ts = (now - timedelta(seconds=45)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    rollout = _write_codex_rollout_with_session_meta(
+        tmp_path,
+        rollout_uuid=uuid_a,
+        cwd=cwd,
+        session_meta_ts=frozen_ts,
+        body_lines=[
+            '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}',
+            '{"type":"event_msg","payload":{"type":"user_message","message":"resume me"}}',
+            # Assistant text materializes from the canonical
+            # response_item/message form (the event_msg/agent_message
+            # form is deliberately ignored to avoid double-emit).
+            '{"type":"response_item","payload":{"type":"message","role":"assistant",'
+            '"content":[{"type":"output_text","text":"A reply"}]}}',
+        ],
+    )
+
+    await observer.tail_file(rollout)
+
+    texts_a = _assistant_texts(repository.list_messages(session_a.id))
+    assert texts_a == ["A reply"], texts_a
+
+    # B must be uncorrupted: A's reply must NOT leak into B, and B's
+    # own codex_resume_id must be intact. (B still has its own run's
+    # "turn" user message — that's expected, not corruption.)
+    assert _assistant_texts(repository.list_messages(session_b.id)) == []
+    assert repository.get_session(session_b.id).codex_resume_id == uuid_b
+    # And A's rollout must not have leaked into a synthesized external row.
+    with pytest.raises(SessionNotFoundError):
+        repository.get_session(f"codex_{uuid_a}")

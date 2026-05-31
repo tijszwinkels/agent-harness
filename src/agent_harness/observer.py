@@ -50,6 +50,35 @@ logger = logging.getLogger(__name__)
 _CODEX_ROLLOUT_RE = re.compile(
     r"^rollout-.+-(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
+_CODEX_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _codex_resume_id_from_external_session_id(session_id: str) -> str | None:
+    """Derive the codex rollout UUID from an external session id.
+
+    External codex sessions encode the rollout UUID directly in the
+    session id (``codex_<uuid>`` — see
+    ``external_session_id_from_codex_path``). Returns the UUID when the
+    id matches that shape; ``None`` otherwise so callers can fall
+    through cleanly for non-external rows or malformed ids.
+
+    Shared by the Option A startup backfill
+    (``_backfill_codex_resume_id_from_external_ids``) and the
+    runtime-discovery path (``_session_event_if_complete``) so newly
+    appearing external codex rollouts arrive with codex_resume_id
+    already populated. Halcyon's NEEDS-FIX on PR #18: without this
+    inline derivation, ``validate_session_resume_target`` rejects the
+    next POST /v1/runs because the synthesized Session carries
+    ``codex_resume_id=None``.
+    """
+    if not session_id.startswith("codex_"):
+        return None
+    candidate = session_id.removeprefix("codex_")
+    if not _CODEX_UUID_RE.fullmatch(candidate):
+        return None
+    return candidate
 # Claude rollout record-types we intentionally drop on the floor.
 # Phase 4 audit: every entry here has a "record genuinely doesn't
 # carry message-shaped content for us" rationale — not "avoid
@@ -145,8 +174,12 @@ class CodexRolloutExpectation:
     expectations by ``session_meta.cwd`` + a ±30s timestamp window —
     content-based, not timing-based, so a watchfiles inotify firing
     BEFORE the orchestrator's spawn-side handoff can still resolve
-    correctly. Expectations have a TTL so a failed/cancelled spawn
-    doesn't leave a permanent ghost hint.
+    correctly. When the timestamp window misses — notably for
+    ``codex exec resume <uuid>``, which reuses the original rollout and
+    freezes ``session_meta.timestamp`` at first-creation time — the
+    observer falls back to matching the rollout's filename UUID against
+    the target session's ``codex_resume_id``. Expectations have a TTL so
+    a failed/cancelled spawn doesn't leave a permanent ghost hint.
     """
 
     cwd: Path
@@ -309,6 +342,18 @@ class ExternalTranscriptObserver:
         # long uptime, a periodic sweep could be added (not load-bearing
         # today).
         self._codex_resolution_cache: dict[Path, bool] = {}
+        # Set of ``{session_id}:{rollout_uuid}`` dedupe keys the
+        # observer has already published a ``session.updated`` event
+        # for. Idempotency guard: a re-tail of an already-bound
+        # rollout (observer restart, or watchfiles firing twice on
+        # the same write) must not produce duplicate session.updated
+        # events (specs/2026-05-21-codex-resume.md).
+        # ``unbind_session`` evicts every entry prefixed with the
+        # session id; ``unbind_rollout`` evicts the entry matching
+        # the rollout's UUID. Halcyon's NEEDS-FIX on PR #18 closed
+        # the leak; before that, the set grew one-entry-per-run for
+        # the observer's lifetime.
+        self._codex_resume_id_published: set[str] = set()
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
         # threshold flips silent sessions to idle; a fresh event on an idle
@@ -320,6 +365,57 @@ class ExternalTranscriptObserver:
         # observer offset persistence (d7658fd) means existing transcripts
         # are not re-scanned, so _last_event_at would stay empty for them.
         self._seed_last_event_at_from_repository()
+        # Option A backfill (specs/2026-05-21-codex-resume.md): populate
+        # codex_resume_id on existing external codex sessions whose
+        # field is None. One-shot per process startup.
+        self._backfill_codex_resume_id_from_external_ids()
+
+    def _backfill_codex_resume_id_from_external_ids(self) -> None:
+        """Populate ``Session.codex_resume_id`` on existing
+        external-origin codex sessions where it's still None. The
+        UUID is encoded in the ``codex_<uuid>`` session id (see
+        ``external_session_id_from_codex_path``); one regex match per
+        candidate row, then ``upsert_session`` writes the modified
+        Session back. Idempotent: rows whose field is already set are
+        skipped. Harness-origin and non-codex rows are left alone (the
+        observer's binding path handles harness codex; claude has no
+        codex resume semantics).
+
+        Spec: specs/2026-05-21-codex-resume.md option A.
+        """
+        if self._repository is None:
+            return
+        try:
+            sessions = self._repository.list_sessions()
+        except Exception:
+            logger.exception("Failed to backfill codex_resume_id from repository")
+            return
+        for session in sessions:
+            if session.backend != "codex":
+                continue
+            if session.origin != "external":
+                continue
+            if session.codex_resume_id is not None:
+                continue
+            resume_id = _codex_resume_id_from_external_session_id(session.id)
+            if resume_id is None:
+                # Defensive: a stray non-codex_ or non-UUID id sneaking
+                # in (e.g. legacy data) shouldn't crash backfill. Skip
+                # and log.
+                logger.warning(
+                    "Skipping codex_resume_id backfill for non-UUID id: %s",
+                    session.id,
+                )
+                continue
+            try:
+                self._repository.upsert_session(
+                    session.model_copy(update={"codex_resume_id": resume_id})
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to write back codex_resume_id for session %s",
+                    session.id,
+                )
 
     def _seed_last_event_at_from_repository(self) -> None:
         if self._repository is None:
@@ -358,10 +454,20 @@ class ExternalTranscriptObserver:
         ``unbind_session`` instead — the orchestrator doesn't know
         which rollout path the observer ended up matching. Idempotent.
         """
-        self._path_to_session.pop(Path(path), None)
+        resolved_path = Path(path)
+        bound_session = self._path_to_session.pop(resolved_path, None)
         # Forget any "checked-no-match" memoization too, so a fresh
         # session_meta peek can run if the rollout reappears.
-        self._codex_resolution_cache.pop(Path(path), None)
+        self._codex_resolution_cache.pop(resolved_path, None)
+        # Halcyon's NEEDS-FIX on PR #18: also drop the matching
+        # codex_resume_id dedupe entry so the docstring's "cleared
+        # when an ``unbind_*`` evicts the binding" claim is true and
+        # the set stays bounded across long uptimes.
+        match = _CODEX_ROLLOUT_RE.match(resolved_path.name)
+        if match is not None and bound_session is not None:
+            self._codex_resume_id_published.discard(
+                f"{bound_session}:{match.group('uuid')}"
+            )
 
     def unbind_session(self, session_id: str) -> None:
         """Evict every path binding pointing at ``session_id``.
@@ -391,6 +497,16 @@ class ExternalTranscriptObserver:
         for path in to_remove:
             self._path_to_session.pop(path, None)
             self._codex_resolution_cache.pop(path, None)
+        # Halcyon's NEEDS-FIX on PR #18: drop every dedupe entry
+        # belonging to this session — without this the set grew
+        # monotonically (one entry per codex run per session) for
+        # the observer's lifetime, contradicting the docstring's
+        # eviction promise and leaking memory across long uptimes.
+        prefix = f"{session_id}:"
+        self._codex_resume_id_published = {
+            key for key in self._codex_resume_id_published
+            if not key.startswith(prefix)
+        }
 
     def expect_codex_rollout(self, *, cwd: Path | str, session_id: str) -> None:
         """Register a hint that a codex rollout matching ``cwd`` is about
@@ -471,8 +587,23 @@ class ExternalTranscriptObserver:
             cwd=peek.cwd, timestamp=peek.timestamp
         )
         if expectation is None:
-            self._codex_resolution_cache[transcript_path] = True
-            return base
+            # ``codex exec resume <uuid>`` reuses the original rollout
+            # file and never rewrites its ``session_meta`` timestamp, so
+            # an expectation registered minutes after the rollout was
+            # first created falls outside the ±30s ``session_meta``
+            # window above. Fall back to the unambiguous resume signal:
+            # the rollout's UUID equals the resumed session's
+            # ``codex_resume_id``. Without this, every resumed turn's
+            # events were misattributed to a synthetic external
+            # ``codex_<uuid>`` row and the harness session's resumed-turn
+            # answers materialized empty (live defect
+            # ses_47d554abc7224cc4b4ac9ac209279cb2).
+            expectation = self._find_resume_expectation(
+                transcript_path, cwd=peek.cwd
+            )
+            if expectation is None:
+                self._codex_resolution_cache[transcript_path] = True
+                return base
 
         self._consume_expectation(expectation)
         self._path_to_session[transcript_path] = expectation.session_id
@@ -482,6 +613,60 @@ class ExternalTranscriptObserver:
             session_id=expectation.session_id,
             is_rebound=True,
         )
+
+    def _find_resume_expectation(
+        self, transcript_path: Path, *, cwd: str
+    ) -> CodexRolloutExpectation | None:
+        """Match a resumed rollout by UUID rather than timestamp.
+
+        Returns the active expectation for ``cwd`` whose target session
+        carries this rollout's UUID as its ``codex_resume_id`` — i.e.
+        the session the orchestrator launched via
+        ``codex exec resume <uuid>``. The timestamp window doesn't help
+        here because codex freezes ``session_meta.timestamp`` at the
+        rollout's original creation time, so resumes drift arbitrarily
+        far from the expectation's registration time.
+        """
+        if self._repository is None:
+            return None
+        match = _CODEX_ROLLOUT_RE.match(transcript_path.name)
+        if match is None:
+            return None
+        resume_id = match.group("uuid")
+        cwd_path = Path(cwd)
+        # Mirror ``_purge_expired_expectations`` expiry semantics on the
+        # observer's injected clock so this method is correct even if a
+        # caller hasn't just purged.
+        now = self._clock()
+        matches = [
+            exp
+            for exp in self._codex_expectations
+            if exp.cwd == cwd_path
+            and exp.expires_at > now
+            and self._session_resume_id(exp.session_id) == resume_id
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # Distinct harness sessions carry distinct codex_resume_ids,
+            # so this is impossible in practice — surface degenerate or
+            # injected data instead of silently picking the first.
+            logger.warning(
+                "multiple active codex expectations match resume_id=%s "
+                "in cwd=%s; sessions=%s — returning first",
+                resume_id,
+                cwd_path,
+                [exp.session_id for exp in matches],
+            )
+        return matches[0]
+
+    def _session_resume_id(self, session_id: str) -> str | None:
+        """``codex_resume_id`` for ``session_id``, or ``None`` if the
+        session has vanished from the repository."""
+        try:
+            return self._repository.get_session(session_id).codex_resume_id
+        except SessionNotFoundError:
+            return None
 
     def _purge_expired_expectations(self) -> None:
         now = self._clock()
@@ -576,6 +761,18 @@ class ExternalTranscriptObserver:
             return []
 
         published: list[Event] = []
+        # specs/2026-05-21-codex-resume.md: once a codex rollout has
+        # been bound to a harness session (``is_rebound`` after
+        # ``_resolve_codex_identity`` consumed an expectation), persist
+        # the rollout UUID onto the session so the next
+        # CodexCommandBuilder.build can pick ``codex exec resume``. Run
+        # before line-by-line publish so the resume_id is durable even
+        # if the rest of the tail aborts mid-flight.
+        resume_event = await self._maybe_publish_codex_resume_id(
+            transcript_path, identity,
+        )
+        if resume_event is not None:
+            published.append(resume_event)
         try:
             with transcript_path.open("rb") as transcript:
                 transcript.seek(self._state.next_offset(transcript_path))
@@ -722,6 +919,62 @@ class ExternalTranscriptObserver:
                 identity=None,
                 offset=None,
             )
+
+    async def _maybe_publish_codex_resume_id(
+        self,
+        transcript_path: Path,
+        identity: TranscriptIdentity,
+    ) -> Event | None:
+        """Persist the rollout UUID onto the bound session's
+        ``codex_resume_id``. Emits at most ONCE per (session, UUID)
+        pair: the in-memory ``_codex_resume_id_published`` set
+        deduplicates against re-tails (observer restart, watchfiles
+        firing twice), and a runtime check against the repository
+        deduplicates against already-set rows (process restart with a
+        warm SQLite DB).
+
+        Only fires for codex rollouts that resolved via the
+        expectation-matching path (``is_rebound`` + backend=codex).
+        Pure-external codex rollouts route through the backfill on
+        startup (option A from the spec); harness sessions whose
+        binding got dropped will re-emit on the next bound rollout.
+        """
+        if identity.backend != "codex" or not identity.is_rebound:
+            return None
+        if self._repository is None:
+            return None
+        match = _CODEX_ROLLOUT_RE.match(transcript_path.name)
+        if match is None:
+            return None
+        resume_id = match.group("uuid")
+        # In-memory idempotency: skip if we've already published this
+        # exact (session, UUID) pair in the current process.
+        dedupe_key = f"{identity.session_id}:{resume_id}"
+        if dedupe_key in self._codex_resume_id_published:
+            return None
+        try:
+            session = self._repository.get_session(identity.session_id)
+        except SessionNotFoundError:
+            return None
+        if session.codex_resume_id == resume_id:
+            # Already persisted (e.g. process restart, DB carried the
+            # field forward) — record the in-memory dedupe key so
+            # future re-tails short-circuit before the DB read.
+            self._codex_resume_id_published.add(dedupe_key)
+            return None
+        updated = session.model_copy(
+            update={"codex_resume_id": resume_id, "updated_at": self._clock()},
+        )
+        data: dict[str, Any] = {
+            **_source_data(identity, offset=None),
+            "session": updated.model_dump(mode="json"),
+        }
+        published = await self._publish_via_bus(
+            Event(event="session.updated", session_id=session.id, data=data)
+        )
+        if published is not None:
+            self._codex_resume_id_published.add(dedupe_key)
+        return published
 
     async def _maybe_publish_status_flip(
         self,
@@ -1274,6 +1527,19 @@ def _session_event_if_complete(
     if identity.is_rebound:
         return []
 
+    # External codex rollouts encode the rollout UUID in the session
+    # id. Populate codex_resume_id inline so the synthesized row
+    # arrives at the materializer ready for ``codex exec resume`` —
+    # the next POST /v1/runs would otherwise be rejected by
+    # ``validate_session_resume_target``. The Option A startup
+    # backfill handles rows that pre-date this code; the inline path
+    # here handles rows discovered after observer construction.
+    # Halcyon's NEEDS-FIX on PR #18.
+    codex_resume_id: str | None = None
+    if identity.backend == "codex":
+        codex_resume_id = _codex_resume_id_from_external_session_id(
+            identity.session_id,
+        )
     session = Session(
         id=identity.session_id,
         backend=identity.backend,
@@ -1281,6 +1547,7 @@ def _session_event_if_complete(
         project=Project(path=cwd, name=Path(cwd).name or cwd),
         status="running",
         origin="external",
+        codex_resume_id=codex_resume_id,
     )
     return [
         Event(

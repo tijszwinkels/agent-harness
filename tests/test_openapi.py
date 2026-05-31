@@ -120,3 +120,16 @@ def test_openapi_documents_session_stats_context_used() -> None:
     assert cu["type"] == ["integer", "null"]
     assert cu["minimum"] == 0
     assert "context_used" not in session_stats.get("required", [])
+
+
+def test_openapi_documents_session_codex_resume_id() -> None:
+    """Drift guard: ``Session.codex_resume_id`` is the codex rollout
+    UUID used by CodexCommandBuilder to pick ``codex exec resume``
+    over a fresh ``codex exec``. Nullable string, optional (None on
+    non-codex sessions and on codex sessions whose first run hasn't
+    completed binding). Spec: specs/2026-05-21-codex-resume.md"""
+    spec = _openapi_spec()
+    session = spec["components"]["schemas"]["Session"]
+    cri = session["properties"]["codex_resume_id"]
+    assert cri["type"] == ["string", "null"]
+    assert "codex_resume_id" not in session.get("required", [])

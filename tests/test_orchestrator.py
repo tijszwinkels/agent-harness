@@ -1747,3 +1747,205 @@ async def test_watchdog_skips_historical_run_end_turn_events(
     await asyncio.wait_for(task, timeout=2)
 
     assert signal.SIGTERM in process.group_signals
+
+
+# --- Stuck-session fix: bound the post-exit stream drain --------------------
+
+
+@pytest.mark.asyncio
+async def test_run_completes_when_orphan_holds_pipe_open_after_foreground_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Root cause of "sessions get stuck and stop responding".
+
+    The foreground agent subprocess exits (``wait_task`` resolves) but
+    a BACKGROUND orphan it spawned (same process group, inherited the
+    stdout/stderr PIPE write-end) keeps the pipe open. ``readline()``
+    therefore never reaches EOF, so the pre-fix ``_finish_streams``
+    gather blocked forever and ``run.completed`` was never published —
+    the bridge never saw a terminal event and the session stuck
+    "running".
+
+    With the fix, run completion is bound to the FOREGROUND child's
+    exit: after ``wait_task`` resolves, the drain gets a finite grace;
+    if the streams don't EOF, the readers are abandoned and the run
+    still publishes ``run.completed``.
+
+    ``close_stdout=False`` / ``close_stderr=False`` model the orphan:
+    no EOF is ever pushed onto the fake streams.
+
+    The drain grace is a real wall-clock timeout (kept off the injected
+    sleep so the run hot-path's clean case stays cheap), so the test
+    uses a tiny grace and real time rather than a FakeClock.
+    """
+    monkeypatch.setattr(
+        orchestrator, "POST_EXIT_DRAIN_GRACE_SECONDS", 0.05, raising=False
+    )
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[], stderr=[], close_stdout=False, close_stderr=False, returncode=0
+    )
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+        ).run()
+    )
+    await flush_asyncio()
+
+    # Foreground child exits while the orphan still holds the pipe open.
+    process.finish()
+
+    # Without the bounded drain this would hang forever. ``wait_for``'s
+    # own timeout (well above the 0.05s grace) turns any regression back
+    # into a hang/failure.
+    result = await asyncio.wait_for(task, timeout=2)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+
+    assert result.status == "completed"
+    assert events[-1].event == "run.completed"
+    assert events[-1].data == {"returncode": 0}
+
+
+@pytest.mark.asyncio
+async def test_run_reaps_process_group_when_orphan_wedges_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the foreground child has exited, the run is logically over.
+    A lingering orphan holding the pipe should be reaped via ``killpg``
+    so it can't keep wedging the drain (and leaking a descendant).
+
+    The reap targets the foreground child's pid as the pgid directly
+    (it's the ``start_new_session=True`` group leader) rather than
+    ``os.getpgid(pid)``, which would raise ``ProcessLookupError`` once
+    asyncio has reaped the now-exited leader. Verify a SIGTERM lands on
+    the group (keyed by the child pid) when the drain times out."""
+    monkeypatch.setattr(
+        orchestrator, "POST_EXIT_DRAIN_GRACE_SECONDS", 0.05, raising=False
+    )
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[],
+        stderr=[],
+        close_stdout=False,
+        close_stderr=False,
+        returncode=0,
+        pid=24680,
+    )
+    calls = install_fake_process_group(monkeypatch, process, pgid=13579)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+        ).run()
+    )
+    await flush_asyncio()
+
+    process.finish()
+    await asyncio.wait_for(task, timeout=2)
+
+    # Reap keys on the child pid (group leader), not os.getpgid()'s 13579.
+    assert (24680, signal.SIGTERM) in calls
+
+
+@pytest.mark.asyncio
+async def test_run_completes_with_chatty_orphan_after_foreground_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chatty-orphan variant: after the foreground child exits, a noisy
+    orphan keeps emitting stdout/stderr lines (which re-warm
+    ``_last_activity_at``), so the 30-min idle watchdog would never
+    fire. The bounded post-exit drain must still terminate the run —
+    completion is gated on the foreground exit, not on the chatty
+    pipe ever closing."""
+    monkeypatch.setattr(
+        orchestrator, "POST_EXIT_DRAIN_GRACE_SECONDS", 0.05, raising=False
+    )
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[], stderr=[], close_stdout=False, close_stderr=False, returncode=0
+    )
+    install_fake_process_group(monkeypatch, process)
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("claude", "--print")),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+    )
+    task = asyncio.create_task(rp.run())
+    await flush_asyncio()
+
+    process.finish()
+    # Orphan keeps chattering on both pipes after the foreground exit —
+    # this re-warms ``_last_activity_at`` but must NOT keep the run alive.
+    for i in range(40):
+        process.stdout.push(f"orphan stdout {i}\n".encode())
+        process.stderr.push(f"orphan stderr {i}\n".encode())
+
+    result = await asyncio.wait_for(task, timeout=2)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+
+    assert result.status == "completed"
+    assert events[-1].event == "run.completed"
+
+
+@pytest.mark.asyncio
+async def test_run_drains_full_output_when_streams_eof_promptly() -> None:
+    """Normal-case regression: no orphan. The stream readers hit EOF
+    promptly, so the bounded drain must still read EVERY stderr line
+    and publish ``run.completed`` exactly as before — the grace path
+    must not truncate clean output or change latency for the common
+    case (no clock advance, completes immediately)."""
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    process = FakeProcess(
+        stdout=[b"line one\n", b"line two\n"],
+        stderr=[b"warn A\n", b"warn B\n", b"warn C\n"],
+        returncode=0,
+    )
+    factory = FakeFactory(process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "hello")),
+            event_bus=bus,
+            process_factory=factory,
+        ).run()
+    )
+    await asyncio.sleep(0)
+    process.finish()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    stderr_texts = [e.data["text"] for e in events if e.event == "process.stderr"]
+
+    assert result.status == "completed"
+    # Every stderr line drained — no truncation by the grace path.
+    assert stderr_texts == ["warn A", "warn B", "warn C"]
+    assert [e.event for e in events] == [
+        "run.started",
+        "process.stderr",
+        "process.stderr",
+        "process.stderr",
+        "run.completed",
+    ]

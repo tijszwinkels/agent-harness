@@ -22,6 +22,15 @@ END_TURN_HARD_KILL_AFTER_SECONDS = 40.0
 IDLE_TIMEOUT_SECONDS = 30 * 60
 IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
+# After the FOREGROUND child exits, the stdout/stderr drain gets this
+# many seconds to reach EOF before we stop waiting on the readers. A
+# background orphan spawned by the agent (same process group, inherited
+# the pipe write-end) keeps the pipe open indefinitely, so EOF never
+# arrives and the run would otherwise hang "running" forever. Run
+# completion must be bound to the foreground child's exit, not to
+# inherited-pipe EOF. The normal case (no orphan) EOFs well within this
+# window, so clean output still drains fully and fast.
+POST_EXIT_DRAIN_GRACE_SECONDS = 5.0
 
 # Phase 4: events that tick ``_last_activity_at`` via ``RunProcess._publish``,
 # keeping the 30-min idle watchdog warm. The observer's ``message`` /
@@ -338,7 +347,7 @@ class RunProcess:
         ]
         try:
             returncode = await wait_task
-            await self._finish_streams(stream_tasks)
+            await self._drain_streams_after_exit(stream_tasks)
         except Exception as exc:
             logger.exception("Run process failed while active: session=%s run=%s", self.session.id, self.run_record.id)
             await self._cancel_streams(stream_tasks)
@@ -540,6 +549,60 @@ class RunProcess:
                     exc_info=(type(result), result, result.__traceback__),
                 )
 
+    async def _drain_streams_after_exit(self, tasks: list[asyncio.Task[None]]) -> None:
+        """Bound the post-exit stdout/stderr drain to a finite grace.
+
+        Called once the FOREGROUND child has exited. In the normal case
+        the readers reach EOF within milliseconds and we drain every
+        line exactly as ``_finish_streams`` always did. But if the agent
+        promoted a BACKGROUND task into its own process group, that
+        orphan inherited the pipe write-end and the pipe never EOFs — the
+        readers would block on ``readline()`` forever and ``run()`` would
+        never publish a terminal event (the stuck-session bug).
+
+        Resolution: give the drain ``POST_EXIT_DRAIN_GRACE_SECONDS`` to
+        finish; if it doesn't, the foreground child is already gone so
+        the run is logically over. Reap the process group (releases the
+        orphan's inherited pipe write-end via SIGTERM) and then abandon
+        the readers, so completion is bound to the foreground exit rather
+        than to inherited-pipe EOF.
+        """
+        if not tasks:
+            return
+        # ALL_COMPLETED + a wall-clock timeout: returns the instant every
+        # reader has EOF'd (the normal, near-instant path) OR once the
+        # grace elapses with readers still blocked. The timeout is real
+        # wall-clock on purpose — it is bounded and small, and keeping it
+        # off the injected ``self._sleep`` avoids loading extra event-loop
+        # hops onto the run hot-path's clean-completion case.
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=POST_EXIT_DRAIN_GRACE_SECONDS,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        if not pending:
+            # Clean EOF within grace — normal path. Surface any reader
+            # exception exactly as ``_finish_streams`` did.
+            await self._finish_streams(tasks)
+            return
+
+        # Grace expired with readers still blocked: an orphan is holding
+        # the pipe open. Reap the group to release it, then stop waiting.
+        logger.warning(
+            "Stream drain exceeded %.0fs after foreground exit; reaping process "
+            "group and abandoning readers (likely an orphaned background task "
+            "holding the pipe): session=%s run=%s",
+            POST_EXIT_DRAIN_GRACE_SECONDS,
+            self.session.id,
+            self.run_record.id,
+        )
+        self._reap_process_group(signal.SIGTERM)
+        # Cancel the still-blocked readers so the run proceeds even if the
+        # killpg above couldn't release the pipe (e.g. the group was
+        # already gone, or a grandchild escaped the group). Correctness
+        # does not depend on the SIGTERM landing.
+        await self._cancel_streams(list(pending))
+
     async def _cancel_streams(self, tasks: list[asyncio.Task[None]]) -> None:
         for task in tasks:
             task.cancel()
@@ -711,6 +774,48 @@ class RunProcess:
         if self._process is not None:
             return self._process.returncode
         return None
+
+    def _reap_process_group(self, sig: signal.Signals) -> bool:
+        """Signal the run's process group AFTER the foreground child has
+        exited, to clean up orphaned background descendants.
+
+        Distinct from ``_signal_process_group`` in two ways the orphan-
+        reap path needs:
+
+        * No ``returncode is not None`` short-circuit. The foreground
+          child has *already* exited here (that's the whole point); the
+          orphans we're reaping are other members of its group.
+        * Targets ``process.pid`` directly as the pgid instead of
+          ``os.getpgid(pid)``. The child was launched with
+          ``start_new_session=True``, so it is the group leader and the
+          pgid equals its pid — and once asyncio has reaped the leader,
+          ``os.getpgid(pid)`` would raise ``ProcessLookupError`` even
+          while orphan group members are still alive.
+        """
+        process = self._process
+        if process is None:
+            return False
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            logger.info(
+                "Run process group already empty at orphan reap: session=%s run=%s pid=%s signal=%s",
+                self.session.id,
+                self.run_record.id,
+                process.pid,
+                sig.name,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Failed to reap run process group: session=%s run=%s pid=%s signal=%s",
+                self.session.id,
+                self.run_record.id,
+                process.pid,
+                sig.name,
+            )
+            return False
 
     def _signal_process_group(self, sig: signal.Signals) -> bool:
         process = self._process

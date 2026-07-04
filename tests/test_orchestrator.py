@@ -220,6 +220,8 @@ def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
         "--model",
         "gpt-5.4",
         "--session-id",
@@ -276,6 +278,8 @@ def test_claude_code_command_builder_resumes_external_claude_session() -> None:
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
         "--model",
         "gpt-5.4",
         "--resume",
@@ -300,6 +304,33 @@ def test_claude_code_command_builder_resumes_legacy_claude_prefixed_external_ses
     assert "--resume" in command.argv
     resume_idx = command.argv.index("--resume")
     assert command.argv[resume_idx + 1] == "2a9857de-2f9d-4190-aa76-e433619602fb"
+
+
+def test_claude_code_command_builder_appends_print_mode_system_prompt() -> None:
+    """claude -p KILLS background Bash tasks (task_type local_bash) at
+    turn teardown — task_updated status "killed" + task_notification
+    "stopped" right after the result record (verified empirically,
+    claude v2.1.200) — while the model believes it will be notified on
+    completion; the work is silently dropped. There is no CLI flag to
+    disable backgrounding, so the builder steers the model away from it
+    via --append-system-prompt."""
+    from agent_harness.orchestrator import CLAUDE_PRINT_MODE_SYSTEM_PROMPT
+
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    run = make_run(session)
+
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=Message.user("go"), is_first_run=True,
+    )
+
+    idx = command.argv.index("--append-system-prompt")
+    assert command.argv[idx + 1] == CLAUDE_PRINT_MODE_SYSTEM_PROMPT
+    # The steering text must cover both background-Bash doom and the
+    # Task-tool exception.
+    assert "run_in_background" in CLAUDE_PRINT_MODE_SYSTEM_PROMPT
+    assert "Task tool" in CLAUDE_PRINT_MODE_SYSTEM_PROMPT
 
 
 def test_codex_command_builder_appends_dangerously_bypass_when_bypass_permissions_set() -> None:
@@ -361,6 +392,8 @@ def test_claude_code_command_builder_appends_dangerously_skip_when_flag_set() ->
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
         "--model",
         "gpt-5.4",
         "--dangerously-skip-permissions",

@@ -33,6 +33,28 @@ IDLE_CHECK_INTERVAL_SECONDS = 60.0
 # window, so clean output still drains fully and fast.
 POST_EXIT_DRAIN_GRACE_SECONDS = 5.0
 
+# Steering prompt appended to every harness claude run. Verified
+# empirically (claude v2.1.200): ``claude --print`` KILLS background
+# Bash tasks (``task_type: local_bash``) at turn teardown —
+# task_updated status "killed" + task_notification "stopped" right
+# after the result record — while the model believes it will be
+# notified on completion, so the work is silently dropped. There is
+# no CLI flag to disable backgrounding; the system prompt is the only
+# steering channel. Async Task-tool subagents are the explicit
+# exception: those DO survive the turn (claude stays alive and
+# re-invokes the model — see ``_watch_end_turn_cleanup``).
+CLAUDE_PRINT_MODE_SYSTEM_PROMPT = (
+    "You are running non-interactively under `claude --print` inside an "
+    "automated harness. Bash tool calls with `run_in_background: true` (and "
+    "commands auto-promoted to background on timeout) are killed when your "
+    "turn ends — you will never receive their completion notification. Run "
+    "commands synchronously (raise the Bash timeout if needed), or for work "
+    "that must outlive the turn, detach it on the host "
+    "(`setsid cmd > /tmp/log 2>&1 < /dev/null &`) and check the log on a "
+    "later turn. Subagents launched via the Task tool DO keep running after "
+    "your turn ends and will re-invoke you on completion."
+)
+
 # Terminal statuses for async-task lifecycle records on claude's
 # stream-json stdout (see ``RunProcess._note_stdout_task_event``).
 # ``task_updated`` patches carrying one of these mean the async task
@@ -180,6 +202,8 @@ class ClaudeCodeCommandBuilder:
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--append-system-prompt",
+            CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
             "--model",
             session.model,
         )

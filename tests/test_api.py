@@ -870,3 +870,35 @@ class FakeWatchService:
         while stop_event is not None and not stop_event.is_set():
             await asyncio.sleep(0)
         self.stopped = True
+
+
+def test_cors_disabled_by_default() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/health", headers={"Origin": "https://hub.example"})
+
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_cors_allows_configured_origin() -> None:
+    client = TestClient(create_app(cors_origins=["https://hub.example"]))
+
+    preflight = client.options(
+        "/v1/sessions",
+        headers={
+            "Origin": "https://hub.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "https://hub.example"
+
+    denied = client.options(
+        "/v1/sessions",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert "access-control-allow-origin" not in denied.headers

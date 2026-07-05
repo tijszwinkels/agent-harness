@@ -43,6 +43,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Disable automatic transcript observation.",
     )
+    serve.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        help="Allow cross-origin browser access from this origin. Repeat for multiple. Off by default.",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "serve":
@@ -74,10 +80,19 @@ def _observer_settings_from_args(args: argparse.Namespace) -> ObserverSettings:
 
 
 def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings):
-    if not observer_settings.enabled and not args.database and not args.execute_runs:
+    if (
+        not observer_settings.enabled
+        and not args.database
+        and not args.execute_runs
+        and not args.cors_origin
+    ):
+        # The import-string fast path returns the module-level default app,
+        # which cannot carry per-invocation CORS config.
         return "agent_harness.api:app"
 
     kwargs = {"observer_settings": observer_settings}
+    if args.cors_origin:
+        kwargs["cors_origins"] = args.cors_origin
     repository = open_sqlite_repository(args.database) if args.database else None
     event_bus = DurableEventBus(repository) if repository is not None else InMemoryEventBus()
     if repository is not None:

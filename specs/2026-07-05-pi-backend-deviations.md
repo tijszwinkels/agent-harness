@@ -78,12 +78,31 @@ plainly why." Item by item:
   30-min idle watchdog still protects pi via the stdout heartbeat + stderr
   signal.
 
-## Capability flags (remark 3) — confirmed honest
+## Capability flags (remark 3) — reconsidered per remark 2
 
-`interactive_pty=False`, `mcp=False`, `fork=False` kept as the honest current
-values (harness plumbing not wired for pi, not pi limitations). `session_id_choice`
-is `True` and now backed by real resume (Deviation 2). No parity work enabled
-`pty`/`mcp`/`fork`, so those stay `False`.
+`BackendCapabilities.fork` / `interactive_pty` are **declarative metadata that
+describe the backend's own capability**, not the harness's plumbing. Neither is
+read by any harness code for *any* backend today (`grep -rn "fork"/"pty" src/`
+finds only the field declaration in `models.py` and the literal assignments in
+`backends.py`), yet claude and codex both set both flags `True`. Setting them
+`False` for pi while pi genuinely supports the underlying behavior would describe
+pi as *less capable than it is* on the exact same "not-wired-through-the-harness"
+footing — an inconsistency, not honesty. So, verifying empirically against
+`pi --help` (v0.80.3, the version this branch targets):
+
+- **`fork=True`** — `pi --help` lists `--fork <path|id>` ("Fork specific session
+  file or partial UUID into a new session"). pi supports fork; the flag now says so.
+- **`interactive_pty=True`** — pi's default mode is interactive (the `pi "prompt"`
+  and bare-`pi` examples), and `-p/--print` is documented as "Non-interactive
+  mode". pi has an interactive TUI; the flag now says so.
+- **`mcp=False`** — kept `False`. This is a *genuine* pi limitation, not a
+  plumbing gap: `pi --help` (v0.80.3) exposes no MCP flag or subcommand at all,
+  unlike claude/codex. This is the one flag remark 2's "only leave out what is
+  genuinely infeasible, and state plainly why" clause applies to.
+- **`session_id_choice=True`** — backed by real resume (Deviation 2).
+
+The test `test_pi_backend_registered_with_honest_capabilities` was updated (TDD)
+to assert these values.
 
 ## End-to-end verification (P7)
 

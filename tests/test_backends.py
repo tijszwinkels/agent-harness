@@ -13,10 +13,13 @@ def test_default_backend_registry_lists_claude_code_codex_and_pi() -> None:
 
 
 def test_pi_backend_registered_with_honest_capabilities() -> None:
-    """pi's capability flags are honest current values (spec Design §3,
-    confirmed by the spec-gate remarks): headless-only, no per-action
-    permission prompt, session-id resume wired, no harness fork/pty/mcp
-    plumbing yet."""
+    """pi's capability flags describe pi's own capabilities, on the same
+    "declarative metadata" footing as claude/codex (none of fork/interactive_pty
+    are plumbed through the harness for any backend). Verified against pi v0.80.3
+    ``pi --help``: ``--fork`` exists (fork True), the default mode is interactive
+    while ``-p`` is "Non-interactive mode" (interactive_pty True), and there is no
+    MCP flag (mcp False — a genuine pi limitation). Resume is wired via
+    ``--session-id`` (session_id_choice True)."""
     registry = default_backend_registry()
 
     assert registry.has("pi")
@@ -25,10 +28,10 @@ def test_pi_backend_registered_with_honest_capabilities() -> None:
     assert pi.available is True
 
     caps = pi.capabilities
-    assert caps.fork is False
+    assert caps.fork is True
     assert caps.subagents is False
     assert caps.permission_detection is False
-    assert caps.interactive_pty is False
+    assert caps.interactive_pty is True
     assert caps.stream_json is True
     assert caps.structured_output is True
     assert caps.session_id_choice is True

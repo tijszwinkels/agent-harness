@@ -58,6 +58,25 @@ def test_create_session_request_accepts_bypass_permissions() -> None:
     assert request.bypass_permissions is True
 
 
+def test_models_accept_pi_backend() -> None:
+    """pi is a first-class backend alongside claude-code and codex:
+    Session and CreateSessionRequest accept ``backend="pi"`` once the
+    BackendName literal includes it (no other model edits needed)."""
+    session = Session(
+        backend="pi",
+        model="gpt-5.4",
+        project=Project(path="/tmp/proj", name="proj"),
+    )
+    assert session.backend == "pi"
+
+    request = CreateSessionRequest(
+        backend="pi",
+        model="gpt-5.4",
+        project=Project(path="/tmp/proj", name="proj"),
+    )
+    assert request.backend == "pi"
+
+
 def test_models_reject_unknown_fields_and_invalid_backend_names() -> None:
     with pytest.raises(ValidationError):
         CreateSessionRequest(backend="unknown", model="x", project={"path": "/tmp", "name": "tmp"})

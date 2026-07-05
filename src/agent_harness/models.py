@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-BackendName = Literal["claude-code", "codex"]
+BackendName = Literal["claude-code", "codex", "pi"]
 Origin = Literal["harness", "external"]
 SessionStatus = Literal["idle", "running", "waiting_for_input", "archived"]
 RunStatus = Literal["queued", "running", "completed", "failed", "interrupted"]

@@ -54,9 +54,32 @@ def default_backend_registry() -> BackendRegistry:
         tools="granular",
         interrupt_external_runs=False,
     )
+    # pi (github.com/parkerhutchinson/pi-cli, verified pi v0.80.3): headless
+    # ``pi -p`` only, so no per-action permission prompt (``permission_detection``
+    # False) and no harness-driven interactive PTY. Resume is wired via
+    # ``--session-id`` (``session_id_choice`` True). ``fork``/``mcp`` are honest
+    # "not plumbed through the harness for pi yet" values, not pi limitations —
+    # confirmed as the current truth by the spec-gate remarks. pi has no sandbox
+    # levels (unlike codex) and no budget flag; its tool allow/deny lists make
+    # ``tools`` granular.
+    pi = BackendCapabilities(
+        fork=False,
+        subagents=False,
+        permission_detection=False,
+        interactive_pty=False,
+        stream_json=True,
+        structured_output=True,
+        session_id_choice=True,
+        max_budget=False,
+        mcp=False,
+        sandbox=None,
+        tools="granular",
+        interrupt_external_runs=False,
+    )
     return BackendRegistry(
         [
             Backend(name="claude-code", display_name="Claude Code", capabilities=claude),
             Backend(name="codex", display_name="Codex", capabilities=codex),
+            Backend(name="pi", display_name="pi", capabilities=pi),
         ]
     )

@@ -20,10 +20,13 @@ def test_health_and_backend_listing() -> None:
 
     response = client.get("/v1/backends")
     assert response.status_code == 200
-    assert {item["name"] for item in response.json()["data"]} == {"claude-code", "codex"}
+    assert {item["name"] for item in response.json()["data"]} == {"claude-code", "codex", "pi"}
 
     assert client.get("/v1/backends/codex/models").json() == {"data": []}
     assert client.get("/v1/backends/claude-code/models").json() == {"data": []}
+    # pi has no model catalog either — 200 with an empty list, not 404 (R1).
+    assert client.get("/v1/backends/pi/models").status_code == 200
+    assert client.get("/v1/backends/pi/models").json() == {"data": []}
     assert client.get("/v1/backends/unknown/models").status_code == 404
 
 

@@ -220,6 +220,8 @@ def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
         "--model",
         "gpt-5.4",
         "--session-id",
@@ -276,6 +278,8 @@ def test_claude_code_command_builder_resumes_external_claude_session() -> None:
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
         "--model",
         "gpt-5.4",
         "--resume",
@@ -300,6 +304,33 @@ def test_claude_code_command_builder_resumes_legacy_claude_prefixed_external_ses
     assert "--resume" in command.argv
     resume_idx = command.argv.index("--resume")
     assert command.argv[resume_idx + 1] == "2a9857de-2f9d-4190-aa76-e433619602fb"
+
+
+def test_claude_code_command_builder_appends_print_mode_system_prompt() -> None:
+    """claude -p KILLS background Bash tasks (task_type local_bash) at
+    turn teardown — task_updated status "killed" + task_notification
+    "stopped" right after the result record (verified empirically,
+    claude v2.1.200) — while the model believes it will be notified on
+    completion; the work is silently dropped. There is no CLI flag to
+    disable backgrounding, so the builder steers the model away from it
+    via --append-system-prompt."""
+    from agent_harness.orchestrator import CLAUDE_PRINT_MODE_SYSTEM_PROMPT
+
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    run = make_run(session)
+
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=Message.user("go"), is_first_run=True,
+    )
+
+    idx = command.argv.index("--append-system-prompt")
+    assert command.argv[idx + 1] == CLAUDE_PRINT_MODE_SYSTEM_PROMPT
+    # The steering text must cover both background-Bash doom and the
+    # Task-tool exception.
+    assert "run_in_background" in CLAUDE_PRINT_MODE_SYSTEM_PROMPT
+    assert "Task tool" in CLAUDE_PRINT_MODE_SYSTEM_PROMPT
 
 
 def test_codex_command_builder_appends_dangerously_bypass_when_bypass_permissions_set() -> None:
@@ -361,6 +392,8 @@ def test_claude_code_command_builder_appends_dangerously_skip_when_flag_set() ->
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
         "--model",
         "gpt-5.4",
         "--dangerously-skip-permissions",
@@ -1747,6 +1780,337 @@ async def test_watchdog_skips_historical_run_end_turn_events(
     await asyncio.wait_for(task, timeout=2)
 
     assert signal.SIGTERM in process.group_signals
+
+
+# --- Async-subagent-aware end-turn cleanup -----------------------------------
+#
+# claude v2.x async subagents (verified empirically, claude v2.1.200):
+# the model calls the Task tool, gets "Async agent launched
+# successfully", and ends its turn — the ROLLOUT records
+# ``stop_reason=end_turn`` while ``claude --print`` legitimately stays
+# alive waiting on the subagent, then RE-INVOKES the model and only
+# exits after a turn ends with no pending tasks. Task lifecycle
+# records (task_started / task_updated / task_notification /
+# task_progress) appear ONLY on stdout, never in the rollout, so the
+# supervisor mirrors the pending-task set from its stdout pump.
+
+
+def _make_run_process() -> RunProcess:
+    session = make_session("claude-code")
+    return RunProcess(
+        session=session,
+        run=make_run(session),
+        command=ProcessCommand(argv=("claude", "--print")),
+        event_bus=InMemoryEventBus(),
+        process_factory=FakeFactory(FakeProcess()),
+    )
+
+
+def _task_line(subtype: str, task_id: str = "a28381b", **extra: object) -> bytes:
+    record: dict[str, object] = {"type": "system", "subtype": subtype, "task_id": task_id}
+    record.update(extra)
+    return (json.dumps(record) + "\n").encode()
+
+
+@pytest.mark.asyncio
+async def test_end_turn_with_pending_async_task_defers_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``run.end_turn`` while an async subagent is still pending
+    (task_started seen on stdout, no terminal task_updated /
+    task_notification yet) must NOT arm the SIGTERM ladder — the
+    process is legitimately alive and the subagent shares its process
+    group, so the old behavior destroyed the subagent's work. The
+    watchdog defers and re-arms on the NEXT end_turn; here none comes
+    and the process exits on its own → clean ``run.completed``."""
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], close_stdout=False, returncode=0)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+
+    # Subagent launched: the stdout-only task_started record arrives...
+    process.stdout.push(
+        _task_line(
+            "task_started",
+            tool_use_id="toolu_01",
+            description="explore the codebase",
+            subagent_type="general-purpose",
+            task_type="local_agent",
+        )
+    )
+    await flush_asyncio()
+
+    # ...then the model ends its turn (observer-side run.end_turn).
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "claude-code"},
+        )
+    )
+    await flush_asyncio()
+
+    # Grace elapses — and keeps elapsing — with the task still pending:
+    # no SIGTERM, no run.terminated_after_end_turn.
+    clock.advance(20)
+    await flush_asyncio()
+    clock.advance(100)
+    await flush_asyncio()
+    assert process.group_signals == []
+
+    # Subagent finishes (terminal task_updated); claude re-invokes the
+    # model and eventually exits on its own.
+    process.stdout.push(
+        _task_line("task_updated", patch={"status": "completed", "end_time": 1751700000})
+    )
+    await flush_asyncio()
+    process.finish()
+    process.stdout.close()
+    result = await asyncio.wait_for(task, timeout=2)
+
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    assert result.status == "completed"
+    assert "run.terminated_after_end_turn" not in [e.event for e in events]
+    assert events[-1].event == "run.completed"
+
+
+@pytest.mark.asyncio
+async def test_stdout_activity_after_end_turn_defers_kill_until_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-end_turn stdout activity (no pending tasks) means the
+    process is NOT in post-turn quiescence — model re-invoked or
+    teardown still flushing. The kill must wait until stdout has been
+    silent for a full grace window; a genuinely wedged process goes
+    stdout-silent, so the kill still lands ~grace after its last
+    output."""
+    monkeypatch.setattr(orchestrator, "END_TURN_GRACE_SECONDS", 20.0, raising=False)
+    monkeypatch.setattr(orchestrator, "END_TURN_HARD_KILL_AFTER_SECONDS", 40.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], close_stdout=False, exit_on_sigterm=True)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+    await flush_asyncio()
+
+    # t=0: end_turn arms the watchdog.
+    await bus.publish(
+        Event(
+            event="run.end_turn",
+            session_id=session.id,
+            run_id=run.id,
+            data={"backend": "claude-code"},
+        )
+    )
+    await flush_asyncio()
+
+    # t=10: stdout still flowing (e.g. partial-message stream events).
+    clock.advance(10)
+    process.stdout.push(b'{"type":"stream_event","event":{"type":"content_block_delta"}}\n')
+    await flush_asyncio()
+
+    # t=20: original grace elapsed but only 10s of quiet — no kill yet.
+    clock.advance(10)
+    await flush_asyncio()
+    assert process.group_signals == []
+
+    # t=25: more stdout.
+    clock.advance(5)
+    process.stdout.push(b'{"type":"stream_event","event":{"type":"content_block_stop"}}\n')
+    await flush_asyncio()
+
+    # t=30: watchdog re-check fires — still only 5s of quiet.
+    clock.advance(5)
+    await flush_asyncio()
+    assert process.group_signals == []
+
+    # t=45: a full grace window of stdout silence since t=25 — kill lands.
+    clock.advance(15)
+    await flush_asyncio()
+    assert process.group_signals == [signal.SIGTERM]
+
+    process.stdout.close()
+    result = await asyncio.wait_for(task, timeout=2)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    watchdog_event = next(e for e in events if e.event == "run.terminated_after_end_turn")
+
+    assert result.status == "interrupted"
+    # Payload unchanged from the pre-async-awareness watchdog.
+    assert watchdog_event.data == {
+        "grace_seconds": 20,
+        "hard_kill": False,
+        "returncode": -signal.SIGTERM,
+        "reason": "subprocess_did_not_exit_after_end_turn",
+    }
+
+
+def test_note_stdout_task_event_tracks_started_and_terminal_update() -> None:
+    rp = _make_run_process()
+
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "a1",
+                "task_type": "local_agent",
+            }
+        )
+    )
+    assert rp._pending_tasks == {"a1": "local_agent"}
+
+    # task_progress is progress-only — never a lifecycle transition.
+    rp._note_stdout_task_event(
+        json.dumps({"type": "system", "subtype": "task_progress", "task_id": "a1"})
+    )
+    assert rp._pending_tasks == {"a1": "local_agent"}
+
+    # A patch without a status (e.g. description rename) must NOT clear.
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "a1",
+                "patch": {"description": "renamed"},
+            }
+        )
+    )
+    assert rp._pending_tasks == {"a1": "local_agent"}
+
+    # A patch with a non-terminal status must NOT clear either.
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "a1",
+                "patch": {"status": "in_progress"},
+            }
+        )
+    )
+    assert rp._pending_tasks == {"a1": "local_agent"}
+
+    # Terminal patch clears.
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "a1",
+                "patch": {"status": "completed", "end_time": 1751700000},
+            }
+        )
+    )
+    assert rp._pending_tasks == {}
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "killed", "stopped"])
+def test_note_stdout_task_event_terminal_statuses_clear(status: str) -> None:
+    rp = _make_run_process()
+    rp._note_stdout_task_event(
+        json.dumps({"type": "system", "subtype": "task_started", "task_id": "a1"})
+    )
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "a1",
+                "patch": {"status": status},
+            }
+        )
+    )
+    assert rp._pending_tasks == {}
+
+
+def test_note_stdout_task_event_notification_clears() -> None:
+    # task_notification is always terminal (observed status values:
+    # "completed", "stopped") — clears regardless of status.
+    rp = _make_run_process()
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "b0j9ovy52",
+                "task_type": "local_bash",
+            }
+        )
+    )
+    assert rp._pending_tasks == {"b0j9ovy52": "local_bash"}
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "b0j9ovy52",
+                "status": "stopped",
+            }
+        )
+    )
+    assert rp._pending_tasks == {}
+
+
+def test_note_stdout_task_event_ignores_malformed_and_foreign_records() -> None:
+    rp = _make_run_process()
+    # task_progress for a never-started task does not add.
+    rp._note_stdout_task_event(
+        json.dumps({"type": "system", "subtype": "task_progress", "task_id": "zz"})
+    )
+    # Malformed JSON that passes the '"task_' prefilter.
+    rp._note_stdout_task_event('{"type":"system","subtype":"task_started","task_id":')
+    # Non-system record with a task_started subtype.
+    rp._note_stdout_task_event(
+        json.dumps({"type": "assistant", "subtype": "task_started", "task_id": "b2"})
+    )
+    # task_started without a task_id.
+    rp._note_stdout_task_event(json.dumps({"type": "system", "subtype": "task_started"}))
+    # JSON that isn't an object at all.
+    rp._note_stdout_task_event('["task_started"]')
+    # Terminal update for an unknown task: no error, still empty.
+    rp._note_stdout_task_event(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "task_updated",
+                "task_id": "ghost",
+                "patch": {"status": "completed"},
+            }
+        )
+    )
+    assert rp._pending_tasks == {}
 
 
 # --- Stuck-session fix: bound the post-exit stream drain --------------------

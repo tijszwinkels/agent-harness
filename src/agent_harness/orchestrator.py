@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -31,6 +32,37 @@ IDLE_CHECK_INTERVAL_SECONDS = 60.0
 # inherited-pipe EOF. The normal case (no orphan) EOFs well within this
 # window, so clean output still drains fully and fast.
 POST_EXIT_DRAIN_GRACE_SECONDS = 5.0
+
+# Steering prompt appended to every harness claude run. Verified
+# empirically (claude v2.1.200): ``claude --print`` KILLS background
+# Bash tasks (``task_type: local_bash``) at turn teardown —
+# task_updated status "killed" + task_notification "stopped" right
+# after the result record — while the model believes it will be
+# notified on completion, so the work is silently dropped. There is
+# no CLI flag to disable backgrounding; the system prompt is the only
+# steering channel. Async Task-tool subagents are the explicit
+# exception: those DO survive the turn (claude stays alive and
+# re-invokes the model — see ``_watch_end_turn_cleanup``).
+CLAUDE_PRINT_MODE_SYSTEM_PROMPT = (
+    "You are running non-interactively under `claude --print` inside an "
+    "automated harness. Bash tool calls with `run_in_background: true` (and "
+    "commands auto-promoted to background on timeout) are killed when your "
+    "turn ends — you will never receive their completion notification. Run "
+    "commands synchronously (raise the Bash timeout if needed), or for work "
+    "that must outlive the turn, detach it on the host "
+    "(`setsid cmd > /tmp/log 2>&1 < /dev/null &`) and check the log on a "
+    "later turn. Subagents launched via the Task tool DO keep running after "
+    "your turn ends and will re-invoke you on completion."
+)
+
+# Terminal statuses for async-task lifecycle records on claude's
+# stream-json stdout (see ``RunProcess._note_stdout_task_event``).
+# ``task_updated`` patches carrying one of these mean the async task
+# is done. Observed values (claude v2.1.200): "completed", "killed";
+# "failed" and "stopped" are included as the same family of terminal
+# states. Patches without a status (or with a non-terminal one) are
+# progress/rename updates, NOT lifecycle transitions.
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "killed", "stopped"})
 
 # Phase 4: events that tick ``_last_activity_at`` via ``RunProcess._publish``,
 # keeping the 30-min idle watchdog warm. The observer's ``message`` /
@@ -170,6 +202,8 @@ class ClaudeCodeCommandBuilder:
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--append-system-prompt",
+            CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
             "--model",
             session.model,
         )
@@ -305,6 +339,14 @@ class RunProcess:
         self._last_activity_event: str | None = None
         self._watchdog_termination_in_progress = False
         self._watchdog_termination_task: asyncio.Task[None] | None = None
+        # claude v2.x async subagents: task lifecycle records
+        # (task_started / task_updated / task_notification) appear
+        # ONLY on stdout — never in the rollout the observer tails
+        # (verified empirically, claude v2.1.200) — so the supervisor
+        # mirrors the pending-task set here for the end-turn
+        # watchdog's kill/defer decision. Maps task_id → task_type
+        # ("local_agent", "local_bash", or "" when absent).
+        self._pending_tasks: dict[str, str] = {}
         # Phase 2: rollout pre-binding is unconditional for harness
         # sessions. claude uses the deterministic ``discover_claude``
         # path; codex uses the expectation registry (no fd probe).
@@ -515,11 +557,15 @@ class RunProcess:
         return tasks
 
     async def _stream_lines(self, stream_name: Literal["stdout", "stderr"], stream: AsyncLineReader) -> None:
-        # Phase 4: the supervisor's stdout pump is now purely
-        # heartbeat + stderr passthrough. End-turn signaling moved to
-        # the observer (rollout-parser → ``run.end_turn`` event →
-        # watchdog subscription); message data has flowed through
-        # the observer since Phase 2. No parsing, no detection.
+        # Phase 4: the supervisor's stdout pump is heartbeat + stderr
+        # passthrough. End-turn signaling moved to the observer
+        # (rollout-parser → ``run.end_turn`` event → watchdog
+        # subscription); message data has flowed through the observer
+        # since Phase 2. One narrow exception to "no parsing":
+        # ``_note_stdout_task_event`` mirrors async-task lifecycle
+        # records, which exist ONLY on stdout — never in the rollout —
+        # so the observer cannot supply them. End-turn detection does
+        # NOT move back here.
         #
         # Heartbeat: every non-empty stdout line ticks
         # ``_last_activity_at`` directly (NOT via ``_publish``),
@@ -535,6 +581,70 @@ class RunProcess:
             # Stdout heartbeat (no publish).
             self._last_activity_at = self._clock()
             self._last_activity_event = "stdout"
+            self._note_stdout_task_event(text)
+
+    def _note_stdout_task_event(self, text: str) -> None:
+        """Track async-task lifecycle records from stream-json stdout.
+
+        claude v2.x async subagents (Task tool, ``task_type``
+        "local_agent") and background Bash ("local_bash") emit
+        ``{"type": "system", "subtype": "task_started" | "task_updated"
+        | "task_progress" | "task_notification", "task_id": ..., ...}``
+        records on stdout ONLY — verified empirically (claude
+        v2.1.200): the rollout transcript carries zero task lifecycle
+        records, so the observer can never see them. The end-turn
+        watchdog consults ``_pending_tasks`` to distinguish a process
+        that is legitimately alive past end_turn (waiting on a
+        subagent that will re-invoke the model) from a wedged one.
+        """
+        # Cheap prefilter: all four subtypes contain ``"task_`` — the
+        # vast majority of stream lines (partial-message deltas etc.)
+        # skip the json.loads entirely.
+        if '"task_' not in text:
+            return
+        try:
+            record = json.loads(text)
+        except ValueError:
+            logger.debug(
+                "Ignoring unparseable stdout line with task marker: session=%s run=%s",
+                self.session.id,
+                self.run_record.id,
+            )
+            return
+        if not isinstance(record, dict) or record.get("type") != "system":
+            return
+        task_id = record.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return
+        subtype = record.get("subtype")
+        if subtype == "task_started":
+            self._pending_tasks[task_id] = str(record.get("task_type") or "")
+            logger.debug(
+                "run %s: async task started: task_id=%s task_type=%s (%d pending)",
+                self.run_record.id,
+                task_id,
+                self._pending_tasks[task_id],
+                len(self._pending_tasks),
+            )
+            return
+        if subtype == "task_updated":
+            patch = record.get("patch")
+            status = patch.get("status") if isinstance(patch, dict) else None
+            if status not in _TERMINAL_TASK_STATUSES:
+                return
+        elif subtype != "task_notification":
+            # task_progress (and anything else): progress-only, never
+            # a lifecycle transition.
+            return
+        # Terminal task_updated or task_notification (always terminal).
+        if self._pending_tasks.pop(task_id, None) is not None:
+            logger.debug(
+                "run %s: async task finished: task_id=%s subtype=%s (%d pending)",
+                self.run_record.id,
+                task_id,
+                subtype,
+                len(self._pending_tasks),
+            )
 
     async def _finish_streams(self, tasks: list[asyncio.Task[None]]) -> None:
         if not tasks:
@@ -677,40 +787,82 @@ class RunProcess:
         # cadence — empirically <1s for claude (flushes promptly on
         # ``stop_reason``) and <2s for codex (flushes on
         # ``task_complete``). Acceptable for a 20s grace window.
-        if not await self._wait_for_run_end_turn():
-            return
-        if self._process_exited(wait_task):
-            return
+        #
+        # Async-subagent awareness (claude v2.x, verified v2.1.200):
+        # the rollout records ``stop_reason=end_turn`` even while an
+        # async Task-tool subagent is still running. ``claude --print``
+        # legitimately stays alive, streams task_progress on stdout,
+        # RE-INVOKES the model when the subagent finishes, and only
+        # exits after a turn ends with no pending tasks. Killing at
+        # first end_turn destroys the subagent's work (same process
+        # group). So a kill requires genuine post-end-turn quiescence:
+        #
+        #   (a) no pending async tasks (``_pending_tasks``, mirrored
+        #       from the stdout-only task lifecycle records) —
+        #       otherwise defer and re-arm on the NEXT end_turn, which
+        #       fires after the post-subagent model re-invocation;
+        #   (b) stdout/stderr silent for a full grace window — output
+        #       since the end_turn means the process is NOT in
+        #       post-turn quiescence (model re-invoked / teardown
+        #       flushing), so re-check after the remaining quiet time.
+        #       A wedged process goes silent, so the kill still lands
+        #       ~grace seconds after its last output.
+        #
+        # Known accepted corner: if a NEW end_turn fires while we're
+        # inside the quiescence loop and we then defer back to
+        # re-subscribe, that end_turn may be missed (the subscription
+        # starts after ``max_sequence``); a wedge in that narrow
+        # window is reaped by the 30-min idle watchdog instead.
+        while True:
+            if not await self._wait_for_run_end_turn():
+                return
+            if self._process_exited(wait_task):
+                return
 
-        await self._sleep(END_TURN_GRACE_SECONDS)
-        if self._process_exited(wait_task):
-            return
+            await self._sleep(END_TURN_GRACE_SECONDS)
+            while True:
+                if self._process_exited(wait_task):
+                    return
+                if self._pending_tasks:
+                    logger.info(
+                        "run %s: end_turn with %d async task(s) pending — "
+                        "deferring end-turn cleanup, waiting for next end_turn",
+                        self.run_record.id,
+                        len(self._pending_tasks),
+                    )
+                    break  # → outer loop: wait for the NEXT end_turn.
+                quiet_seconds = (self._clock() - self._last_activity_at).total_seconds()
+                if quiet_seconds < END_TURN_GRACE_SECONDS:
+                    # Activity since the end_turn — not quiescent yet.
+                    await self._sleep(END_TURN_GRACE_SECONDS - quiet_seconds)
+                    continue
 
-        self._watchdog_termination_in_progress = True
-        self._watchdog_termination_task = asyncio.current_task()
-        self._interrupted = True
-        if not self._signal_process_group(signal.SIGTERM):
-            return
+                self._watchdog_termination_in_progress = True
+                self._watchdog_termination_task = asyncio.current_task()
+                self._interrupted = True
+                if not self._signal_process_group(signal.SIGTERM):
+                    return
 
-        hard_kill = False
-        remaining = max(0.0, END_TURN_HARD_KILL_AFTER_SECONDS - END_TURN_GRACE_SECONDS)
-        if remaining:
-            await self._wait_for_process_or_sleep(wait_task, remaining)
+                hard_kill = False
+                remaining = max(0.0, END_TURN_HARD_KILL_AFTER_SECONDS - END_TURN_GRACE_SECONDS)
+                if remaining:
+                    await self._wait_for_process_or_sleep(wait_task, remaining)
 
-        if not self._process_exited(wait_task):
-            hard_kill = self._signal_process_group(signal.SIGKILL)
-        if hard_kill:
-            await wait_task
+                if not self._process_exited(wait_task):
+                    hard_kill = self._signal_process_group(signal.SIGKILL)
+                if hard_kill:
+                    await wait_task
 
-        await self._publish(
-            "run.terminated_after_end_turn",
-            {
-                "grace_seconds": int(END_TURN_GRACE_SECONDS),
-                "hard_kill": hard_kill,
-                "returncode": self._returncode(wait_task),
-                "reason": "subprocess_did_not_exit_after_end_turn",
-            },
-        )
+                await self._publish(
+                    "run.terminated_after_end_turn",
+                    {
+                        "grace_seconds": int(END_TURN_GRACE_SECONDS),
+                        "hard_kill": hard_kill,
+                        "returncode": self._returncode(wait_task),
+                        "reason": "subprocess_did_not_exit_after_end_turn",
+                    },
+                )
+                return
 
     async def _watch_idle_timeout(self, wait_task: asyncio.Task[int]) -> None:
         while True:

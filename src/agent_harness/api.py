@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Protocol
 
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
 from agent_harness.backends import BackendRegistry, default_backend_registry
@@ -67,6 +68,7 @@ def create_app(
     task_factory: TaskFactory | None = None,
     run_manager: RunManager | None = None,
     command_builders: Mapping[str, BackendCommandBuilder] | None = None,
+    cors_origins: Sequence[str] | None = None,
 ) -> FastAPI:
     repo = repository or InMemoryRepository()
     events = event_bus or _event_bus_for_repository(repo)
@@ -86,6 +88,18 @@ def create_app(
             run_manager=run_manager,
         ),
     )
+
+    if cors_origins:
+        # Opt-in cross-origin browser access (e.g. a dataverse page embedding
+        # a chat widget). Off by default: no flag, no CORS headers. Pure ASGI
+        # middleware, so headers land on the SSE StreamingResponse too. No
+        # allow_credentials: browser clients send no cookies or auth headers.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(cors_origins),
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:

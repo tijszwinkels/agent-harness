@@ -155,3 +155,31 @@ def test_serve_command_can_disable_auto_observer(monkeypatch, tmp_path) -> None:
     assert main(["serve", "--no-observer"]) == 0
 
     assert calls[0][0] == ("agent_harness.api:app",)
+
+
+def test_serve_command_wires_cors_origins(monkeypatch, tmp_path) -> None:
+    calls = []
+    app = object()
+
+    def fake_create_app(**kwargs):
+        calls.append(kwargs)
+        return app
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("agent_harness.cli.create_app", fake_create_app)
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", lambda *_args, **_kwargs: None)
+
+    assert (
+        main(
+            [
+                "serve",
+                "--cors-origin",
+                "https://a.example",
+                "--cors-origin",
+                "https://b.example",
+            ]
+        )
+        == 0
+    )
+
+    assert calls[0]["cors_origins"] == ["https://a.example", "https://b.example"]

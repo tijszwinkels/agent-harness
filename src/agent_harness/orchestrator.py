@@ -229,10 +229,64 @@ class ClaudeCodeCommandBuilder:
         )
 
 
+class PiCommandBuilder:
+    """Headless pi runs: ``pi -p --model M --session-id <uuid> [-a] <text>``.
+
+    Modelled on ``CodexCommandBuilder`` (the simpler template — no
+    stdout/rollout coupling), with one simplification: pi's
+    ``--session-id <id>`` "creates it if missing" (verified pi v0.80.3
+    ``--help``), so the SAME flag serves the first run and every resume.
+    There is no first-run/resume flag switch like claude's
+    ``--session-id`` -> ``--resume`` — passing a deterministic UUID
+    derived from the harness session id on every run makes pi create
+    the session on the first turn and load it (retaining context) on the
+    next. Empirically verified for multi-turn context before landing
+    (see specs/2026-07-05-pi-backend-deviations.md).
+
+    The executable is the bare ``pi`` on PATH — matching how the
+    claude/codex builders hardcode their binaries. Node >= 22.19 (pi's
+    hard requirement; it crashes on Node 20 with ``markAsUncloneable``)
+    is delivered operationally by bumping the machine's default Node for
+    the harness's systemd environment, NOT by a pi-specific env-var/
+    wrapper indirection in the harness code (spec-gate remark 1).
+    """
+
+    def build(
+        self,
+        *,
+        session: Session,
+        run: Run,
+        message: Message,
+        is_first_run: bool = True,
+    ) -> ProcessCommand:
+        del run, is_first_run  # pi --session-id is idempotent create-or-load.
+        text = _message_text(message)
+        # Reuse the claude UUID derivation: harness ``ses_<hex>`` ->
+        # canonical 8-4-4-4-12 UUID. pi accepts any string id, but a
+        # UUID keeps the on-disk session filenames uniform and lets the
+        # same helper (and its non-hex guard) cover both backends.
+        session_uuid = _harness_session_id_as_uuid(session.id)
+        approve: tuple[str, ...] = ("-a",) if session.bypass_permissions else ()
+        return ProcessCommand(
+            argv=(
+                "pi",
+                "-p",
+                "--model",
+                session.model,
+                "--session-id",
+                session_uuid,
+                *approve,
+                text,
+            ),
+            cwd=session.project.path,
+        )
+
+
 def default_command_builders() -> dict[str, BackendCommandBuilder]:
     return {
         "claude-code": ClaudeCodeCommandBuilder(),
         "codex": CodexCommandBuilder(),
+        "pi": PiCommandBuilder(),
     }
 
 

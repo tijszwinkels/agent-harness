@@ -20,10 +20,13 @@ def test_health_and_backend_listing() -> None:
 
     response = client.get("/v1/backends")
     assert response.status_code == 200
-    assert {item["name"] for item in response.json()["data"]} == {"claude-code", "codex"}
+    assert {item["name"] for item in response.json()["data"]} == {"claude-code", "codex", "pi"}
 
     assert client.get("/v1/backends/codex/models").json() == {"data": []}
     assert client.get("/v1/backends/claude-code/models").json() == {"data": []}
+    # pi has no model catalog either — 200 with an empty list, not 404 (R1).
+    assert client.get("/v1/backends/pi/models").status_code == 200
+    assert client.get("/v1/backends/pi/models").json() == {"data": []}
     assert client.get("/v1/backends/unknown/models").status_code == 404
 
 
@@ -571,6 +574,90 @@ async def test_rapid_back_to_back_creates_serialize_through_real_run_manager() -
         spawned[1].finish()
         for _ in range(10):
             await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_pi_session_create_and_run_completes_through_lifecycle() -> None:
+    """R2 + R4: a pi session is created (201) and a pi run drives through
+    the normal process lifecycle — no observer branch, run.completed comes
+    from the foreground process exit, exactly like codex/claude runs."""
+    import httpx
+
+    class _FakeStream:
+        def __init__(self) -> None:
+            self._q: asyncio.Queue[bytes] = asyncio.Queue()
+            self._q.put_nowait(b"")
+
+        async def readline(self) -> bytes:
+            return await self._q.get()
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _FakeStream()
+            self.stderr = _FakeStream()
+            self.returncode: int | None = None
+            self._done = asyncio.Event()
+
+        async def wait(self) -> int:
+            await self._done.wait()
+            return self.returncode if self.returncode is not None else 0
+
+        def finish(self, code: int = 0) -> None:
+            self.returncode = code
+            self._done.set()
+
+        def terminate(self) -> None:
+            self.returncode = -15
+            self._done.set()
+
+    spawned: list[_FakeProcess] = []
+
+    async def factory(command: ProcessCommand) -> _FakeProcess:
+        proc = _FakeProcess()
+        spawned.append(proc)
+        return proc
+
+    class _FakeBuilder:
+        def build(self, *, session, run, message, is_first_run=True):
+            return ProcessCommand(argv=("pi", "-p", "noop"))
+
+    repo = InMemoryRepository()
+    bus = InMemoryEventBus()
+    manager = RunManager(event_bus=bus, process_factory=factory)
+    app = create_app(
+        repository=repo,
+        event_bus=bus,
+        run_manager=manager,
+        command_builders={"pi": _FakeBuilder()},
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        session_resp = await client.post(
+            "/v1/sessions",
+            json={"backend": "pi", "model": "gpt-5.4", "project": {"path": "/tmp/p", "name": "p"}},
+        )
+        assert session_resp.status_code == 201
+        session = session_resp.json()
+        assert session["backend"] == "pi"
+
+        run_resp = await client.post(
+            f"/v1/sessions/{session['id']}/runs", json={"message": "do the thing"},
+        )
+        assert run_resp.status_code == 202
+        run = run_resp.json()
+        assert run["status"] == "running"
+
+        await asyncio.sleep(0)
+        assert len(spawned) == 1
+
+        # Foreground pi exits 0 -> run resolves completed.
+        spawned[0].finish(0)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        runs = (await client.get(f"/v1/sessions/{session['id']}/runs")).json()["data"]
+        assert runs[0]["status"] == "completed"
 
 
 def test_session_messages_endpoint_returns_materialized_messages() -> None:

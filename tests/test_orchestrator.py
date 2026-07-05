@@ -13,10 +13,12 @@ from agent_harness.orchestrator import (
     ClaudeCodeCommandBuilder,
     CommandBuildError,
     CodexCommandBuilder,
+    PiCommandBuilder,
     ProcessCommand,
     RunManager,
     RunProcess,
     SubmitResult,
+    default_command_builders,
     validate_session_resume_target,
 )
 
@@ -199,6 +201,117 @@ def test_codex_command_builder_resumes_external_codex_session() -> None:
         "append this",
     )
     assert command.cwd == "/workspace/project"
+
+
+# ── pi builder ───────────────────────────────────────────────────────────────
+# pi is launched headless: ``pi -p --model M --session-id <uuid> [-a] <text>``.
+# Unlike claude, pi's ``--session-id ... creating it if missing`` is idempotent
+# create-or-load, so the SAME flag serves the first run and every resume — the
+# builder never switches to a separate resume flag (verified pi v0.80.3 --help;
+# empirically confirmed for multi-turn context, see specs deviations note).
+
+
+def test_pi_command_builder_uses_print_mode_session_id_and_project_cwd() -> None:
+    # Pin the session id to a known hex so the derived UUID is predictable.
+    session = make_session("pi").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    run = make_run(session)
+    message = Message.user("implement it")
+
+    command = PiCommandBuilder().build(session=session, run=run, message=message)
+
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--model",
+        "gpt-5.4",
+        "--session-id",
+        "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "implement it",
+    )
+    assert command.cwd == "/workspace/project"
+    assert command.env == {}
+
+
+def test_pi_command_builder_appends_approve_when_bypass_permissions() -> None:
+    session = make_session("pi").model_copy(
+        update={
+            "id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc",
+            "bypass_permissions": True,
+        }
+    )
+    run = make_run(session)
+    message = Message.user("implement it")
+
+    command = PiCommandBuilder().build(session=session, run=run, message=message)
+
+    # ``-a`` (Trust project-local files) is pi's only trust knob in -p mode;
+    # it sits between the session flags and the positional prompt.
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--model",
+        "gpt-5.4",
+        "--session-id",
+        "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "-a",
+        "implement it",
+    )
+
+
+def test_pi_command_builder_reuses_session_id_across_runs() -> None:
+    """R6 resume: pi's --session-id is create-or-load, so a follow-up run
+    of the same session reuses the same --session-id (no flag switch) and
+    pi loads the existing conversation. Empirically verified for context
+    retention before landing (specs deviations note)."""
+    session = make_session("pi").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    run = make_run(session)
+
+    first = PiCommandBuilder().build(
+        session=session, run=run, message=Message.user("start"), is_first_run=True,
+    )
+    later = PiCommandBuilder().build(
+        session=session, run=run, message=Message.user("follow-up"), is_first_run=False,
+    )
+
+    def session_id_of(argv: tuple[str, ...]) -> str:
+        return argv[argv.index("--session-id") + 1]
+
+    assert session_id_of(first.argv) == "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc"
+    assert session_id_of(later.argv) == session_id_of(first.argv)
+    # No first/resume flag divergence: only the prompt text differs.
+    assert first.argv[:-1] == later.argv[:-1]
+
+
+def test_pi_command_builder_rejects_non_hex_harness_session_id() -> None:
+    session = make_session("pi").model_copy(update={"id": "ses_not-uuid-shaped"})
+    run = make_run(session)
+
+    with pytest.raises(CommandBuildError, match="Cannot derive"):
+        PiCommandBuilder().build(
+            session=session, run=run, message=Message.user("hi"),
+        )
+
+
+def test_default_command_builders_includes_pi() -> None:
+    builders = default_command_builders()
+
+    assert set(builders) == {"claude-code", "codex", "pi"}
+    assert isinstance(builders["pi"], PiCommandBuilder)
+
+    session = make_session("pi").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    command = builders["pi"].build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+    # Default pi executable is the bare "pi" on PATH — the operator delivers
+    # Node >= 22.19 by bumping the machine default Node (spec-gate remark 1),
+    # so the harness carries no pi-specific Node workaround.
+    assert command.argv[0] == "pi"
 
 
 def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:

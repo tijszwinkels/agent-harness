@@ -15,7 +15,11 @@ from agent_harness.usage import (
     parse_codex_context_snapshot,
     parse_codex_token_count,
     parse_codex_usage,
+    parse_pi_context_snapshot,
+    parse_pi_usage,
 )
+
+import pytest
 
 
 # --- claude .message.usage ---------------------------------------------------
@@ -238,3 +242,50 @@ def test_parse_claude_context_snapshot_clamps_negative_to_zero() -> None:
         )
         == 13
     )
+
+
+# --- pi .message.usage -------------------------------------------------------
+
+
+def test_parse_pi_usage_maps_camelcase_fields() -> None:
+    usage = parse_pi_usage(
+        {
+            "input": 9131,
+            "output": 46,
+            "cacheRead": 0,
+            "cacheWrite": 12738,
+            "cost": {"total": 0.084},
+        }
+    )
+    assert usage == Usage(
+        input=9131, output=46, cache_read=0, cache_creation=12738, cost_usd=0.084
+    )
+
+
+def test_parse_pi_usage_tolerates_missing_cost_block() -> None:
+    usage = parse_pi_usage({"input": 1, "output": 2})
+    assert usage is not None
+    assert usage.cost_usd == 0.0
+
+
+def test_parse_pi_usage_returns_none_for_non_mapping() -> None:
+    assert parse_pi_usage(None) is None
+    assert parse_pi_usage("nope") is None
+
+
+def test_parse_pi_context_snapshot_sums_input_and_cache_excludes_output() -> None:
+    assert (
+        parse_pi_context_snapshot(
+            {"input": 100, "output": 20, "cacheRead": 5, "cacheWrite": 3}
+        )
+        == 108
+    )
+
+
+def test_parse_pi_context_snapshot_all_zero_returns_zero() -> None:
+    # Zero snapshot → materializer treats it as "no useful snapshot".
+    assert parse_pi_context_snapshot({"input": 0, "output": 999}) == 0
+
+
+def test_parse_pi_context_snapshot_returns_none_for_non_mapping() -> None:
+    assert parse_pi_context_snapshot(None) is None

@@ -150,6 +150,52 @@ def parse_claude_context_snapshot(usage: object) -> int | None:
     )
 
 
+def parse_pi_usage(data: object) -> Usage | None:
+    """Parse a pi rollout ``message.usage`` block into a ``Usage``.
+
+    pi reports ``{input, output, cacheRead, cacheWrite, reasoning,
+    totalTokens, cost:{input, output, cacheRead, cacheWrite, total}}``
+    (verified pi rollout corpus 2026-07-06). Maps camelCase token fields
+    onto the unified Usage; ``cacheWrite`` is pi's cache-creation
+    equivalent. ``cost.total`` carries the per-turn USD cost — unlike
+    claude/codex rollouts, pi embeds cost directly, so ``cost_usd`` is
+    populated rather than defaulted to zero.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    cost = data.get("cost")
+    cost_total = cost.get("total") if isinstance(cost, Mapping) else None
+    return Usage(
+        input=_nonnegative_int(data.get("input")),
+        output=_nonnegative_int(data.get("output")),
+        cache_read=_nonnegative_int(data.get("cacheRead")),
+        cache_creation=_nonnegative_int(data.get("cacheWrite")),
+        cost_usd=_nonnegative_float(cost_total),
+    )
+
+
+def parse_pi_context_snapshot(data: object) -> int | None:
+    """Compute the currently-loaded context size from a pi
+    ``message.usage`` block.
+
+    Loaded context = ``input + cacheRead + cacheWrite`` (the prompt the
+    model saw this turn); ``output`` is excluded — it's the response, not
+    part of next-turn context. Mirrors ``parse_claude_context_snapshot``.
+
+    Returns ``None`` for a non-mapping input (matches ``parse_pi_usage``'s
+    contract). An all-zero mapping returns ``0``, which the materializer
+    treats as "no useful snapshot" — see ``observer._run_usage_event``'s
+    skip-on-zero guard.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    return (
+        _nonnegative_int(data.get("input"))
+        + _nonnegative_int(data.get("cacheRead"))
+        + _nonnegative_int(data.get("cacheWrite"))
+    )
+
+
 def add_usage(left: Usage, right: Usage) -> Usage:
     """Sum two ``Usage`` records component-wise. Used by the
     materializer to apply per-turn usage onto the run's running

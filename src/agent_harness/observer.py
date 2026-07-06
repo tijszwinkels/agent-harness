@@ -855,6 +855,14 @@ class ExternalTranscriptObserver:
                 # scopes pi observation to harness-owned sessions; when
                 # external synthesis lands the guard is removed. See
                 # specs/2026-07-06-pi-transcript-observer.md.
+                #
+                # NB: this SKIPS (not buffers), so unlike claude/codex it
+                # doesn't recover a message for a session that appears
+                # later. That's safe because a HARNESS pi session is
+                # always persisted (POST /v1/sessions) before its run
+                # subprocess spawns, so ``_session_exists`` is already
+                # True by the time pi writes its first rollout line —
+                # only genuinely-external sessions ever hit this branch.
                 logger.debug(
                     "Skipping pi message for unknown session=%s path=%s",
                     event.session_id,

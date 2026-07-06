@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import Project, Session
+from agent_harness.models import (
+    CreateRunRequest,
+    CreateSessionRequest,
+    Project,
+    Session,
+)
 from agent_harness.observer import (
     ExternalTranscriptObserver,
     external_session_id_from_pi_path,
@@ -361,6 +366,66 @@ async def test_observer_skips_pi_message_for_unknown_session(tmp_path) -> None:
     published = await observer.tail_file(transcript)
 
     assert [e.event for e in published if e.event == "message"] == []
+
+
+@pytest.mark.asyncio
+async def test_observer_materializes_pi_usage_and_cost_into_session_stats(tmp_path) -> None:
+    """With an ACTIVE running run, a pi assistant record's usage must
+    resolve run_id and materialize into Session.stats (tokens + cost +
+    context_used). Guards the SHOULD claim that pi carries token/cost —
+    the parser-only tests never exercise the run.usage materialization
+    path, and pi is single-shot so this is its only usage record.
+    """
+    repository = InMemoryRepository()
+    session = repository.create_session(
+        CreateSessionRequest(
+            backend="pi",
+            model="glm-5.2:cloud",
+            project=Project(path="/repo", name="repo"),
+        )
+    )
+    # create_run flips the session running; start_run makes the run the
+    # active one that run.usage / run.end_turn resolve against.
+    run = repository.create_run(session.id, CreateRunRequest(message="hi"))
+    repository.start_run(session.id, run.id)
+
+    raw = session.id.removeprefix("ses_")
+    pi_uuid = f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    rollout = pi_transcript_path("/repo", "2026-07-06T11-25-51-562Z", pi_uuid, home=tmp_path)
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],'
+        '"model":"glm-5.2:cloud","usage":{"input":100,"output":50,"cacheRead":30,"cacheWrite":4,'
+        '"cost":{"total":0.0125}},"stopReason":"stop"}}\n',
+        encoding="utf-8",
+    )
+
+    observer = ExternalTranscriptObserver(InMemoryEventBus(), repository=repository)
+    published = await observer.tail_file(rollout)
+
+    usage_events = [e for e in published if e.event == "run.usage"]
+    assert usage_events, [e.event for e in published]
+    assert usage_events[0].run_id == run.id
+    assert usage_events[0].data["usage"] == {
+        "input": 100,
+        "output": 50,
+        "cache_read": 30,
+        "cache_creation": 4,
+        "cost_usd": 0.0125,
+    }
+    assert usage_events[0].data["context_used"] == 134  # input + cacheRead + cacheWrite
+    # run.end_turn resolves to the active run too (stopReason == "stop").
+    end_turn = [e for e in published if e.event == "run.end_turn"]
+    assert end_turn and end_turn[0].run_id == run.id
+
+    # Materialized into Session.stats (the real payoff of run.usage).
+    stats = repository.get_session(session.id).stats
+    assert stats.tokens["input"] == 100
+    assert stats.tokens["output"] == 50
+    assert stats.tokens["cache_read"] == 30
+    assert stats.tokens["cache_creation"] == 4
+    assert stats.cost_usd == pytest.approx(0.0125)
+    assert stats.context_used == 134
 
 
 @pytest.mark.asyncio

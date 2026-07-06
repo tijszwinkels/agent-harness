@@ -100,6 +100,21 @@ implemented, unlike the deviations note's provisional "no `run.usage`".
 - **Malformed / partial lines**: handled by the existing `tail_file` machinery
   (unterminated line → break + retry next tick; bad JSON → warn + skip). The pi
   parser only sees whole, valid records.
+- **Resume appends to one file (verified 2026-07-06)**: two `pi -p --session-id
+  <uuid>` runs in the same cwd write to the *same* `<ts>_<uuid>.jsonl` (filename
+  + timestamp unchanged, file grew 1342→2415 B; turn 2 recalled turn-1 context).
+  pi does NOT open a new file per run with replayed history, so the per-path
+  offset tailer emits each turn's records exactly once — no duplication on
+  resume (covered by `test_observer_pi_multi_turn_resume_in_one_file`).
+- **Single-shot usage race (not pi-specific)**: `run.usage`/`run.end_turn` carry
+  `run_id=None` and resolve against the session's *running* run in
+  `publish_line`; if the process-exit→`run.completed` transition wins the race
+  with the observer tailing the final rollout write, the event is dropped. This
+  is the pre-existing architecture for all backends (claude/codex included), not
+  a pi regression; e2e observed `run.usage`/`run.end_turn` landing before
+  `run.completed`. `test_observer_materializes_pi_usage_and_cost_into_session_stats`
+  locks in that, with an active run, pi usage/cost/context_used materialize into
+  `Session.stats`.
 - **Unknown record / role / block types**: debug-logged and skipped; unknown
   `message` roles fall through to a single "unsupported pi shape" warning path,
   never a crash.

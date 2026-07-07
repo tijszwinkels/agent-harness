@@ -124,6 +124,7 @@ def test_serve_command_auto_observes_existing_default_transcript_roots(monkeypat
     calls = []
     (tmp_path / ".claude" / "projects").mkdir(parents=True)
     (tmp_path / ".codex" / "sessions").mkdir(parents=True)
+    (tmp_path / ".pi" / "agent" / "sessions").mkdir(parents=True)
 
     def fake_create_app(**kwargs):
         calls.append(kwargs)
@@ -138,6 +139,7 @@ def test_serve_command_auto_observes_existing_default_transcript_roots(monkeypat
     assert calls[0]["observer_settings"].roots == (
         tmp_path / ".claude" / "projects",
         tmp_path / ".codex" / "sessions",
+        tmp_path / ".pi" / "agent" / "sessions",
     )
 
 

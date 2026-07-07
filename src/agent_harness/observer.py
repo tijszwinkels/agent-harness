@@ -38,6 +38,8 @@ from agent_harness.usage import (
     parse_claude_usage,
     parse_codex_context_snapshot,
     parse_codex_token_count,
+    parse_pi_context_snapshot,
+    parse_pi_usage,
 )
 
 try:
@@ -52,6 +54,13 @@ _CODEX_ROLLOUT_RE = re.compile(
 )
 _CODEX_UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# pi rollout filename: ``<ISO-ts>_<session-uuid>.jsonl``. The timestamp
+# uses ``-`` separators and contains no ``_``, so the single ``_`` splits
+# ts from the trailing UUID; the fixed-length UUID pattern anchors the
+# match unambiguously.
+_PI_ROLLOUT_RE = re.compile(
+    r"^.+_(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$"
 )
 
 
@@ -828,6 +837,38 @@ class ExternalTranscriptObserver:
                 if resolved is None:
                     continue
                 event = resolved
+            elif (
+                resolved_identity.backend == "pi"
+                and event.event == "message"
+                and self._repository is not None
+                and event.session_id is not None
+                and not self._session_exists(event.session_id)
+            ):
+                # External-origin pi sessions aren't synthesized yet: pi
+                # splits cwd (``session`` record) and model
+                # (``model_change`` record) across two records, so a
+                # single record can't build a ``session.updated`` the
+                # way claude/codex do. Rather than buffer a message for a
+                # session the harness doesn't own — which would grow
+                # ``_pending_materialization`` unbounded across the
+                # operator's many interactive pi sessions — skip it. This
+                # scopes pi observation to harness-owned sessions; when
+                # external synthesis lands the guard is removed. See
+                # specs/2026-07-06-pi-transcript-observer.md.
+                #
+                # NB: this SKIPS (not buffers), so unlike claude/codex it
+                # doesn't recover a message for a session that appears
+                # later. That's safe because a HARNESS pi session is
+                # always persisted (POST /v1/sessions) before its run
+                # subprocess spawns, so ``_session_exists`` is already
+                # True by the time pi writes its first rollout line —
+                # only genuinely-external sessions ever hit this branch.
+                logger.debug(
+                    "Skipping pi message for unknown session=%s path=%s",
+                    event.session_id,
+                    transcript_path,
+                )
+                continue
             published_event = await self._publish_via_bus(event)
             if published_event is None:
                 continue
@@ -1194,6 +1235,49 @@ def codex_transcript_path(
     )
 
 
+def pi_session_dir_name(cwd: str | Path) -> str:
+    # pi sanitizes the session cwd into a directory name by replacing
+    # ``/`` with ``-`` and wrapping the result in ``--…--`` (verified
+    # against ~/.pi/agent/sessions 2026-07-06). Absolute paths already
+    # start with ``/`` → a leading ``-`` after replacement; strip it so
+    # the wrap yields exactly two leading dashes.
+    inner = Path(cwd).expanduser().as_posix().strip("/").replace("/", "-")
+    return f"--{inner}--"
+
+
+def pi_transcript_path(
+    cwd: str | Path,
+    timestamp: str,
+    session_uuid: str,
+    *,
+    home: str | Path | None = None,
+) -> Path:
+    home_path = Path(home).expanduser() if home is not None else Path.home()
+    return (
+        home_path
+        / ".pi"
+        / "agent"
+        / "sessions"
+        / pi_session_dir_name(cwd)
+        / f"{timestamp}_{session_uuid}.jsonl"
+    )
+
+
+def external_session_id_from_pi_path(path: str | Path) -> str:
+    # Canonical ``ses_<32hex>`` — the same shape harness-origin pi
+    # sessions use (``PiCommandBuilder`` passes
+    # ``_harness_session_id_as_uuid(ses_<hex>)`` as ``--session-id``),
+    # so path-derivation reproduces the exact harness id and no
+    # orchestrator pre-bind is needed. Mirrors
+    # ``external_session_id_from_claude_path``.
+    transcript_path = Path(path)
+    match = _PI_ROLLOUT_RE.match(transcript_path.name)
+    if match is None:
+        raise ValueError(f"Not a pi rollout transcript path: {transcript_path}")
+    hex_part = match.group("uuid").replace("-", "").lower()
+    return f"ses_{hex_part}"
+
+
 def external_session_id_from_claude_path(path: str | Path) -> str:
     # Canonical form: ``ses_<32hex>``. This matches the shape harness-origin
     # claude sessions use (see ``_harness_session_id_as_uuid``), so an
@@ -1234,6 +1318,12 @@ def transcript_identity_from_path(path: str | Path) -> TranscriptIdentity:
             path=transcript_path,
             session_id=external_session_id_from_codex_path(transcript_path),
         )
+    if ".pi" in parts and "agent" in parts and "sessions" in parts:
+        return TranscriptIdentity(
+            backend="pi",
+            path=transcript_path,
+            session_id=external_session_id_from_pi_path(transcript_path),
+        )
     raise ValueError(f"Unsupported transcript path: {transcript_path}")
 
 
@@ -1270,6 +1360,8 @@ def parse_transcript_record(
         return _parse_claude_record(record, identity=identity, offset=offset)
     if identity.backend == "codex":
         return _parse_codex_record(record, identity=identity, offset=offset)
+    if identity.backend == "pi":
+        return _parse_pi_record(record, identity=identity, offset=offset)
 
     logger.warning("Unsupported transcript backend: %s", identity.backend)
     return []
@@ -1508,6 +1600,135 @@ def _parse_codex_record(
     return []
 
 
+# pi rollout record-types we intentionally drop on the floor. All are
+# metadata that carry no conversational content for a data-plane
+# consumer:
+#
+# - ``session``: rollout header (cwd + uuid); no model, so it can't
+#   drive session synthesis on its own (see the deviations note).
+# - ``model_change`` / ``thinking_level_change``: settings changes.
+# - ``custom`` / ``custom_message``: extension bookkeeping (e.g.
+#   plannotator phase).
+# - ``session_info``: pi's session-name marker (mirrors codex
+#   ``session_meta`` — observability only).
+# - ``compaction`` / ``reload`` / ``branch_summary``: transcript
+#   maintenance markers.
+# - ``provider_transport_failure``: a transport diagnostic; the
+#   run-lifecycle events already carry failure state.
+_IGNORED_PI_RECORD_TYPES = {
+    "session",
+    "model_change",
+    "thinking_level_change",
+    "custom",
+    "custom_message",
+    "session_info",
+    "compaction",
+    "reload",
+    "branch_summary",
+    "provider_transport_failure",
+}
+
+
+def _parse_pi_record(
+    record: Mapping[str, Any],
+    *,
+    identity: TranscriptIdentity,
+    offset: int | None,
+) -> list[Event]:
+    record_type = _string_value(record.get("type"))
+    if record_type in _IGNORED_PI_RECORD_TYPES:
+        logger.debug(
+            "Ignoring pi transcript metadata: path=%s type=%s",
+            identity.path,
+            record_type,
+        )
+        return []
+    if record_type != "message":
+        logger.warning(
+            "Unsupported pi transcript shape: path=%s type=%s keys=%s",
+            identity.path,
+            record_type,
+            sorted(str(key) for key in record.keys()),
+        )
+        return []
+
+    message = record.get("message") if isinstance(record.get("message"), Mapping) else {}
+    role_value = message.get("role")
+
+    # pi surfaces tool results as a distinct top-level message with
+    # ``role == "toolResult"`` (toolCallId / toolName / content /
+    # isError), not as a content block inside a user turn. Map it to a
+    # role=user message carrying a single tool_result block — identical
+    # to how codex's ``function_call_output`` is represented, so
+    # downstream consumers treat all three backends uniformly.
+    if role_value == "toolResult":
+        block = _tool_result_block(
+            tool_use_id=_string_value(message.get("toolCallId")),
+            content=message.get("content"),
+            is_error=message.get("isError"),
+        )
+        event = _message_event(
+            identity=identity,
+            role="user",
+            source_type="toolResult",
+            model=None,
+            blocks=[block] if block is not None else [],
+            offset=offset,
+        )
+        return [event] if event is not None else []
+
+    role = _role_from_value(role_value)
+    if role is None:
+        # ``bashExecution`` and any future non-conversational role.
+        logger.debug(
+            "Ignoring pi message with unsupported role: path=%s role=%s",
+            identity.path,
+            role_value,
+        )
+        return []
+
+    events: list[Event] = []
+    message_event = _message_event(
+        identity=identity,
+        role=role,
+        source_type="message",
+        model=_string_value(message.get("model")),
+        blocks=_blocks_from_pi_content(message.get("content")),
+        offset=offset,
+    )
+    if message_event is not None:
+        events.append(message_event)
+
+    if role == "assistant":
+        # pi embeds per-turn usage + cost on the assistant message.
+        usage = parse_pi_usage(message.get("usage"))
+        if usage is not None:
+            snapshot = parse_pi_context_snapshot(message.get("usage"))
+            events.append(
+                _run_usage_event(
+                    identity=identity,
+                    usage=usage,
+                    context_window=None,
+                    context_used=snapshot if snapshot else None,
+                    offset=offset,
+                )
+            )
+        # ``stopReason == "stop"`` is pi's clean end-of-turn (the
+        # claude ``end_turn`` analog). ``toolUse`` continues the turn;
+        # ``aborted`` / ``error`` / ``length`` are abnormal
+        # terminations — conservatively not surfaced as end_turn, so
+        # the watchdog only cleans up on a genuine turn completion.
+        if message.get("stopReason") == "stop":
+            events.append(
+                _run_end_turn_event(
+                    identity=identity,
+                    backend="pi",
+                    offset=offset,
+                )
+            )
+    return events
+
+
 def _session_event_if_complete(
     *,
     identity: TranscriptIdentity,
@@ -1666,6 +1887,30 @@ def blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]
 
 
 _blocks_from_claude_message = blocks_from_claude_message
+
+
+def _blocks_from_pi_content(content: object) -> list[MessageBlock]:
+    """Normalize a pi ``message.content`` list.
+
+    pi's ``text`` / ``thinking`` / ``image`` blocks share claude's
+    shape, so they route straight through the shared
+    ``_blocks_from_content``. The one pi-specific block is the
+    camelCase ``toolCall`` (``id`` / ``name`` / ``arguments``) — handled
+    by ``_tool_use_block``, which already reads ``arguments`` as the
+    input source. Unknown block types are skipped by the shared helper.
+    """
+    if not isinstance(content, list):
+        # str content (or empty) — the shared helper handles both.
+        return _blocks_from_content(content)
+    blocks: list[MessageBlock] = []
+    for item in content:
+        if isinstance(item, Mapping) and _string_value(item.get("type")) == "toolCall":
+            block = _tool_use_block(item)
+            if block is not None:
+                blocks.append(block)
+            continue
+        blocks.extend(_blocks_from_content([item]))
+    return blocks
 
 
 def _blocks_from_codex_payload(payload: Mapping[str, Any]) -> list[MessageBlock]:

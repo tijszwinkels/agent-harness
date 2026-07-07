@@ -36,6 +36,7 @@ class ObserverSettings:
             [
                 home_path / ".claude" / "projects",
                 home_path / ".codex" / "sessions",
+                home_path / ".pi" / "agent" / "sessions",
             ]
         )
 

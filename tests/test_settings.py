@@ -18,6 +18,7 @@ def test_observer_settings_builds_default_transcript_roots(tmp_path) -> None:
     assert settings.roots == (
         tmp_path / ".claude" / "projects",
         tmp_path / ".codex" / "sessions",
+        tmp_path / ".pi" / "agent" / "sessions",
     )
     assert settings.enabled
 

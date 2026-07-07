@@ -8,9 +8,9 @@ HTTP/SSE service and SDK primitives for CLI coding agents.
 - Pydantic v2 models for sessions, runs, normalized message blocks, backends, events, and common API responses.
 - In-memory session repository and optional SQLite persistence.
 - In-memory event bus with monotonic sequence numbers, replay, and live subscriptions.
-- Backend registry stubs for `claude-code` and `codex`.
+- Backend registry stubs for `claude-code`, `codex`, and `pi`.
 - FastAPI app factory with health, backend listing, session and run endpoints, DELETE-based interruption/archive behavior, and SSE event streaming endpoints.
-- External Claude Code and Codex transcript observation with `watchfiles`.
+- External Claude Code, Codex, and pi transcript observation with `watchfiles`.
 
 ## Development
 
@@ -36,10 +36,10 @@ still pass backend-supported model names directly when creating sessions.
 
 Add `--execute-runs` when the service should launch real backend CLI
 processes for `POST /v1/sessions/{id}/runs`. Without that flag, run creation
-records the input message and publishes API events, but does not invoke Codex or
-Claude Code.
+records the input message and publishes API events, but does not invoke Codex,
+Claude Code, or pi.
 
-By default, the server observes the known Claude Code and Codex transcript roots under `HOME` when those directories exist. Use `--no-observer` to disable that automatic observation.
+By default, the server observes the known Claude Code, Codex, and pi transcript roots under `HOME` when those directories exist. Use `--no-observer` to disable that automatic observation. pi rollouts (`~/.pi/agent/sessions`) are parsed into `message`, `run.usage`, and `run.end_turn` events like the other backends; see `specs/2026-07-06-pi-transcript-observer.md`.
 Transcript records are normalized into the existing message block models where possible; see `docs/transcript-normalization.md` for coverage and limits.
 
 Appending to an observed external session uses the same run endpoint. When

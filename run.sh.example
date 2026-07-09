@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Template launcher. Copy to `run.sh` (gitignored — it's per-host), make it
+# executable (`chmod +x run.sh`), and adjust for your machine.
+set -euo pipefail
+cd "$(dirname "$0")"
+# The harness spawns the `codex`/`claude` CLIs as subprocesses, inheriting this
+# process's PATH. systemd starts us via a non-interactive shell that skips
+# ~/.bashrc, so add the dirs your backends AND uv live in explicitly. If your
+# backends are system-installed (e.g. /usr/bin) you only need ~/.local/bin here.
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+exec uv run agent-harness serve \
+  --host 0.0.0.0 \
+  --port 8877 \
+  --database .agent-harness.db.8877 \
+  --execute-runs
+  # --cors-origin https://your-dashboard   # only if a browser app calls the harness cross-origin

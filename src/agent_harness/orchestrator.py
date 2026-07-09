@@ -148,13 +148,17 @@ class CodexCommandBuilder:
                     session.model,
                     *bypass,
                     session.codex_resume_id,
+                    # ``--`` ends option parsing so a ``-``-prefixed prompt is
+                    # read as the positional prompt, not an unknown flag (codex
+                    # exits 2 otherwise). Same guard as the claude builder.
+                    "--",
                     text,
                 ),
                 cwd=session.project.path,
             )
 
         return ProcessCommand(
-            argv=("codex", "exec", "--json", "--model", session.model, *bypass, text),
+            argv=("codex", "exec", "--json", "--model", session.model, *bypass, "--", text),
             cwd=session.project.path,
         )
 
@@ -182,6 +186,27 @@ def _harness_session_id_as_uuid(session_id: str) -> str:
             f"Cannot derive claude session UUID from harness session id {session_id!r}",
         )
     return f"{hex_part[0:8]}-{hex_part[8:12]}-{hex_part[12:16]}-{hex_part[16:20]}-{hex_part[20:32]}"
+
+
+def claude_conversation_exists(session: Session, *, home: str | Path | None = None) -> bool:
+    """True when claude has already written this session's transcript to disk.
+
+    Drives the ``--session-id`` (create) vs ``--resume`` choice off whether the
+    conversation actually exists, rather than "has any prior run". A run that
+    failed *before* claude created the conversation (e.g. an arg-parse error on
+    a ``-``-prefixed prompt) is then retried as a create — otherwise every later
+    run ``--resume``s a session that was never born and fails forever ("No
+    conversation found with session ID"). Returns False for ids that aren't
+    claude UUIDs (nothing to resume).
+    """
+    try:
+        claude_uuid = _harness_session_id_as_uuid(session.id)
+    except CommandBuildError:
+        return False
+    # Local import avoids any orchestrator<->observer import-order coupling.
+    from agent_harness.observer import claude_transcript_path
+
+    return claude_transcript_path(session.project.path, claude_uuid, home=home).exists()
 
 
 class ClaudeCodeCommandBuilder:
@@ -223,8 +248,13 @@ class ClaudeCodeCommandBuilder:
             flag = "--session-id" if is_first_run else "--resume"
             argv = (*argv, flag, claude_uuid)
 
+        # ``--`` terminates option parsing so a prompt that begins with ``-``
+        # (e.g. a chat message starting with a dash) is taken as the positional
+        # prompt rather than an unknown flag. Without it claude exits 1
+        # ("error: unknown option '-…'") before creating the conversation,
+        # which strands the session on a phantom --resume target.
         return ProcessCommand(
-            argv=(*argv, text),
+            argv=(*argv, "--", text),
             cwd=session.project.path,
         )
 

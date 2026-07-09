@@ -18,6 +18,7 @@ from agent_harness.orchestrator import (
     RunManager,
     RunProcess,
     SubmitResult,
+    claude_conversation_exists,
     default_command_builders,
     validate_session_resume_target,
 )
@@ -168,7 +169,7 @@ def test_codex_command_builder_uses_exec_json_mode_and_project_cwd() -> None:
 
     command = CodexCommandBuilder().build(session=session, run=run, message=message)
 
-    assert command.argv == ("codex", "exec", "--json", "--model", "gpt-5.4", "implement it")
+    assert command.argv == ("codex", "exec", "--json", "--model", "gpt-5.4", "--", "implement it")
     assert command.cwd == "/workspace/project"
     assert command.env == {}
 
@@ -198,6 +199,7 @@ def test_codex_command_builder_resumes_external_codex_session() -> None:
         "--model",
         "gpt-5.4",
         "019e07c3-4682-7ff1-99e8-948e64bb70c4",
+        "--",
         "append this",
     )
     assert command.cwd == "/workspace/project"
@@ -339,6 +341,7 @@ def test_claude_code_command_builder_uses_headless_stream_json_mode() -> None:
         "gpt-5.4",
         "--session-id",
         "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "--",
         "review it",
     )
     assert command.cwd == "/workspace/project"
@@ -397,9 +400,65 @@ def test_claude_code_command_builder_resumes_external_claude_session() -> None:
         "gpt-5.4",
         "--resume",
         "2a9857de-2f9d-4190-aa76-e433619602fb",
+        "--",
         "continue this",
     )
     assert command.cwd == "/workspace/project"
+
+
+def test_claude_code_command_builder_guards_dash_prefixed_prompt() -> None:
+    # A chat message beginning with "-" (e.g. after a leading @mention is
+    # stripped) must reach claude as the positional prompt, not be parsed as an
+    # unknown option. Regression: such a first message failed the *creating*
+    # run and stranded the channel on a phantom --resume target.
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    run = make_run(session)
+    dash_prompt = "- a coding agent has been doing some development work"
+
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=run, message=Message.user(dash_prompt), is_first_run=True,
+    )
+
+    # ``--`` sits immediately before the prompt so option parsing stops first.
+    assert command.argv[-2:] == ("--", dash_prompt)
+
+
+def test_codex_command_builder_guards_dash_prefixed_prompt() -> None:
+    session = make_session("codex")
+    run = make_run(session)
+    dash_prompt = "- please fix the thing"
+
+    command = CodexCommandBuilder().build(
+        session=session, run=run, message=Message.user(dash_prompt),
+    )
+
+    assert command.argv[-2:] == ("--", dash_prompt)
+
+
+def test_claude_conversation_exists_reflects_transcript_on_disk(tmp_path) -> None:
+    from agent_harness.observer import claude_transcript_path
+
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"}
+    )
+    uuid = "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc"
+
+    # No transcript yet -> CREATE (downstream is_first_run True).
+    assert claude_conversation_exists(session, home=tmp_path) is False
+
+    transcript = claude_transcript_path(session.project.path, uuid, home=tmp_path)
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text("{}\n")
+
+    # Transcript now on disk -> RESUME.
+    assert claude_conversation_exists(session, home=tmp_path) is True
+
+
+def test_claude_conversation_exists_false_for_non_uuid_id(tmp_path) -> None:
+    session = make_session("claude-code").model_copy(update={"id": "ses_not-uuid-shaped"})
+    assert claude_conversation_exists(session, home=tmp_path) is False
 
 
 def test_claude_code_command_builder_resumes_legacy_claude_prefixed_external_session() -> None:
@@ -460,6 +519,7 @@ def test_codex_command_builder_appends_dangerously_bypass_when_bypass_permission
         "--model",
         "gpt-5.4",
         "--dangerously-bypass-approvals-and-sandbox",
+        "--",
         "yolo run",
     )
 
@@ -478,11 +538,12 @@ def test_codex_command_builder_appends_dangerously_bypass_on_external_resume_whe
     command = CodexCommandBuilder().build(session=session, run=run, message=Message.user("yolo resume"))
 
     assert "--dangerously-bypass-approvals-and-sandbox" in command.argv
-    # Must appear before the resume id + prompt positional args.
+    # Must appear before the resume id + ``--`` guard + prompt positional args.
     flag_idx = command.argv.index("--dangerously-bypass-approvals-and-sandbox")
-    assert command.argv[-2] == "019e07c3-4682-7ff1-99e8-948e64bb70c4"
+    assert command.argv[-3] == "019e07c3-4682-7ff1-99e8-948e64bb70c4"
+    assert command.argv[-2] == "--"
     assert command.argv[-1] == "yolo resume"
-    assert flag_idx < len(command.argv) - 2
+    assert flag_idx < len(command.argv) - 3
 
 
 def test_claude_code_command_builder_appends_dangerously_skip_when_flag_set() -> None:
@@ -512,6 +573,7 @@ def test_claude_code_command_builder_appends_dangerously_skip_when_flag_set() ->
         "--dangerously-skip-permissions",
         "--session-id",
         "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "--",
         "yolo claude",
     )
 
@@ -585,6 +647,7 @@ def test_codex_command_uses_exec_resume_when_resume_id_present() -> None:
         "--model",
         "gpt-5.4",
         "019e0500-0000-0000-0000-000000000000",
+        "--",
         "follow-up turn",
     )
     assert command.cwd == "/workspace/project"
@@ -606,6 +669,7 @@ def test_codex_command_uses_fresh_exec_when_resume_id_absent() -> None:
         "--json",
         "--model",
         "gpt-5.4",
+        "--",
         "first turn",
     )
 
@@ -634,6 +698,7 @@ def test_codex_command_uses_resume_for_external_origin_via_unified_field() -> No
         "--model",
         "gpt-5.4",
         "019e07c3-4682-7ff1-99e8-948e64bb70c4",
+        "--",
         "continue this",
     )
 

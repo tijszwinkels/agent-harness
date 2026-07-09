@@ -30,6 +30,7 @@ from agent_harness.orchestrator import (
     CommandBuildError,
     RunManager,
     RunProcessResult,
+    claude_conversation_exists,
     default_command_builders,
     validate_session_resume_target,
 )
@@ -239,6 +240,13 @@ def create_app(
                 # row, this is the session's first run and the builder may
                 # need a creation flag instead of a resume flag.
                 is_first_run = len(repo.list_runs(session_id)) <= 1
+                if session.backend == "claude-code":
+                    # Prefer the on-disk signal: resume only once claude has
+                    # actually created the conversation. A create that failed
+                    # before writing the transcript (e.g. arg-parse error on a
+                    # ``-``-prefixed prompt) must be retried as a create, not
+                    # locked into --resume against a session that never existed.
+                    is_first_run = not claude_conversation_exists(session)
                 command = builder.build(
                     session=session,
                     run=run,

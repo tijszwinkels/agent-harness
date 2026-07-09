@@ -1665,6 +1665,7 @@ async def test_codex_multi_turn_resumes_after_observer_binding_pineapple(tmp_pat
         "--model",
         "gpt-5.4",
         rollout_uuid,
+        "--",
         "What word did I ask you to remember?",
     )
 

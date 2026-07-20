@@ -407,6 +407,12 @@ components:
             rollout filename (harness origin), or by the startup backfill from `codex_<uuid>` ids
             (external origin). Null on non-codex sessions and on codex sessions whose first run
             hasn't yet completed binding.
+        forked_from:
+          type: [string, "null"]
+          description: |
+            Parent session id this session was forked from (POST /v1/sessions/{id}/forks). Null for
+            non-fork sessions. Set once at fork creation; the command builder consumes it on the
+            first run to resume the parent's conversation into this child's own transcript.
 
     Run:
       type: object

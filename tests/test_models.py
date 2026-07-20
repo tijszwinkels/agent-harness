@@ -6,6 +6,8 @@ from agent_harness.models import (
     CreateRunRequest,
     CreateSessionRequest,
     Event,
+    ForkSessionRequest,
+    ForkSessionResponse,
     Message,
     Project,
     Run,
@@ -93,6 +95,42 @@ def test_session_and_request_model_is_optional() -> None:
         CreateSessionRequest(
             backend="pi", model="", project=Project(path="/tmp/proj", name="proj"),
         )
+
+
+def test_session_carries_forked_from() -> None:
+    # forked_from records the parent session a fork descends from; defaults None.
+    session = Session(backend="claude-code", project=Project(path="/tmp/p", name="p"))
+    assert session.forked_from is None
+
+    forked = session.model_copy(update={"forked_from": "ses_parent"})
+    assert forked.forked_from == "ses_parent"
+
+
+def test_fork_session_request_message_and_title_optional() -> None:
+    empty = ForkSessionRequest()
+    assert empty.message is None
+    assert empty.title is None
+
+    full = ForkSessionRequest(message="hi", title="Thread reply")
+    assert full.message == "hi"
+    assert full.title == "Thread reply"
+
+    # empty strings rejected (min_length=1) — same guard as PatchSessionRequest.
+    with pytest.raises(ValidationError):
+        ForkSessionRequest(message="")
+    with pytest.raises(ValidationError):
+        ForkSessionRequest(title="")
+
+
+def test_fork_session_response_carries_session_and_optional_run() -> None:
+    session = Session(backend="claude-code", project=Project(path="/tmp/p", name="p"))
+    resp = ForkSessionResponse(session=session)
+    assert resp.run is None
+
+    run = Run(session_id=session.id, status="running")
+    with_run = ForkSessionResponse(session=session, run=run)
+    assert with_run.run is not None
+    assert with_run.run.id == run.id
 
 
 def test_models_reject_unknown_fields_and_invalid_backend_names() -> None:

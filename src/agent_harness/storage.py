@@ -210,6 +210,12 @@ class SQLiteRepository:
             self._upsert_session(session)
         return session.model_copy(deep=True)
 
+    def create_forked_session(self, parent: Session, *, title: str | None) -> Session:
+        child = Session.forked_child(parent, title=title)
+        with self._lock, self._connection:
+            self._upsert_session(child)
+        return child.model_copy(deep=True)
+
     def list_sessions(self) -> list[Session]:
         with self._lock:
             rows = self._connection.execute("select payload from sessions order by rowid").fetchall()

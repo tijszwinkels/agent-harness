@@ -177,6 +177,33 @@ class Session(HarnessModel):
     # diagnostic field (PR #12 / Phase 4) — this one is the live
     # resume key.
     codex_resume_id: str | None = None
+    # Parent session id this session was forked from
+    # (``POST /v1/sessions/{id}/forks``). ``None`` for non-fork sessions.
+    # Set once at fork creation; the command builder consumes it on the
+    # first run to resume the parent's conversation into this child's own
+    # transcript (claude ``--fork-session``, pi ``--fork``). After the first
+    # run the child has its own transcript and resumes itself normally, so
+    # this field is thereafter lineage/observability only.
+    forked_from: str | None = None
+
+    @classmethod
+    def forked_child(cls, parent: "Session", *, title: str | None = None) -> "Session":
+        """A new harness-owned child that forks ``parent``.
+
+        Inherits the parent's backend / model / project / bypass_permissions,
+        records ``forked_from``, and keeps the parent's title unless
+        overridden. Always ``origin="harness"`` — the fork is harness-owned
+        even when the parent is an observed (external) session.
+        """
+        return cls(
+            backend=parent.backend,
+            model=parent.model,
+            project=parent.project.model_copy(deep=True),
+            title=title if title is not None else parent.title,
+            bypass_permissions=parent.bypass_permissions,
+            origin="harness",
+            forked_from=parent.id,
+        )
 
 
 class Event(HarnessModel):
@@ -211,6 +238,17 @@ class PatchSessionRequest(HarnessModel):
     title: str | None = Field(default=None, min_length=1)
 
 
+class ForkSessionRequest(HarnessModel):
+    # Fork payload for ``POST /v1/sessions/{id}/forks``. Both fields are
+    # optional. ``message`` — when present — starts a first run in the fork
+    # (the bridge relies on this synchronous launch; it does not call
+    # ``create_run`` afterwards). ``title`` overrides the inherited parent
+    # title. Empty strings are rejected (omit the field instead), matching
+    # ``PatchSessionRequest``.
+    message: str | None = Field(default=None, min_length=1)
+    title: str | None = Field(default=None, min_length=1)
+
+
 class CreateRunRequest(HarnessModel):
     message: str = Field(min_length=1)
     model: str | None = None
@@ -222,6 +260,13 @@ class CreateRunResponse(HarnessModel):
     # "running" when the harness spawned the subprocess immediately, "queued"
     # when the session already had an in-flight run and this one is waiting.
     status: RunStatus = "running"
+
+
+class ForkSessionResponse(HarnessModel):
+    # ``session`` is the new harness-owned child. ``run`` is the first run
+    # started in the fork when a ``message`` was supplied, else ``None``.
+    session: Session
+    run: Run | None = None
 
 
 class InterruptRunResponse(HarnessModel):

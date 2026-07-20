@@ -1005,3 +1005,145 @@ def test_cors_allows_configured_origin() -> None:
         },
     )
     assert "access-control-allow-origin" not in denied.headers
+
+
+class _AcceptingRunManager:
+    """Minimal RunManager double: records submissions, reports the run
+    "running", and fires on_start so the repo flips into the matching
+    state (mirrors test_run_create_starts_run_manager_when_configured)."""
+
+    def __init__(self) -> None:
+        self.submitted = []
+
+    def submit(self, *, session, run, command, on_start=None):
+        self.submitted.append(command)
+        if on_start is not None:
+            on_start()
+        return SubmitResult(accepted=True, status="running")
+
+
+def _new_session(client: TestClient, backend: str = "claude-code", **extra) -> dict:
+    payload = {
+        "backend": backend,
+        "model": "claude-4-7-sonnet",
+        "project": {"path": "/tmp/proj", "name": "proj"},
+        **extra,
+    }
+    return client.post("/v1/sessions", json=payload).json()
+
+
+def test_fork_session_happy_path_claude_launches_forked_run() -> None:
+    manager = _AcceptingRunManager()
+    client = TestClient(create_app(run_manager=manager))
+    parent = _new_session(client, "claude-code", title="Parent")
+
+    response = client.post(f"/v1/sessions/{parent['id']}/forks", json={"message": "thread reply"})
+
+    assert response.status_code == 201
+    body = response.json()
+    child = body["session"]
+    assert child["id"] != parent["id"]
+    assert child["origin"] == "harness"
+    assert child["forked_from"] == parent["id"]
+    assert child["backend"] == "claude-code"
+    # No title given → inherit parent's.
+    assert child["title"] == "Parent"
+    # A run was started in the fork; bridge tracks it via run["id"].
+    assert body["run"] is not None
+    assert body["run"]["id"].startswith("run_")
+    # The launched command forked the PARENT conversation into the child id.
+    assert len(manager.submitted) == 1
+    argv = manager.submitted[0].argv
+    assert "--fork-session" in argv
+    assert "--resume" in argv
+
+
+def test_fork_session_without_message_creates_child_and_no_run() -> None:
+    client = TestClient(create_app())
+    parent = _new_session(client, "claude-code")
+
+    response = client.post(f"/v1/sessions/{parent['id']}/forks", json={})
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["run"] is None
+    child_id = body["session"]["id"]
+    assert client.get(f"/v1/sessions/{child_id}/runs").json()["data"] == []
+
+
+def test_fork_session_uses_explicit_title() -> None:
+    client = TestClient(create_app())
+    parent = _new_session(client, "claude-code", title="Parent")
+
+    response = client.post(
+        f"/v1/sessions/{parent['id']}/forks", json={"title": "Thread reply"}
+    )
+
+    assert response.json()["session"]["title"] == "Thread reply"
+
+
+def test_fork_unknown_parent_returns_404() -> None:
+    client = TestClient(create_app())
+
+    response = client.post("/v1/sessions/ses_does_not_exist/forks", json={"message": "hi"})
+
+    assert response.status_code == 404
+
+
+def test_fork_codex_session_returns_409() -> None:
+    client = TestClient(create_app())
+    parent = _new_session(client, "codex", model="gpt-5.4")
+
+    response = client.post(f"/v1/sessions/{parent['id']}/forks", json={"message": "hi"})
+
+    assert response.status_code == 409
+    assert "fork" in response.json()["detail"].lower()
+
+
+def test_fork_while_parent_has_live_run_returns_409() -> None:
+    repo = InMemoryRepository()
+    parent = repo.create_session(
+        CreateSessionRequest(
+            backend="claude-code",
+            model="claude-4-7-sonnet",
+            project=Project(path="/tmp/proj", name="proj"),
+        )
+    )
+    # A queued/running run makes the parent's transcript a moving fork target.
+    repo.create_run(parent.id, CreateRunRequest(message="busy"))
+    client = TestClient(create_app(repository=repo))
+
+    response = client.post(f"/v1/sessions/{parent.id}/forks", json={"message": "hi"})
+
+    assert response.status_code == 409
+    assert "in-progress run" in response.json()["detail"]
+
+
+def test_fork_external_claude_parent_returns_harness_child() -> None:
+    repo = InMemoryRepository()
+    repo.upsert_session(
+        Session(
+            id="ses_2a9857de2f9d4190aa76e433619602fb",
+            backend="claude-code",
+            model="claude-4-7-sonnet",
+            project=Project(path="/tmp/proj", name="proj"),
+            origin="external",
+        )
+    )
+    manager = _AcceptingRunManager()
+    client = TestClient(create_app(repository=repo, run_manager=manager))
+
+    response = client.post(
+        "/v1/sessions/ses_2a9857de2f9d4190aa76e433619602fb/forks",
+        json={"message": "hi"},
+    )
+
+    assert response.status_code == 201
+    child = response.json()["session"]
+    # Fork is harness-owned even when the parent is observed-only.
+    assert child["origin"] == "harness"
+    assert child["forked_from"] == "ses_2a9857de2f9d4190aa76e433619602fb"
+    # It resumes the external parent's on-disk transcript.
+    argv = manager.submitted[0].argv
+    assert "--fork-session" in argv
+    assert argv[argv.index("--resume") + 1] == "2a9857de-2f9d-4190-aa76-e433619602fb"

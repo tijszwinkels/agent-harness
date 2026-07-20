@@ -1185,3 +1185,59 @@ def test_materialize_run_usage_accepts_context_used_decrease(tmp_path) -> None:
         assert repository.get_session(session.id).stats.context_used == 12000
     finally:
         repository.close()
+
+
+def _forkable_parent(repo, *, backend: str = "claude-code", title: str | None = "Parent") -> Session:
+    return repo.create_session(
+        CreateSessionRequest(
+            backend=backend,
+            model="claude-4-7-sonnet",
+            project=Project(path="/repo", name="repo"),
+            title=title,
+            bypass_permissions=True,
+        )
+    )
+
+
+def test_inmemory_create_forked_session_inherits_fields_and_records_parent() -> None:
+    repo = InMemoryRepository()
+    parent = _forkable_parent(repo)
+
+    child = repo.create_forked_session(parent, title=None)
+
+    assert child.id != parent.id
+    assert child.origin == "harness"
+    assert child.forked_from == parent.id
+    assert child.backend == parent.backend
+    assert child.model == parent.model
+    assert child.project == parent.project
+    assert child.bypass_permissions is True
+    # No title given → inherit the parent's.
+    assert child.title == parent.title
+    # Child is a real, retrievable session with its own (empty) message log.
+    assert repo.get_session(child.id).id == child.id
+    assert repo.list_messages(child.id) == []
+
+
+def test_inmemory_create_forked_session_uses_explicit_title() -> None:
+    repo = InMemoryRepository()
+    parent = _forkable_parent(repo)
+
+    child = repo.create_forked_session(parent, title="Thread reply")
+
+    assert child.title == "Thread reply"
+
+
+def test_sqlite_create_forked_session_persists_after_reopen(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    parent = _forkable_parent(repository)
+    child = repository.create_forked_session(parent, title=None)
+    repository.close()
+
+    reopened = open_sqlite_repository(db_path)
+    stored = reopened.get_session(child.id)
+    assert stored.forked_from == parent.id
+    assert stored.origin == "harness"
+    assert stored.model == parent.model
+    reopened.close()

@@ -136,7 +136,7 @@ In `tests/test_openapi.py`:
 
 ## What this is NOT
 
-- A cost calculator. `cost_usd` stays zero per Tijs's deferred-indefinitely call.
+- A cost calculator. `cost_usd` stays zero per the maintainer's deferred-indefinitely call.
 - A backfill for existing sessions. New data only; pre-existing sessions stay `context_used = None` until they next run.
 - A change to the cumulative `tokens` semantics. That field continues to be sum-across-runs for cost rollup.
 - A heuristic about "how close to context_window". Command-bridge computes `context_used / context_window` on its side; harness just ships the inputs.

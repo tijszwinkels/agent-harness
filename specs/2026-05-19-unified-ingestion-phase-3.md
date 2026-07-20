@@ -61,7 +61,7 @@ Concrete changes:
 - `ExternalTranscriptObserver._materialize_or_buffer`: simplifies. Drops the `repository.materialize_event` call for events being published through the bus (the bus does it now). Keeps the buffering logic for `SessionNotFoundError` — but the exception now bubbles from `bus.publish`, so the catch moves to the publish call-site (`tail_file` / `publish_line`).
 - In-memory test fixtures: the `materialize_event(store_event=True)` path is still used by tests that don't go through the bus. No change there.
 
-This is the right shape to dissolve the original design smell Tijs flagged early in this refactor ("why is materialization invoked from two places?"). After Phase 3, the answer is: it isn't.
+This is the right shape to dissolve the original design smell the maintainer flagged early in this refactor ("why is materialization invoked from two places?"). After Phase 3, the answer is: it isn't.
 
 ## run.usage materialization from rollouts
 
@@ -82,7 +82,7 @@ Wire-up: in `ExternalTranscriptObserver.publish_line` (or wherever rollout recor
 
 Skip the publish if no active run exists (pure-external sessions where the harness never created a Run record — same edge Falcon flagged on PR #11 as "worth-noting #1"). Document this limitation in a code comment; revisit in Phase 4 or later when we decide whether to auto-create runs for external sessions.
 
-Cost data: not in this phase per Tijs's 2026-05-19 call. `Usage.cost_usd` stays zero. Future helper can compute cost from token counts × a price table — separate task.
+Cost data: not in this phase per the maintainer's 2026-05-19 call. `Usage.cost_usd` stays zero. Future helper can compute cost from token counts × a price table — separate task.
 
 ## What disappears
 
@@ -147,7 +147,7 @@ After implementation:
 - `_IGNORED_*` lists pruning (Phase 4).
 - `Session.codex_internal_id` decision (Phase 4).
 - Dead origin-tag cleanup (Phase 4).
-- Cost data for claude (deferred indefinitely per Tijs).
+- Cost data for claude (deferred indefinitely per the maintainer).
 - Auto-creating Run records for pure-external sessions (revisit in Phase 4+ or as a separate task).
 
 ## Self-review checklist

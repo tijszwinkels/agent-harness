@@ -11,10 +11,11 @@ uv run agent-harness serve \
 
 The service automatically observes existing Claude Code and Codex transcript roots under `HOME`. Use `--observe-root PATH` only when you want to add a specific directory, such as the safe fake transcript root used by `python/observer_external.py`.
 
-Use the Tailscale URL from another machine:
+To reach the service from another machine, use that host's address in place
+of `127.0.0.1`, for example:
 
 ```text
-http://pillar.tail72f2bc.ts.net:8876
+http://your-harness-host.example:8876
 ```
 
 ## Examples

@@ -14,7 +14,7 @@ turn 2 — codex behaves as a blank session.
 Observed in vivo by Aster on 2026-05-21 (SLAM 4 session
 `ses_c3577e146acc4920ab9f590264328455`): two separate codex rollouts were
 generated for two runs of the same logical harness session. Turn 2's rollout
-opened on Tijs's bare `?` nudge with no prior conversation in scope, so codex
+opened on the operator's bare `?` nudge with no prior conversation in scope, so codex
 correctly replied "What would you like me to work on?" — it genuinely had no
 context.
 

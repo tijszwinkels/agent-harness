@@ -19,7 +19,7 @@ Every harness-origin codex run launches a brand-new `codex exec --json` with no 
 
 `ClaudeCodeCommandBuilder` (lines 137-177) has the correct pattern: `--session-id` on first run, `--resume <id>` on follow-up. The codex equivalent was never written.
 
-**Verified in vivo by Aster 2026-05-21** (SLAM 4 session `ses_c3577e146acc4920ab9f590264328455`): two separate codex rollouts generated for two runs of the same logical session. Rollout 2's first user message was Tijs's bare `?` nudge with no prior conversation in scope; codex correctly responded "What would you like me to work on?" because it genuinely had no context. Latent since codex was first added.
+**Verified in vivo by Aster 2026-05-21** (SLAM 4 session `ses_c3577e146acc4920ab9f590264328455`): two separate codex rollouts generated for two runs of the same logical session. Rollout 2's first user message was the operator's bare `?` nudge with no prior conversation in scope; codex correctly responded "What would you like me to work on?" because it genuinely had no context. Latent since codex was first added.
 
 ## Architectural insight
 

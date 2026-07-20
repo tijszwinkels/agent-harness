@@ -8,7 +8,7 @@ Drafted: 2026-05-19 — Echo (PM)
 - PR #16 (Phase 4): watchdog rewires; supervisor stops parsing; final cleanup
 
 The dual-path architecture is fully gone. The original design smell
-Tijs flagged ("why is materialization invoked from two places?") is
+the maintainer flagged ("why is materialization invoked from two places?") is
 resolved at every layer — `bus.publish` is the single materialization
 point, the observer is the sole writer for `message` / `run.usage` /
 `run.end_turn`, and the supervisor's stdout pump is purely heartbeat
@@ -42,7 +42,7 @@ The orchestrator remains, but reduced to a process supervisor:
 
 The observer is the only writer for `message`, `message.delta`, `run.usage`, `session.updated`, and any backend-derived event we surface in the future.
 
-### Guiding rule (Tijs, 2026-05-19)
+### Guiding rule (the maintainer, 2026-05-19)
 
 > "Still acceptable to pull things from process invocation or even stderr/stdout if we need it, but don't duplicate where we get messages from. That gets messy quickly."
 
@@ -174,13 +174,13 @@ Each phase's PR also runs the sidecar smoke (claude harness session + codex harn
 
 ## Open questions
 
-1. **Cost data — deferred** (Tijs, 2026-05-19). Token counts only in this refactor. `Usage.cost_usd` remains zero for codex (no upstream); claude `total_cost_usd` is dropped from the data plane since it only exists in stream-json `result`. A future helper can derive cost from token counts × a price table once we identify a maintainable price source.
+1. **Cost data — deferred** (the maintainer, 2026-05-19). Token counts only in this refactor. `Usage.cost_usd` remains zero for codex (no upstream); claude `total_cost_usd` is dropped from the data plane since it only exists in stream-json `result`. A future helper can derive cost from token counts × a price table once we identify a maintainable price source.
 
 2. **psutil dependency — added in Phase 1, removed in Phase 2.** Phase 1 added `psutil` for the codex fd probe; Phase 2 retires that probe in favor of the observer-side expectation registry (content-based match on `session_meta`), and drops `psutil` along with the `lsof` fallback.
 
-3. **`process.stderr` event shape — confirmed** (Tijs, 2026-05-19). New event name: `process.stderr` with `{text: str}`. SSE consumers (mm-bridge, command-bridge) update accordingly. Mute previous `message.delta` from supervisor.
+3. **`process.stderr` event shape — confirmed** (the maintainer, 2026-05-19). New event name: `process.stderr` with `{text: str}`. SSE consumers (mm-bridge, command-bridge) update accordingly. Mute previous `message.delta` from supervisor.
 
-4. **Migration window — hard cut-over** (Tijs, 2026-05-19). No parallel-path consistency-check overlay. Each phase removes its half cleanly; tests cover the new shape.
+4. **Migration window — hard cut-over** (the maintainer, 2026-05-19). No parallel-path consistency-check overlay. Each phase removes its half cleanly; tests cover the new shape.
 
 5. **`Session.codex_internal_id` — decide in Phase 1.** Optional. Useful for diagnostics (cross-reference session → rollout filename); not required for correctness. Default: drop unless we find a concrete debug-flow that needs it.
 
@@ -201,7 +201,7 @@ Each phase's PR also runs the sidecar smoke (claude harness session + codex harn
 - Phase 3: ~1 day. Watchdog rewire + tests.
 - Phase 4: ~0.5 day.
 
-Total: ~4 dev days plus review cycles. Reasonable scope for a single sub-session if Tijs greenlights, but I'd prefer phased PRs reviewed independently — fault isolation is much better.
+Total: ~4 dev days plus review cycles. Reasonable scope for a single sub-session if the maintainer greenlights, but I'd prefer phased PRs reviewed independently — fault isolation is much better.
 
 ## Authoring notes
 

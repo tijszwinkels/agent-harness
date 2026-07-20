@@ -2854,7 +2854,7 @@ async def test_resumed_codex_turns_materialize_assistant_text(tmp_path) -> None:
     harness runs and assert ALL THREE assistant answers materialize on
     the harness session — not just the first turn.
 
-    The fixture is the real rollout from the live defect: three
+    The fixture is a synthetic rollout modeling the live defect: three
     ``task_started``/``task_complete`` turns appended to a single file
     whose ``session_meta`` timestamp never moves. We drive the observer
     the way the orchestrator does — register a fresh expectation per
@@ -2935,7 +2935,7 @@ async def test_resumed_codex_turns_materialize_assistant_text(tmp_path) -> None:
         "all three resumed assistant answers must materialize on the "
         f"harness session, got {len(texts)}: {[t[:40] for t in texts]}"
     )
-    assert texts[0].startswith("Hi Tijs."), texts[0][:60]
+    assert texts[0].startswith("Hi there."), texts[0][:60]
     assert texts[1].startswith("Executive summary:"), texts[1][:60]
     assert texts[2].startswith("You’re right to question that:"), texts[2][:60]
 

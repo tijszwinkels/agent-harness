@@ -122,6 +122,20 @@ def test_openapi_documents_session_stats_context_used() -> None:
     assert "context_used" not in session_stats.get("required", [])
 
 
+def test_openapi_documents_optional_session_model() -> None:
+    """Drift guard: ``model`` is optional on both Session and
+    CreateSessionRequest (null ⇒ use the backend CLI's own default; pi
+    callers omit it). Spec: specs/2026-07-20-session-fork-route.md"""
+    spec = _openapi_spec()
+    session = spec["components"]["schemas"]["Session"]
+    assert session["properties"]["model"]["type"] == ["string", "null"]
+    assert "model" not in session["required"]
+
+    create = spec["components"]["schemas"]["CreateSessionRequest"]
+    assert create["properties"]["model"]["type"] == ["string", "null"]
+    assert "model" not in create["required"]
+
+
 def test_openapi_documents_session_codex_resume_id() -> None:
     """Drift guard: ``Session.codex_resume_id`` is the codex rollout
     UUID used by CodexCommandBuilder to pick ``codex exec resume``

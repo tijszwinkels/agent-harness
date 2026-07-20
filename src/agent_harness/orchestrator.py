@@ -83,6 +83,13 @@ class CommandBuildError(ValueError):
     """Raised when a session cannot be mapped to a runnable backend command."""
 
 
+def _model_flag(session: Session) -> tuple[str, ...]:
+    # ``--model M`` when the session pins a model; empty when it doesn't, so
+    # the backend CLI falls back to its own configured default. All three CLIs
+    # accept an absent ``--model`` (verified 2026-07-20).
+    return ("--model", session.model) if session.model is not None else ()
+
+
 @dataclass(frozen=True)
 class ProcessCommand:
     argv: tuple[str, ...]
@@ -144,8 +151,7 @@ class CodexCommandBuilder:
                     "exec",
                     "resume",
                     "--json",
-                    "--model",
-                    session.model,
+                    *_model_flag(session),
                     *bypass,
                     session.codex_resume_id,
                     # ``--`` ends option parsing so a ``-``-prefixed prompt is
@@ -158,7 +164,7 @@ class CodexCommandBuilder:
             )
 
         return ProcessCommand(
-            argv=("codex", "exec", "--json", "--model", session.model, *bypass, "--", text),
+            argv=("codex", "exec", "--json", *_model_flag(session), *bypass, "--", text),
             cwd=session.project.path,
         )
 
@@ -229,8 +235,7 @@ class ClaudeCodeCommandBuilder:
             "--include-partial-messages",
             "--append-system-prompt",
             CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
-            "--model",
-            session.model,
+            *_model_flag(session),
         )
         if session.bypass_permissions:
             argv = (*argv, "--dangerously-skip-permissions")
@@ -301,8 +306,7 @@ class PiCommandBuilder:
             argv=(
                 "pi",
                 "-p",
-                "--model",
-                session.model,
+                *_model_flag(session),
                 "--session-id",
                 session_uuid,
                 *approve,

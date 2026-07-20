@@ -368,14 +368,17 @@ components:
   schemas:
     Session:
       type: object
-      required: [id, backend, model, project, title, created_at, updated_at, status, origin, stats]
+      required: [id, backend, project, title, created_at, updated_at, status, origin, stats]
       properties:
         id:
           type: string
         backend:
           type: string
         model:
-          type: string
+          type: [string, "null"]
+          description: |
+            Null means "use the backend CLI's own configured default" — the command builder omits
+            `--model`. pi callers rely on this.
         project:
           $ref: "#/components/schemas/Project"
         title:
@@ -608,12 +611,13 @@ components:
 
     CreateSessionRequest:
       type: object
-      required: [backend, model, project]
+      required: [backend, project]
       properties:
         backend:
           type: string
         model:
-          type: string
+          type: [string, "null"]
+          description: Optional; omit to use the backend CLI's own configured default.
         project:
           $ref: "#/components/schemas/Project"
         title:

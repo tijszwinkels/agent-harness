@@ -425,6 +425,55 @@ def test_claude_code_command_builder_guards_dash_prefixed_prompt() -> None:
     assert command.argv[-2:] == ("--", dash_prompt)
 
 
+# ── optional session model ────────────────────────────────────────────────────
+# A session created without a model (``Session.model is None``) lets the backend
+# CLI fall back to its own configured default. Each builder omits ``--model``
+# entirely rather than emitting ``--model None`` (verified: all three CLIs accept
+# an absent ``--model`` and use their configured default).
+
+
+def test_codex_command_builder_omits_model_when_none() -> None:
+    session = make_session("codex").model_copy(update={"model": None})
+    command = CodexCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "--model" not in command.argv
+    assert command.argv == ("codex", "exec", "--json", "--", "go")
+
+
+def test_pi_command_builder_omits_model_when_none() -> None:
+    session = make_session("pi").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc", "model": None}
+    )
+    command = PiCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "--model" not in command.argv
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--session-id",
+        "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "go",
+    )
+
+
+def test_claude_code_command_builder_omits_model_when_none() -> None:
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc", "model": None}
+    )
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"), is_first_run=True,
+    )
+
+    assert "--model" not in command.argv
+    # session flags still present, just no --model pair.
+    assert "--session-id" in command.argv
+    assert command.argv[-2:] == ("--", "go")
+
+
 def test_codex_command_builder_guards_dash_prefixed_prompt() -> None:
     session = make_session("codex")
     run = make_run(session)

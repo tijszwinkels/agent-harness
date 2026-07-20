@@ -150,7 +150,10 @@ class Run(HarnessModel):
 class Session(HarnessModel):
     id: str = Field(default_factory=lambda: new_id("ses"))
     backend: BackendName
-    model: str = Field(min_length=1)
+    # Optional: ``None`` means "use the backend CLI's own configured default".
+    # pi callers omit the model; the command builder then omits ``--model`` so
+    # the CLI falls back. A given value must still be non-empty.
+    model: str | None = Field(default=None, min_length=1)
     project: Project
     title: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -190,7 +193,9 @@ class Event(HarnessModel):
 
 class CreateSessionRequest(HarnessModel):
     backend: BackendName
-    model: str = Field(min_length=1)
+    # Optional: omit to let the backend CLI use its own configured default
+    # (pi callers rely on this). A given value must be non-empty.
+    model: str | None = Field(default=None, min_length=1)
     project: Project
     title: str | None = None
     bypass_permissions: bool = False

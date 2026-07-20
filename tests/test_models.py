@@ -77,6 +77,24 @@ def test_models_accept_pi_backend() -> None:
     assert request.backend == "pi"
 
 
+def test_session_and_request_model_is_optional() -> None:
+    # A session may be created without a model — the backend CLI falls back to
+    # its own configured default (pi callers omit it). ``None`` is allowed;
+    # an empty string is still rejected (min_length=1 when a value is given).
+    request = CreateSessionRequest(
+        backend="pi", project=Project(path="/tmp/proj", name="proj"),
+    )
+    assert request.model is None
+
+    session = Session(backend="pi", project=Project(path="/tmp/proj", name="proj"))
+    assert session.model is None
+
+    with pytest.raises(ValidationError):
+        CreateSessionRequest(
+            backend="pi", model="", project=Project(path="/tmp/proj", name="proj"),
+        )
+
+
 def test_models_reject_unknown_fields_and_invalid_backend_names() -> None:
     with pytest.raises(ValidationError):
         CreateSessionRequest(backend="unknown", model="x", project={"path": "/tmp", "name": "tmp"})

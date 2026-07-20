@@ -59,6 +59,22 @@ def test_session_create_list_get_archive_flow() -> None:
     assert archive_response.json()["status"] == "archived"
 
 
+def test_session_create_without_model_succeeds() -> None:
+    # pi callers (mm-bridge's pi purpose) don't send a model — the pi CLI has
+    # its own configured default. Model is optional; the backend falls back.
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/sessions",
+        json={"backend": "pi", "project": {"path": "/tmp/proj", "name": "proj"}},
+    )
+
+    assert response.status_code == 201
+    session = response.json()
+    assert session["backend"] == "pi"
+    assert session["model"] is None
+
+
 def test_session_create_rejects_unknown_backend() -> None:
     client = TestClient(create_app())
 

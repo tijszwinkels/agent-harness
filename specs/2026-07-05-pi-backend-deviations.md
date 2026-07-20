@@ -27,7 +27,7 @@ Implemented accordingly:
 **Open operational item (P10):** pi needs Node ≥ 22.19 (it crashes on Node 20 —
 see R5 below). Delivering that is an out-of-code step: bump the default Node in
 the harness's **systemd** environment (systemd services default to Node 20 on
-pillar even though interactive shells get Node 24 via fnm). This executor did
+the deployment host even though interactive shells get Node 24 via fnm). This executor did
 **not** modify the live machine's Node — that is a production change outside the
 task's repo scope and outside an unattended executor's remit. **Until the
 systemd Node is ≥ 22.19, every pi run will exit non-zero (`failed`).**

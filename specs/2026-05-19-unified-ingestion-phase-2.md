@@ -20,7 +20,7 @@ Phase 1 introduced synchronous codex pre-bind via psutil fd-polling. Sentry's re
 
 Option 1 dissolves the race by inverting the resolver: instead of orchestrator → observer ("here's the path; bind it"), the observer reads `session_meta` from the file content and looks up the orchestrator's hint. Watchfiles can fire whenever; resolution is content-based, not timing-based.
 
-Confirmed with Tijs 2026-05-19: "yeah, do option 1."
+Confirmed with the maintainer 2026-05-19: "yeah, do option 1."
 
 ## Code changes
 

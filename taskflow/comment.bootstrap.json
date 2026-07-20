@@ -4,7 +4,7 @@
   "name": "Echo bootstrap progress",
   "instruction": "A TaskFlow progress comment for the Echo agent-harness build task.",
   "content": {
-    "body": "Bootstrap complete: created /home/claude/projects/agent-harness-echo, initialized git, created ~/.agents/echo with memory and notes, created the Agent Harness (Echo) TaskFlow project/default board/states/task, and placed the task in Refinement. Mattermost session/channel: https://chat.tinkertank.instructiongraph.ai/tinkertank/pl/shtg38psnf8ntqpw5twfbz6txc"
+    "body": "Bootstrap complete: created the agent-harness project workspace, initialized git, created the agent memory and notes directory, created the Agent Harness (Echo) TaskFlow project/default board/states/task, and placed the task in Refinement."
   },
   "relations": {
     "replies_to": [

@@ -119,7 +119,7 @@ After implementation:
 
 ## What is NOT in Phase 4
 
-- Cost data for claude (deferred indefinitely per Tijs).
+- Cost data for claude (deferred indefinitely per the maintainer).
 - Auto-creating Run records for pure-external sessions (not architecturally needed; revisit if a future feature requires it).
 - Backfilling historical sessions.
 - Bridge-side migrations (mm-bridge / command-bridge consume the new event shapes; their teams handle on their schedule).

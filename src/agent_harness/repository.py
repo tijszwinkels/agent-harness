@@ -70,6 +70,13 @@ class InMemoryRepository:
             self._messages[session.id] = []
         return session.model_copy(deep=True)
 
+    def create_forked_session(self, parent: Session, *, title: str | None) -> Session:
+        child = Session.forked_child(parent, title=title)
+        with self._lock:
+            self._sessions[child.id] = child
+            self._messages[child.id] = []
+        return child.model_copy(deep=True)
+
     def list_sessions(self) -> list[Session]:
         with self._lock:
             return [session.model_copy(deep=True) for session in self._sessions.values()]

@@ -83,6 +83,13 @@ class CommandBuildError(ValueError):
     """Raised when a session cannot be mapped to a runnable backend command."""
 
 
+def _model_flag(session: Session) -> tuple[str, ...]:
+    # ``--model M`` when the session pins a model; empty when it doesn't, so
+    # the backend CLI falls back to its own configured default. All three CLIs
+    # accept an absent ``--model`` (verified 2026-07-20).
+    return ("--model", session.model) if session.model is not None else ()
+
+
 @dataclass(frozen=True)
 class ProcessCommand:
     argv: tuple[str, ...]
@@ -144,8 +151,7 @@ class CodexCommandBuilder:
                     "exec",
                     "resume",
                     "--json",
-                    "--model",
-                    session.model,
+                    *_model_flag(session),
                     *bypass,
                     session.codex_resume_id,
                     # ``--`` ends option parsing so a ``-``-prefixed prompt is
@@ -158,7 +164,7 @@ class CodexCommandBuilder:
             )
 
         return ProcessCommand(
-            argv=("codex", "exec", "--json", "--model", session.model, *bypass, "--", text),
+            argv=("codex", "exec", "--json", *_model_flag(session), *bypass, "--", text),
             cwd=session.project.path,
         )
 
@@ -229,8 +235,7 @@ class ClaudeCodeCommandBuilder:
             "--include-partial-messages",
             "--append-system-prompt",
             CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
-            "--model",
-            session.model,
+            *_model_flag(session),
         )
         if session.bypass_permissions:
             argv = (*argv, "--dangerously-skip-permissions")
@@ -240,6 +245,14 @@ class ClaudeCodeCommandBuilder:
             # (claude wrote the .jsonl with it). We can only --resume — we
             # don't own session creation.
             argv = (*argv, "--resume", claude_uuid)
+        elif is_first_run and session.forked_from is not None:
+            # Fork: resume the PARENT's conversation but --fork-session so
+            # claude writes to a NEW id, pinned to this child's own UUID.
+            # The parent transcript is read-only (verified 2026-07-20). Only
+            # the first run forks; once the child transcript exists, follow-up
+            # runs resume the child normally via the branch below.
+            parent_uuid = _harness_session_id_as_uuid(session.forked_from)
+            argv = (*argv, "--resume", parent_uuid, "--fork-session", "--session-id", claude_uuid)
         else:
             # Harness-origin: pin a deterministic claude session UUID so
             # subsequent runs can --resume and retain conversation context.
@@ -289,7 +302,7 @@ class PiCommandBuilder:
         message: Message,
         is_first_run: bool = True,
     ) -> ProcessCommand:
-        del run, is_first_run  # pi --session-id is idempotent create-or-load.
+        del run
         text = _message_text(message)
         # Reuse the claude UUID derivation: harness ``ses_<hex>`` ->
         # canonical 8-4-4-4-12 UUID. pi accepts any string id, but a
@@ -297,12 +310,19 @@ class PiCommandBuilder:
         # same helper (and its non-hex guard) cover both backends.
         session_uuid = _harness_session_id_as_uuid(session.id)
         approve: tuple[str, ...] = ("-a",) if session.bypass_permissions else ()
+        # Fork: on the first run, ``pi --fork <parent> --session-id <child>``
+        # forks the parent session file into the child's pinned id, leaving
+        # the parent untouched (verified 2026-07-20). Follow-up runs drop
+        # ``--fork`` and just load the child via its idempotent --session-id.
+        fork: tuple[str, ...] = ()
+        if is_first_run and session.forked_from is not None:
+            fork = ("--fork", _harness_session_id_as_uuid(session.forked_from))
         return ProcessCommand(
             argv=(
                 "pi",
                 "-p",
-                "--model",
-                session.model,
+                *_model_flag(session),
+                *fork,
                 "--session-id",
                 session_uuid,
                 *approve,
@@ -326,6 +346,38 @@ def default_command_builders() -> dict[str, BackendCommandBuilder]:
 # subscription (see ``RunProcess._wait_for_run_end_turn``). The
 # supervisor's stdout pump is now purely a heartbeat tick + stderr
 # passthrough (see ``_stream_lines``).
+
+
+# Backends whose non-interactive CLI can fork a session cleanly (resume the
+# parent's history into a NEW transcript, leaving the parent untouched):
+#   * claude-code — ``--resume <parent> --fork-session --session-id <child>``
+#   * pi          — ``--fork <parent> --session-id <child>``
+# codex is excluded: ``codex exec resume`` appends to the parent's own rollout
+# (would mutate it), and ``codex fork`` is a TUI-only subcommand with no
+# ``--json`` mode — incompatible with the harness's ``codex exec --json``
+# pipeline. Verified against the real CLIs 2026-07-20.
+_FORKABLE_BACKENDS: frozenset[str] = frozenset({"claude-code", "pi"})
+
+
+def session_supports_fork(backend: str) -> bool:
+    return backend in _FORKABLE_BACKENDS
+
+
+def validate_fork_source(parent: Session) -> None:
+    """Raise ``CommandBuildError`` when ``parent`` can't seed a fork.
+
+    Mirrors ``validate_session_resume_target``: the API layer catches the
+    error and maps it to a 409 so the bridge surfaces its "cannot fork"
+    message.
+    """
+    if not session_supports_fork(parent.backend):
+        raise CommandBuildError(
+            f"Backend {parent.backend} does not support forking",
+        )
+    # Both forkable backends derive the parent's fork UUID from its session id
+    # (claude/pi share the ``ses_<hex>`` / legacy / raw-UUID derivation). A
+    # parent whose id can't produce a UUID can't be a fork source.
+    _harness_session_id_as_uuid(parent.id)
 
 
 def validate_session_resume_target(session: Session) -> None:

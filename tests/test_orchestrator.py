@@ -20,8 +20,15 @@ from agent_harness.orchestrator import (
     SubmitResult,
     claude_conversation_exists,
     default_command_builders,
+    session_supports_fork,
+    validate_fork_source,
     validate_session_resume_target,
 )
+
+_PARENT_ID = "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"
+_PARENT_UUID = "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc"
+_CHILD_ID = "ses_2a9857de2f9d4190aa76e433619602fb"
+_CHILD_UUID = "2a9857de-2f9d-4190-aa76-e433619602fb"
 
 
 class FakeStream:
@@ -423,6 +430,147 @@ def test_claude_code_command_builder_guards_dash_prefixed_prompt() -> None:
 
     # ``--`` sits immediately before the prompt so option parsing stops first.
     assert command.argv[-2:] == ("--", dash_prompt)
+
+
+# ── optional session model ────────────────────────────────────────────────────
+# A session created without a model (``Session.model is None``) lets the backend
+# CLI fall back to its own configured default. Each builder omits ``--model``
+# entirely rather than emitting ``--model None`` (verified: all three CLIs accept
+# an absent ``--model`` and use their configured default).
+
+
+def test_codex_command_builder_omits_model_when_none() -> None:
+    session = make_session("codex").model_copy(update={"model": None})
+    command = CodexCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "--model" not in command.argv
+    assert command.argv == ("codex", "exec", "--json", "--", "go")
+
+
+def test_pi_command_builder_omits_model_when_none() -> None:
+    session = make_session("pi").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc", "model": None}
+    )
+    command = PiCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "--model" not in command.argv
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--session-id",
+        "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc",
+        "go",
+    )
+
+
+def test_claude_code_command_builder_omits_model_when_none() -> None:
+    session = make_session("claude-code").model_copy(
+        update={"id": "ses_3eb0e45b9d724deabdc3b472e0c4c2fc", "model": None}
+    )
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"), is_first_run=True,
+    )
+
+    assert "--model" not in command.argv
+    # session flags still present, just no --model pair.
+    assert "--session-id" in command.argv
+    assert command.argv[-2:] == ("--", "go")
+
+
+# ── fork mechanics ─────────────────────────────────────────────────────────────
+# A fork's first run resumes the PARENT conversation but writes to the CHILD's
+# own deterministic transcript, leaving the parent untouched. Verified against
+# the real CLIs 2026-07-20 (see specs/2026-07-20-session-fork-route.md).
+
+
+def _forked_child(backend: str) -> Session:
+    return make_session(backend).model_copy(
+        update={"id": _CHILD_ID, "forked_from": _PARENT_ID}
+    )
+
+
+def test_claude_fork_first_run_resumes_parent_and_pins_child_id() -> None:
+    child = _forked_child("claude-code")
+    command = ClaudeCodeCommandBuilder().build(
+        session=child, run=make_run(child), message=Message.user("go"), is_first_run=True,
+    )
+
+    # --resume <parent> --fork-session --session-id <child> : fork the parent's
+    # conversation into the child's own id.
+    assert "--fork-session" in command.argv
+    assert command.argv[command.argv.index("--resume") + 1] == _PARENT_UUID
+    assert command.argv[command.argv.index("--session-id") + 1] == _CHILD_UUID
+    assert command.argv[-2:] == ("--", "go")
+
+
+def test_claude_fork_second_run_resumes_child_not_parent() -> None:
+    # Once the fork's first run has written the child transcript, follow-up
+    # runs resume the CHILD normally — no re-fork, no parent reference.
+    child = _forked_child("claude-code")
+    command = ClaudeCodeCommandBuilder().build(
+        session=child, run=make_run(child), message=Message.user("more"), is_first_run=False,
+    )
+
+    assert "--fork-session" not in command.argv
+    assert command.argv[command.argv.index("--resume") + 1] == _CHILD_UUID
+
+
+def test_pi_fork_first_run_forks_parent_and_pins_child_id() -> None:
+    child = _forked_child("pi")
+    command = PiCommandBuilder().build(
+        session=child, run=make_run(child), message=Message.user("go"), is_first_run=True,
+    )
+
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--model",
+        "gpt-5.4",
+        "--fork",
+        _PARENT_UUID,
+        "--session-id",
+        _CHILD_UUID,
+        "go",
+    )
+
+
+def test_pi_fork_second_run_loads_child_session_without_fork() -> None:
+    child = _forked_child("pi")
+    command = PiCommandBuilder().build(
+        session=child, run=make_run(child), message=Message.user("more"), is_first_run=False,
+    )
+
+    assert "--fork" not in command.argv
+    assert command.argv[command.argv.index("--session-id") + 1] == _CHILD_UUID
+
+
+def test_session_supports_fork() -> None:
+    assert session_supports_fork("claude-code") is True
+    assert session_supports_fork("pi") is True
+    # codex: exec resume appends to the parent rollout; `codex fork` is TUI-only.
+    assert session_supports_fork("codex") is False
+    assert session_supports_fork("unknown") is False
+
+
+def test_validate_fork_source_rejects_codex() -> None:
+    codex = make_session("codex")
+    with pytest.raises(CommandBuildError, match="does not support forking"):
+        validate_fork_source(codex)
+
+
+def test_validate_fork_source_rejects_non_derivable_id() -> None:
+    bad = make_session("claude-code").model_copy(update={"id": "ses_not-uuid-shaped"})
+    with pytest.raises(CommandBuildError, match="Cannot derive"):
+        validate_fork_source(bad)
+
+
+def test_validate_fork_source_accepts_claude_and_pi() -> None:
+    validate_fork_source(make_session("claude-code").model_copy(update={"id": _PARENT_ID}))
+    validate_fork_source(make_session("pi").model_copy(update={"id": _PARENT_ID}))
 
 
 def test_codex_command_builder_guards_dash_prefixed_prompt() -> None:

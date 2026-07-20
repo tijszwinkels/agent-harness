@@ -20,6 +20,8 @@ from agent_harness.models import (
     CreateRunResponse,
     CreateSessionRequest,
     Event,
+    ForkSessionRequest,
+    ForkSessionResponse,
     InterruptRunResponse,
     PatchSessionRequest,
     StopReason,
@@ -32,6 +34,8 @@ from agent_harness.orchestrator import (
     RunProcessResult,
     claude_conversation_exists,
     default_command_builders,
+    session_supports_fork,
+    validate_fork_source,
     validate_session_resume_target,
 )
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
@@ -206,8 +210,18 @@ def create_app(
             )
         return session
 
-    @app.post("/v1/sessions/{session_id}/runs", status_code=status.HTTP_202_ACCEPTED)
-    async def create_run(session_id: str, request: CreateRunRequest) -> CreateRunResponse:
+    async def _create_and_launch_run(
+        session_id: str, request: CreateRunRequest
+    ) -> CreateRunResponse:
+        """Shared run-launch body for ``POST .../runs`` and the fork route.
+
+        Preflights the session, inserts the run, builds the backend command,
+        and submits it to the RunManager (or the no-manager test path).
+        Raises ``HTTPException`` on the documented failure statuses. The fork
+        route relies on the command builder emitting the fork argv for a
+        first run whose session carries ``forked_from`` — no special-casing
+        needed here.
+        """
         preflight_session = None
         if run_manager is not None:
             try:
@@ -322,6 +336,60 @@ def create_app(
             repo.start_run(session_id, run.id)
             run_status = "running"
         return CreateRunResponse(session_id=session_id, run_id=run.id, status=run_status)
+
+    @app.post("/v1/sessions/{session_id}/runs", status_code=status.HTTP_202_ACCEPTED)
+    async def create_run(session_id: str, request: CreateRunRequest) -> CreateRunResponse:
+        return await _create_and_launch_run(session_id, request)
+
+    @app.post("/v1/sessions/{session_id}/forks", status_code=status.HTTP_201_CREATED)
+    async def fork_session(
+        session_id: str, request: ForkSessionRequest
+    ) -> ForkSessionResponse:
+        # A fork is a new harness-owned child session whose first run resumes
+        # the PARENT's whole conversation but writes to the child's own
+        # transcript, leaving the parent untouched (claude --fork-session /
+        # pi --fork; verified against the real CLIs). The child then diverges.
+        try:
+            parent = repo.get_session(session_id)
+        except SessionNotFoundError as exc:
+            logger.warning("Fork failed because parent session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+
+        # Backend/id must be forkable (codex and non-UUID ids are rejected).
+        try:
+            validate_fork_source(parent)
+        except CommandBuildError as exc:
+            logger.warning("Fork rejected for session=%s: %s", session_id, exc)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+        # Forking a mid-write transcript would give an ill-defined fork point:
+        # reject while any run for the parent is still queued or running.
+        if any(run.status in ("queued", "running") for run in repo.list_runs(session_id)):
+            logger.info("Fork rejected: parent %s has an in-progress run", session_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot fork a session with an in-progress run",
+            )
+
+        child = repo.create_forked_session(parent, title=request.title)
+        await events.publish(
+            Event(
+                event="session.updated",
+                session_id=child.id,
+                data={"session": jsonable_encoder(child)},
+            )
+        )
+
+        run = None
+        if request.message is not None:
+            # Reuse the run-launch path; the builder emits the fork argv
+            # because the child is a first-run session carrying forked_from.
+            launched = await _create_and_launch_run(
+                child.id, CreateRunRequest(message=request.message)
+            )
+            run = repo.get_run(child.id, launched.run_id)
+
+        return ForkSessionResponse(session=child, run=run)
 
     @app.get("/v1/sessions/{session_id}/runs")
     async def list_runs(session_id: str) -> dict[str, object]:

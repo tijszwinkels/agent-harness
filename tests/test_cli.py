@@ -1,3 +1,7 @@
+import logging
+
+import pytest
+
 from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.cli import main
 
@@ -185,3 +189,30 @@ def test_serve_command_wires_cors_origins(monkeypatch, tmp_path) -> None:
     )
 
     assert calls[0]["cors_origins"] == ["https://a.example", "https://b.example"]
+
+
+def test_serve_warns_when_bound_to_public_host(monkeypatch, tmp_path, caplog) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", lambda *_args, **_kwargs: None)
+
+    with caplog.at_level(logging.WARNING, logger="agent_harness.cli"):
+        assert main(["serve", "--host", "0.0.0.0"]) == 0
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "expected a WARNING when binding a non-loopback host"
+    message = warnings[0].getMessage().lower()
+    assert "unauthenticated" in message
+    assert "0.0.0.0" in message
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_serve_does_not_warn_on_loopback_hosts(monkeypatch, tmp_path, caplog, host) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("agent_harness.cli.uvicorn.run", lambda *_args, **_kwargs: None)
+
+    with caplog.at_level(logging.WARNING, logger="agent_harness.cli"):
+        assert main(["serve", "--host", host]) == 0
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        f"loopback host {host} must not trigger the public-bind warning"
+    )

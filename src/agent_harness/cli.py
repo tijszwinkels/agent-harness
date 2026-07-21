@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from collections.abc import Sequence
 
 import uvicorn
@@ -11,6 +12,33 @@ from agent_harness.orchestrator import RunManager
 from agent_harness.rollout_discovery import RolloutDiscovery
 from agent_harness.settings import ObserverSettings
 from agent_harness.storage import open_sqlite_repository
+
+logger = logging.getLogger(__name__)
+
+# Hosts that keep the service reachable only from the local machine. Binding
+# anything else exposes the API on a network interface.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _warn_if_public_host(host: str) -> None:
+    """Log a prominent warning when the harness binds a non-loopback host.
+
+    The API is unauthenticated and spawns agent CLIs with
+    ``--dangerously-skip-permissions``; exposing it on a routable interface
+    (e.g. ``0.0.0.0`` on a public-IP box) is unauthenticated remote code
+    execution. The bridge reaches the harness over localhost, so loopback is
+    the correct default for the normal co-located topology.
+    """
+    if host in _LOOPBACK_HOSTS:
+        return
+    logger.warning(
+        "agent-harness is binding %s, which is NOT loopback. The API is "
+        "UNAUTHENTICATED and launches agent CLIs with "
+        "--dangerously-skip-permissions; anyone who can reach this port has "
+        "remote code execution. Bind 127.0.0.1, or firewall the port and put "
+        "an authenticating proxy in front before exposing it.",
+        host,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -52,6 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "serve":
+        _warn_if_public_host(args.host)
         observer_settings = _observer_settings_from_args(args)
         app = _app_for_serve(args, observer_settings)
         uvicorn.run(

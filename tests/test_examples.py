@@ -18,6 +18,20 @@ def _load_example(relative_path: str):
     return module
 
 
+def test_run_sh_example_binds_loopback_by_default() -> None:
+    """The launcher template must not expose the unauthenticated harness on
+    every interface. The live `serve` invocation must bind 127.0.0.1; any
+    `0.0.0.0` may appear only in a commented note about remote topologies."""
+    content = (ROOT / "run.sh.example").read_text()
+
+    assert "--host 127.0.0.1" in content
+    active_lines = [
+        line for line in content.splitlines()
+        if "0.0.0.0" in line and not line.lstrip().startswith("#")
+    ]
+    assert active_lines == [], f"run.sh.example binds 0.0.0.0 on a live line: {active_lines}"
+
+
 def test_observer_external_builds_codex_demo_transcript(tmp_path: Path) -> None:
     example = _load_example("examples/python/observer_external.py")
 

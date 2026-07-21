@@ -8,8 +8,14 @@ cd "$(dirname "$0")"
 # ~/.bashrc, so add the dirs your backends AND uv live in explicitly. If your
 # backends are system-installed (e.g. /usr/bin) you only need ~/.local/bin here.
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+# SECURITY: bind loopback. The API is UNAUTHENTICATED and spawns agent CLIs
+# with --dangerously-skip-permissions, so anything that can reach this port has
+# remote code execution. The bridge talks to the harness over localhost, so
+# 127.0.0.1 is right for the normal co-located topology. Only change --host to
+# 0.0.0.0 (or a specific interface) if the port is firewalled and fronted by an
+# authenticating proxy — never bind 0.0.0.0 on a public-IP box.
 exec uv run agent-harness serve \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8877 \
   --database .agent-harness.db.8877 \
   --execute-runs

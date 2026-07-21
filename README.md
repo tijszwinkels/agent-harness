@@ -125,6 +125,19 @@ Key flags:
 By default the server observes the known Claude Code, Codex, and pi transcript
 roots under `HOME` when those directories exist.
 
+### Security: the API is unauthenticated
+
+The harness HTTP/SSE API has **no authentication** and spawns agent CLIs with
+`--dangerously-skip-permissions`. Anyone who can reach the port can start
+sessions and run arbitrary commands as the service user. Therefore:
+
+- **Bind loopback (`--host 127.0.0.1`, the default).** The bridge and other
+  local clients reach the harness over localhost.
+- **Do not bind `0.0.0.0` on a public-IP host** — that is unauthenticated
+  remote code execution. If you need remote access, firewall the port and put
+  an authenticating reverse proxy in front. `serve` logs a prominent WARNING at
+  startup whenever `--host` is not a loopback address.
+
 ## Observing external sessions
 
 The observer watches each backend's transcript files with `watchfiles` and

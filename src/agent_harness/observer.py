@@ -1206,7 +1206,16 @@ class TranscriptWatchService:
 
 
 def claude_project_dir_name(cwd: str | Path) -> str:
-    return Path(cwd).expanduser().as_posix().replace("/", "-")
+    # Claude Code names ~/.claude/projects/<dir> by replacing EVERY
+    # non-alphanumeric char in the cwd with ``-`` (not just ``/``). Verified on
+    # claude 2.1.216: ``/tmp/dot.test_dir/.hidden/a_b.c`` ->
+    # ``-tmp-dot-test-dir--hidden-a-b-c``. Matching this exactly is load-bearing:
+    # ``claude_conversation_exists`` uses it to decide ``--session-id`` (create)
+    # vs ``--resume``. A ``/``-only slug missed the transcript for any cwd under
+    # a hidden dir (e.g. ``~/.mycel/...`` agents), so every follow-up turn was
+    # treated as a first run and reused ``--session-id`` -> the CLI aborts with
+    # ``Session ID <uuid> is already in use`` and the turn silently fails.
+    return re.sub(r"[^A-Za-z0-9]", "-", Path(cwd).expanduser().as_posix())
 
 
 def claude_transcript_path(cwd: str | Path, session_uuid: str, *, home: str | Path | None = None) -> Path:

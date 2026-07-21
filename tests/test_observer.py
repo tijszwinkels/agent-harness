@@ -37,6 +37,22 @@ def test_claude_transcript_path_and_external_id_helpers() -> None:
     assert transcript_identity_from_path(path).session_id == "ses_123e4567e89b12d3a456426614174000"
 
 
+def test_claude_project_dir_name_slugifies_dots_and_underscores() -> None:
+    # Claude Code slugifies EVERY non-alphanumeric char in the cwd to ``-`` when
+    # naming ~/.claude/projects/<dir>, not just ``/``. A cwd under a hidden dir
+    # (``.mycel``) or with ``.``/``_`` in a component (verified on claude 2.1.216:
+    # ``/tmp/dot.test_dir/.hidden/a_b.c`` -> ``-tmp-dot-test-dir--hidden-a-b-c``)
+    # must resolve to the SAME dir claude actually writes to. Getting this wrong
+    # made ``claude_conversation_exists`` miss the transcript, so the orchestrator
+    # treated every follow-up turn as a first run and reused ``--session-id`` ->
+    # ``Error: Session ID <uuid> is already in use`` (harness agents under
+    # ``~/.mycel/...`` failed on turn 2 onwards).
+    assert claude_project_dir_name("/home/claude/.mycel/agents/tool/do-quarterly-taxes") == (
+        "-home-claude--mycel-agents-tool-do-quarterly-taxes"
+    )
+    assert claude_project_dir_name("/tmp/dot.test_dir/.hidden/a_b.c") == "-tmp-dot-test-dir--hidden-a-b-c"
+
+
 def test_codex_transcript_path_and_external_id_helpers() -> None:
     path = codex_transcript_path(
         year=2026,

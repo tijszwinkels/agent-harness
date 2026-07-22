@@ -23,6 +23,14 @@ END_TURN_HARD_KILL_AFTER_SECONDS = 40.0
 IDLE_TIMEOUT_SECONDS = 30 * 60
 IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
+# When the idle threshold is crossed, the watchdog samples the run's
+# process-tree CPU. If the tree burned more than this many CPU-seconds
+# since the previous check, a child is genuinely working (a single
+# long-but-silent tool call — a >30-min build/transcription — emits no
+# stdout and no observer events) → defer the kill. A wedged process
+# burns ~0 CPU, so it stays below this floor and is reaped as before.
+# Well above idle-loop/stdio noise, well below any real build's burn.
+CPU_ACTIVITY_EPSILON_SECONDS = 0.5
 # After the FOREGROUND child exits, the stdout/stderr drain gets this
 # many seconds to reach EOF before we stop waiting on the readers. A
 # background orphan spawned by the agent (same process group, inherited
@@ -1108,15 +1116,103 @@ class RunProcess:
         finally:
             await subscription.aclose()
 
+    def _sample_process_tree_cpu(self) -> float | None:
+        """Total CPU-seconds (utime+stime) across every live process in
+        the run's process group, read from ``/proc``.
+
+        Lets the idle watchdog tell a *wedged* process (no output, no
+        CPU) from one stuck inside a single long-but-silent tool call (a
+        build/transcription whose child burns CPU while claude waits and
+        emits nothing). Returns ``None`` when the sample can't be
+        trusted — the foreground child is gone, or ``/proc`` is
+        unavailable (non-Linux) — and the caller then kills as usual.
+        POSIX/Linux-only, consistent with the ``killpg``-based watchdog.
+        """
+        process = self._process
+        if process is None:
+            return None
+        # Anchor on the foreground child's own /proc entry: if it's gone
+        # the run is over (kill path), and requiring it keeps unit tests
+        # with synthetic pids deterministic (no /proc entry → None).
+        try:
+            with open(f"/proc/{process.pid}/stat", "rb"):
+                pass
+        except OSError:
+            return None
+        try:
+            pgid = os.getpgid(process.pid)
+            clk_tck = os.sysconf("SC_CLK_TCK")
+            entries = os.listdir("/proc")
+        except (OSError, ValueError, ProcessLookupError):
+            return None
+        total_ticks = 0
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as fh:
+                    stat_line = fh.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            # comm (field 2) may contain spaces/parens, so split AFTER the
+            # last ')'. Remaining 0-indexed fields: 0=state, 2=pgrp,
+            # 11=utime, 12=stime (proc(5)).
+            rparen = stat_line.rfind(")")
+            if rparen == -1:
+                continue
+            fields = stat_line[rparen + 2:].split()
+            if len(fields) < 13:
+                continue
+            try:
+                if int(fields[2]) != pgid:
+                    continue
+                total_ticks += int(fields[11]) + int(fields[12])
+            except ValueError:
+                continue
+        return total_ticks / clk_tck
+
     async def _watch_idle_timeout(self, wait_task: asyncio.Task[int]) -> None:
+        # Step 4: on crossing the idle threshold, defer the kill while the
+        # process tree is actively burning CPU (a single long silent tool
+        # call). ``prev_cpu`` is the previous check's sample; a quiescent
+        # tree shows ~0 delta and is reaped on the first over-threshold
+        # check exactly as before (no added latency).
+        prev_cpu: float | None = None
+        warned = False
         while True:
             await self._sleep(IDLE_CHECK_INTERVAL_SECONDS)
             if self._process_exited(wait_task):
                 return
 
+            cpu = self._sample_process_tree_cpu()
             idle_seconds = (self._clock() - self._last_activity_at).total_seconds()
             if idle_seconds <= self._idle_timeout_seconds:
+                prev_cpu = cpu
+                warned = False
                 continue
+
+            if (
+                cpu is not None
+                and prev_cpu is not None
+                and cpu - prev_cpu > CPU_ACTIVITY_EPSILON_SECONDS
+            ):
+                # A child in the group burned CPU since the last check —
+                # the run is inside a long silent tool call. Defer; warn
+                # once so a frontend can surface the near-miss.
+                if not warned:
+                    await self._publish(
+                        "run.idle_warning",
+                        {
+                            "idle_seconds": int(idle_seconds),
+                            "idle_timeout_seconds": int(self._idle_timeout_seconds),
+                            "cpu_seconds_delta": round(cpu - prev_cpu, 3),
+                            "reason": "process_tree_busy_deferring_kill",
+                        },
+                    )
+                    warned = True
+                prev_cpu = cpu
+                continue
+            prev_cpu = cpu
 
             self._watchdog_termination_in_progress = True
             self._watchdog_termination_task = asyncio.current_task()

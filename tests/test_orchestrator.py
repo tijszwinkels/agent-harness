@@ -2851,3 +2851,123 @@ async def test_run_manager_threads_idle_timeout_to_run_process() -> None:
     finally:
         process.finish()
         await asyncio.wait_for(manager.wait(run.id), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_defers_kill_while_child_burns_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 4 (stretch): a single long-but-silent tool call (e.g. a
+    >30-min build/transcription) emits no stdout and no observer events,
+    so both heartbeat layers go quiet — but its child process burns CPU.
+    At the idle threshold the watchdog samples the process tree; while
+    CPU keeps advancing it DEFERS the kill (and emits ``run.idle_warning``
+    once). When the child finishes and CPU goes flat, the run is reaped.
+    """
+    monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_HARD_KILL_GRACE_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(orchestrator, "CPU_ACTIVITY_EPSILON_SECONDS", 0.5, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], stderr=[], close_stdout=False, close_stderr=False)
+    install_fake_process_group(monkeypatch, process)
+
+    cpu = {"v": 0.0}
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("claude", "--print")),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+        idle_timeout_seconds=120,
+    )
+    rp._sample_process_tree_cpu = lambda: cpu["v"]  # type: ignore[method-assign]
+    task = asyncio.create_task(rp.run())
+
+    async def settle() -> None:
+        for _ in range(6):
+            await asyncio.sleep(0)
+
+    await settle()
+
+    # Child keeps burning CPU across five checks, two of them past the
+    # 120s threshold → kill deferred each time.
+    for _ in range(5):
+        cpu["v"] += 5.0
+        clock.advance(60)
+        await settle()
+
+    assert process.group_signals == []
+    warnings = [
+        e
+        for e in await bus.replay(session_id=session.id)
+        if e.run_id == run.id and e.event == "run.idle_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].data["reason"] == "process_tree_busy_deferring_kill"
+
+    # Build finishes: CPU flat → next over-threshold check reaps it.
+    clock.advance(60)
+    await settle()
+    assert process.group_signals == [signal.SIGTERM]
+    clock.advance(30)
+    await settle()
+    process.stdout.close()
+    process.stderr.close()
+    result = await asyncio.wait_for(task, timeout=6)
+    assert result.status == "interrupted"
+    events = [e.event for e in await bus.replay(session_id=session.id)]
+    assert "run.timed_out_idle" in events
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_kills_when_tree_cpu_is_flat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live-but-quiescent tree (present, but burning no CPU) is still
+    reaped at the threshold, with no ``run.idle_warning`` — the CPU
+    defer only saves trees that are actively working."""
+    monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_HARD_KILL_GRACE_SECONDS", 30.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], stderr=[], close_stdout=False, close_stderr=False)
+    install_fake_process_group(monkeypatch, process)
+
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("claude", "--print")),
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        clock=clock,
+        sleep=clock.sleep,
+        idle_timeout_seconds=120,
+    )
+    rp._sample_process_tree_cpu = lambda: 7.0  # type: ignore[method-assign]
+    task = asyncio.create_task(rp.run())
+    await flush_asyncio()
+
+    clock.advance(60)   # t=60, idle<=120 → establish prev_cpu
+    await flush_asyncio()
+    clock.advance(60)   # t=120, idle<=120
+    await flush_asyncio()
+    clock.advance(60)   # t=180, idle>120, flat CPU → kill
+    await flush_asyncio()
+    assert process.group_signals == [signal.SIGTERM]
+
+    clock.advance(30)
+    await flush_asyncio()
+    process.stdout.close()
+    process.stderr.close()
+    result = await asyncio.wait_for(task, timeout=6)
+    assert result.status == "interrupted"
+    events = [e.event for e in await bus.replay(session_id=session.id)]
+    assert "run.idle_warning" not in events
+    assert "run.timed_out_idle" in events

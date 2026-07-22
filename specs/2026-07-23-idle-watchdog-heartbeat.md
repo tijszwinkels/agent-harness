@@ -87,21 +87,36 @@ turn's replayed activity (same guard as `_wait_for_run_end_turn`); session
 scoping is sufficient because the RunManager keeps at most one active
 subprocess per session.
 
-### Layer 3 — configurable timeout
+### Layer 3 — configurable idle timeout (default 600 s)
 
-`serve --idle-timeout-seconds` (default 1800) threads through
+Policy (2026-07-23): the idle fuse is **600 s (10 min)** so genuinely silent
+runs die fast. `serve --idle-timeout-seconds` threads through
 `RunManager → RunProcess._idle_timeout_seconds`. Resolved at construction so
 `IDLE_TIMEOUT_SECONDS` stays monkeypatchable in tests. The `run.timed_out_idle`
 event reports the configured value.
 
-### Layer 4 (stretch, separate commit — droppable in review)
+### Layer 4 — process-tree defer at idle expiry (REQUIRED)
 
-At timeout, before killing: a process-tree activity check. If live child
-processes have accumulated CPU since the previous check, the run is in a single
-long-but-silent tool call (e.g. a >30-min build or transcription where BOTH the
-stdout heartbeat AND observer events are silent) — defer and re-check. A
-quiescent tree is killed as today. A `run.idle_warning` event is emitted on the
-first deferral so a frontend can notify. The hard timeout remains the backstop.
+Promoted from stretch to required by the 600 s fuse: any single silent tool
+call longer than 10 min (a build, a full test suite, a transcription — the very
+workloads that motivated this report) emits no stdout AND no observer events
+while its child burns CPU, so both heartbeat layers legitimately go quiet.
+
+At idle expiry, before killing, the watchdog samples the run's process-group
+CPU (utime+stime via `/proc`, Linux-only, consistent with the `killpg`
+watchdog). A quiescent (wedged) tree — ~0 CPU — is killed as before. A tree
+that burned more than `CPU_ACTIVITY_EPSILON_SECONDS` since the previous check
+is genuinely working → defer and re-check, bounded only by the Layer-5 runtime
+cap. `run.idle_warning` fires on the first deferral so a frontend can notify.
+
+### Layer 5 — hard per-run runtime cap (default 3600 s)
+
+A wall-clock cap from spawn that kills a run **regardless of activity** — the
+backstop that bounds a CPU-busy run the idle watchdog keeps deferring.
+`serve --max-run-seconds` (default 3600) → `RunManager → RunProcess`.
+`_watch_max_runtime` emits `run.max_runtime_warning`
+`MAX_RUN_WARNING_LEAD_SECONDS` (600 s) before the cap so the bridge can warn the
+channel, then SIGTERM/SIGKILL at the cap and emits `run.exceeded_max_runtime`.
 
 ## Non-goals
 

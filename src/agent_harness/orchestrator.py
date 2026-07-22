@@ -20,9 +20,18 @@ logger = logging.getLogger(__name__)
 
 END_TURN_GRACE_SECONDS = 20.0
 END_TURN_HARD_KILL_AFTER_SECONDS = 40.0
-IDLE_TIMEOUT_SECONDS = 30 * 60
+# Policy (2026-07-23): a short idle fuse (silent runs die fast) plus a
+# hard per-run duration cap (bounds even an active or CPU-busy run).
+IDLE_TIMEOUT_SECONDS = 10 * 60
 IDLE_HARD_KILL_GRACE_SECONDS = 30.0
 IDLE_CHECK_INTERVAL_SECONDS = 60.0
+# Hard wall-clock cap on a single run, from spawn. Fires regardless of
+# activity — the backstop that bounds a CPU-busy run the idle watchdog
+# keeps deferring (see ``_watch_idle_timeout`` / ``_watch_max_runtime``).
+MAX_RUN_SECONDS = 60 * 60
+# Emit ``run.max_runtime_warning`` this many seconds before the cap so a
+# frontend can warn the channel before the kill.
+MAX_RUN_WARNING_LEAD_SECONDS = 600.0
 # When the idle threshold is crossed, the watchdog samples the run's
 # process-tree CPU. If the tree burned more than this many CPU-seconds
 # since the previous check, a child is genuinely working (a single
@@ -500,6 +509,7 @@ class RunProcess:
         observer: Any | None = None,
         rollout_discovery: Any | None = None,
         idle_timeout_seconds: float | None = None,
+        max_run_seconds: float | None = None,
     ) -> None:
         self.session = session
         self.run_record = run
@@ -517,6 +527,11 @@ class RunProcess:
             idle_timeout_seconds
             if idle_timeout_seconds is not None
             else IDLE_TIMEOUT_SECONDS
+        )
+        # Hard per-run wall-clock cap; resolved at construction (same
+        # rationale as the idle timeout). Set from --max-run-seconds.
+        self._max_run_seconds = (
+            max_run_seconds if max_run_seconds is not None else MAX_RUN_SECONDS
         )
         # Phase 4: end-turn signaling moved to the event bus
         # (``_wait_for_run_end_turn`` subscribes by session_id).
@@ -577,6 +592,7 @@ class RunProcess:
             asyncio.create_task(self._watch_end_turn_cleanup(wait_task)),
             asyncio.create_task(self._watch_idle_timeout(wait_task)),
             asyncio.create_task(self._watch_activity_events(activity_after)),
+            asyncio.create_task(self._watch_max_runtime(wait_task)),
         ]
         try:
             returncode = await wait_task
@@ -1171,6 +1187,61 @@ class RunProcess:
                 continue
         return total_ticks / clk_tck
 
+    async def _watch_max_runtime(self, wait_task: asyncio.Task[int]) -> None:
+        """Hard per-run wall-clock cap, from spawn.
+
+        Fires regardless of activity — the backstop that bounds even an
+        actively-working or CPU-busy run (one the idle watchdog keeps
+        deferring past a long silent tool call). Emits
+        ``run.max_runtime_warning`` ``MAX_RUN_WARNING_LEAD_SECONDS``
+        before the cap so a frontend can warn the channel, then
+        SIGTERM/SIGKILL at the cap and emits ``run.exceeded_max_runtime``.
+        """
+        cap = self._max_run_seconds
+        if cap is None or cap <= 0:
+            return
+        lead = MAX_RUN_WARNING_LEAD_SECONDS
+        if cap > lead > 0:
+            await self._wait_for_process_or_sleep(wait_task, cap - lead)
+            if self._process_exited(wait_task):
+                return
+            await self._publish(
+                "run.max_runtime_warning",
+                {
+                    "max_run_seconds": int(cap),
+                    "seconds_until_kill": int(lead),
+                    "reason": "approaching_max_runtime",
+                },
+            )
+            await self._wait_for_process_or_sleep(wait_task, lead)
+        else:
+            await self._wait_for_process_or_sleep(wait_task, cap)
+        if self._process_exited(wait_task):
+            return
+
+        self._watchdog_termination_in_progress = True
+        self._watchdog_termination_task = asyncio.current_task()
+        self._interrupted = True
+        if not self._signal_process_group(signal.SIGTERM):
+            return
+
+        hard_kill = False
+        await self._wait_for_process_or_sleep(wait_task, IDLE_HARD_KILL_GRACE_SECONDS)
+        if not self._process_exited(wait_task):
+            hard_kill = self._signal_process_group(signal.SIGKILL)
+            if hard_kill:
+                await wait_task
+
+        await self._publish(
+            "run.exceeded_max_runtime",
+            {
+                "max_run_seconds": int(cap),
+                "hard_kill": hard_kill,
+                "reason": "max_runtime_exceeded",
+            },
+        )
+        return
+
     async def _watch_idle_timeout(self, wait_task: asyncio.Task[int]) -> None:
         # Step 4: on crossing the idle threshold, defer the kill while the
         # process tree is actively burning CPU (a single long silent tool
@@ -1380,14 +1451,16 @@ class RunManager:
         observer: Any | None = None,
         rollout_discovery: Any | None = None,
         idle_timeout_seconds: float | None = None,
+        max_run_seconds: float | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
         self._queue_max_per_session = queue_max_per_session
-        # Threshold handed to every spawned RunProcess; None keeps the
-        # module default (``IDLE_TIMEOUT_SECONDS``). Set from the serve
-        # ``--idle-timeout-seconds`` flag.
+        # Thresholds handed to every spawned RunProcess; None keeps the
+        # module defaults (``IDLE_TIMEOUT_SECONDS`` / ``MAX_RUN_SECONDS``).
+        # Set from --idle-timeout-seconds / --max-run-seconds.
         self._idle_timeout_seconds = idle_timeout_seconds
+        self._max_run_seconds = max_run_seconds
         self._active: dict[str, RunProcess] = {}
         self._tasks: dict[str, asyncio.Task[RunProcessResult]] = {}
         # Tracks which run_id currently owns the subprocess for each session
@@ -1500,6 +1573,7 @@ class RunManager:
             observer=self._observer,
             rollout_discovery=self._rollout_discovery,
             idle_timeout_seconds=self._idle_timeout_seconds,
+            max_run_seconds=self._max_run_seconds,
         )
         self._active[run.id] = run_process
         self._active_run_by_session[session.id] = run.id

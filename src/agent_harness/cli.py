@@ -77,9 +77,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
         help="Allow cross-origin browser access from this origin. Repeat for multiple. Off by default.",
     )
+    serve.add_argument(
+        "--idle-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Kill a harness-owned run after this many seconds with no "
+            "visible activity (stdout/stderr heartbeat or observer "
+            "message/tool_use/usage events). Default: 1800. "
+            "Only applies with --execute-runs."
+        ),
+    )
 
     args = parser.parse_args(argv)
     if args.command == "serve":
+        if args.idle_timeout_seconds is not None and args.idle_timeout_seconds <= 0:
+            parser.error("--idle-timeout-seconds must be positive")
         _warn_if_public_host(args.host)
         observer_settings = _observer_settings_from_args(args)
         app = _app_for_serve(args, observer_settings)
@@ -139,6 +152,7 @@ def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings
         kwargs["run_manager"] = RunManager(
             event_bus=event_bus,
             rollout_discovery=RolloutDiscovery(),
+            idle_timeout_seconds=args.idle_timeout_seconds,
         )
     return create_app(**kwargs)
 

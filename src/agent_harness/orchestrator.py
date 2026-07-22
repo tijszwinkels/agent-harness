@@ -33,6 +33,20 @@ IDLE_CHECK_INTERVAL_SECONDS = 60.0
 # window, so clean output still drains fully and fast.
 POST_EXIT_DRAIN_GRACE_SECONDS = 5.0
 
+# asyncio's subprocess ``StreamReader`` raises ``ValueError``
+# (LimitOverrunError) from ``readline()`` when a single line exceeds its
+# buffer limit — and the DEFAULT limit is only 64KB. claude
+# ``--output-format stream-json`` emits each protocol event as one line;
+# a ``user`` turn echoing a large Read/Bash tool_result (or the init
+# event) routinely exceeds 64KB. When that raise went uncaught it killed
+# the stdout reader task and FROZE the idle heartbeat, so the watchdog
+# SIGTERMed actively-working runs ~31 min in (last tick stuck near run
+# start). We raise the pipe limit so normal large lines are read whole
+# (``_note_stdout_task_event`` keeps seeing intact records), and
+# ``_stream_lines`` ALSO catches the raise defensively — so the reader
+# can never die on line size, whatever the limit.
+STDOUT_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
+
 # Steering prompt appended to every harness claude run. Verified
 # empirically (claude v2.1.200): ``claude --print`` KILLS background
 # Bash tasks (``task_type: local_bash``) at turn teardown —
@@ -76,6 +90,20 @@ _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "killed", "stopped"}
 # stdout heartbeat + stderr keep claude / codex runs warm.
 _ACTIVITY_EVENTS = frozenset({
     "process.stderr",
+})
+
+# Defense-in-depth idle-warm: observer-emitted events that keep the idle
+# watchdog warm via ``RunProcess._watch_activity_events`` — a bus
+# subscription that ticks ``_last_activity_at`` independently of the
+# stdout heartbeat. Any of these for the run's session proves visible
+# work is happening. This is the layer that makes the "silenced stdout
+# heartbeat -> watchdog kills a working run" bug class impossible to
+# reintroduce, whatever stdout does.
+_OBSERVER_ACTIVITY_EVENTS = frozenset({
+    "message",
+    "message.delta",
+    "tool_use",
+    "run.usage",
 })
 
 
@@ -434,6 +462,11 @@ class AsyncioProcessFactory:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            # Raise the per-line StreamReader buffer well above the 64KB
+            # default so whole stream-json events (big tool_results, the
+            # init event) are read as single lines instead of tripping
+            # LimitOverrunError. See ``STDOUT_STREAM_LIMIT_BYTES``.
+            limit=STDOUT_STREAM_LIMIT_BYTES,
         )
 
 
@@ -458,6 +491,7 @@ class RunProcess:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         observer: Any | None = None,
         rollout_discovery: Any | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> None:
         self.session = session
         self.run_record = run
@@ -468,6 +502,14 @@ class RunProcess:
         self._interrupted = False
         self._clock = clock
         self._sleep = sleep
+        # Idle watchdog threshold. Resolved at construction (not as a
+        # default arg) so ``IDLE_TIMEOUT_SECONDS`` stays monkeypatchable
+        # in tests and ``--idle-timeout-seconds`` can override per serve.
+        self._idle_timeout_seconds = (
+            idle_timeout_seconds
+            if idle_timeout_seconds is not None
+            else IDLE_TIMEOUT_SECONDS
+        )
         # Phase 4: end-turn signaling moved to the event bus
         # (``_wait_for_run_end_turn`` subscribes by session_id).
         # The internal ``_end_turn_event`` asyncio.Event is retired.
@@ -519,9 +561,14 @@ class RunProcess:
 
         stream_tasks = self._stream_tasks(self._process)
         wait_task = asyncio.create_task(self._process.wait())
+        # Cursor for the observer-event idle-warm subscription: only
+        # events published from here on should warm THIS run, never a
+        # prior turn's replayed activity (mirrors ``_wait_for_run_end_turn``).
+        activity_after = await self._event_bus.max_sequence(session_id=self.session.id)
         watchdog_tasks = [
             asyncio.create_task(self._watch_end_turn_cleanup(wait_task)),
             asyncio.create_task(self._watch_idle_timeout(wait_task)),
+            asyncio.create_task(self._watch_activity_events(activity_after)),
         ]
         try:
             returncode = await wait_task
@@ -707,7 +754,35 @@ class RunProcess:
         # ``_last_activity_at`` directly (NOT via ``_publish``),
         # keeping the idle watchdog warm for long-running harness
         # runs that emit no stderr (claude talks only via rollout).
-        while line := await stream.readline():
+        while True:
+            try:
+                line = await stream.readline()
+            except ValueError:
+                # Oversized line: it exceeded the StreamReader buffer
+                # limit, so ``readline`` raised (LimitOverrunError
+                # surfaces as ValueError) and discarded the buffered
+                # chunk. Do NOT let the reader die — an uncaught raise
+                # here froze the heartbeat and let the idle watchdog
+                # kill actively-working runs. The subprocess is plainly
+                # producing output (genuine activity), so tick and keep
+                # reading. Losing the oversized content is harmless:
+                # stdout is heartbeat + task-lifecycle only (task
+                # records are tiny, never oversized) and message data
+                # flows via the observer; an oversized stderr chunk is
+                # likewise dropped (stderr is rarely near the limit).
+                logger.warning(
+                    "Oversized %s line exceeded the stream reader buffer "
+                    "limit; dropped its content but kept the reader alive: "
+                    "session=%s run=%s",
+                    stream_name,
+                    self.session.id,
+                    self.run_record.id,
+                )
+                self._last_activity_at = self._clock()
+                self._last_activity_event = f"{stream_name}:oversized-line"
+                continue
+            if not line:
+                break
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not text:
                 continue
@@ -1000,6 +1075,39 @@ class RunProcess:
                 )
                 return
 
+    async def _watch_activity_events(self, after: int) -> None:
+        """Defense-in-depth idle-warm: subscribe to the shared event bus
+        for THIS session and tick the idle clock on every
+        observer-emitted activity event (see ``_OBSERVER_ACTIVITY_EVENTS``).
+
+        The stdout heartbeat can be silenced — e.g. an oversized stdout
+        line once killed the reader — which used to let the idle
+        watchdog SIGTERM an actively-working run. This subscription is a
+        SECOND, independent activity source: as long as the observer
+        sees the run doing visible work (messages, tool calls, usage),
+        the run stays warm no matter what stdout does.
+
+        ``after`` skips historical events so a fresh run isn't warmed by
+        a previous turn's replayed activity (same guard as
+        ``_wait_for_run_end_turn``). Session-scoping is sufficient: the
+        RunManager keeps at most one active subprocess per session, so
+        any activity on the session belongs to this run.
+        """
+        subscription = self._event_bus.subscribe(
+            after=after, session_id=self.session.id
+        )
+        try:
+            async for event in subscription:
+                if event is None:
+                    continue
+                if event.event in _OBSERVER_ACTIVITY_EVENTS:
+                    self._last_activity_at = self._clock()
+                    self._last_activity_event = event.event
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await subscription.aclose()
+
     async def _watch_idle_timeout(self, wait_task: asyncio.Task[int]) -> None:
         while True:
             await self._sleep(IDLE_CHECK_INTERVAL_SECONDS)
@@ -1007,7 +1115,7 @@ class RunProcess:
                 return
 
             idle_seconds = (self._clock() - self._last_activity_at).total_seconds()
-            if idle_seconds <= IDLE_TIMEOUT_SECONDS:
+            if idle_seconds <= self._idle_timeout_seconds:
                 continue
 
             self._watchdog_termination_in_progress = True
@@ -1026,7 +1134,7 @@ class RunProcess:
             await self._publish(
                 "run.timed_out_idle",
                 {
-                    "idle_seconds": int(IDLE_TIMEOUT_SECONDS),
+                    "idle_seconds": int(self._idle_timeout_seconds),
                     "last_activity_event": self._last_activity_event,
                     "last_activity_at": _format_timestamp(self._last_activity_at),
                     "hard_kill": hard_kill,
@@ -1175,10 +1283,15 @@ class RunManager:
         queue_max_per_session: int = RUN_QUEUE_MAX_PER_SESSION,
         observer: Any | None = None,
         rollout_discovery: Any | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._process_factory = process_factory or AsyncioProcessFactory()
         self._queue_max_per_session = queue_max_per_session
+        # Threshold handed to every spawned RunProcess; None keeps the
+        # module default (``IDLE_TIMEOUT_SECONDS``). Set from the serve
+        # ``--idle-timeout-seconds`` flag.
+        self._idle_timeout_seconds = idle_timeout_seconds
         self._active: dict[str, RunProcess] = {}
         self._tasks: dict[str, asyncio.Task[RunProcessResult]] = {}
         # Tracks which run_id currently owns the subprocess for each session
@@ -1290,6 +1403,7 @@ class RunManager:
             process_factory=self._process_factory,
             observer=self._observer,
             rollout_discovery=self._rollout_discovery,
+            idle_timeout_seconds=self._idle_timeout_seconds,
         )
         self._active[run.id] = run_process
         self._active_run_by_session[session.id] = run.id

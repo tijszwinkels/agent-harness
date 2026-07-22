@@ -2639,3 +2639,215 @@ async def test_run_drains_full_output_when_streams_eof_promptly() -> None:
         "process.stderr",
         "run.completed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_lines_survives_oversized_stdout_line() -> None:
+    """Root cause of the start+31min idle-kill: claude stream-json
+    stdout emits a single line larger than asyncio's ``StreamReader``
+    limit (a ``user`` turn echoing a big Read/Bash tool_result, or the
+    init event). ``readline()`` raises ``ValueError`` (LimitOverrunError)
+    which, uncaught, kills the stdout reader task — freezing the
+    heartbeat so the idle watchdog SIGTERMs an actively-working run
+    ~31 min in (last tick frozen near run start).
+
+    ``_stream_lines`` must survive an oversized line: keep the reader
+    alive AND keep ticking ``_last_activity_at``. Exercises a REAL
+    ``asyncio.StreamReader`` at the same 64KB default limit the
+    subprocess pipe uses, so the exact production failure is hit.
+    """
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    rp = RunProcess(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("claude", "--print"), cwd="/workspace/project"),
+        event_bus=bus,
+        process_factory=FakeFactory(FakeProcess()),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    seen: list[str] = []
+    rp._note_stdout_task_event = lambda text: seen.append(text)  # type: ignore[method-assign]
+
+    reader = asyncio.StreamReader(limit=65536, loop=asyncio.get_running_loop())
+    reader.feed_data(b'{"type":"system","subtype":"init"}\n')
+    reader.feed_data(b'{"blob":"' + b"a" * 200_000 + b'"}\n')  # single line > 64KB
+    reader.feed_data(b'{"type":"result","marker":"after-oversized"}\n')
+    reader.feed_eof()
+
+    initial = rp._last_activity_at
+    clock.advance(5)
+
+    # Must NOT raise, and MUST go on to read the line after the
+    # oversized one (proves the reader survived).
+    await asyncio.wait_for(rp._stream_lines("stdout", reader), timeout=1)
+
+    assert any("after-oversized" in text for text in seen), seen
+    assert rp._last_activity_at > initial
+    assert rp._last_activity_event == "stdout"
+
+
+@pytest.mark.asyncio
+async def test_asyncio_factory_raises_stream_reader_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default 64KB ``StreamReader`` limit made ``readline`` raise
+    on a single oversized stdout line (a big tool_result / init event),
+    killing the reader and freezing the heartbeat. The factory raises
+    the pipe limit so normal large lines stay on the whole-line path."""
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*argv: object, **kwargs: object) -> FakeProcess:
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        orchestrator.asyncio, "create_subprocess_exec", fake_exec
+    )
+    await orchestrator.AsyncioProcessFactory()(
+        ProcessCommand(argv=("claude", "--print"))
+    )
+    assert isinstance(captured.get("limit"), int)
+    assert captured["limit"] >= 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_stays_warm_on_observer_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense-in-depth (makes the bug class un-reintroducible): even
+    if the stdout heartbeat is silenced, the idle watchdog stays warm
+    on observer-emitted activity events (``message`` / ``tool_use`` /
+    ``run.usage``) for the run's session. Any visible work keeps the
+    run alive regardless of stdout.
+
+    Simulate a claude run whose stdout produces NO lines at all (the
+    frozen-heartbeat scenario) — only observer events flow. Assert no
+    SIGTERM while activity arrives every 25 min across two would-be
+    timeout windows, then a clean kill once activity stops.
+    """
+    monkeypatch.setattr(orchestrator, "IDLE_TIMEOUT_SECONDS", 30 * 60, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_HARD_KILL_GRACE_SECONDS", 30.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session("claude-code")
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], stderr=[], close_stdout=False, close_stderr=False)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("claude", "--print")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+        ).run()
+    )
+
+    async def settle() -> None:
+        for _ in range(8):
+            await asyncio.sleep(0)
+
+    await settle()
+
+    for marker in ("tool_use", "message", "run.usage"):
+        clock.advance(25 * 60)
+        await settle()
+        await bus.publish(
+            Event(event=marker, session_id=session.id, run_id=run.id, data={})
+        )
+        await settle()
+
+    # Never killed while observer activity kept arriving.
+    assert process.group_signals == []
+
+    # Activity stops: the run goes genuinely silent and is reaped.
+    clock.advance(31 * 60)
+    await settle()
+    assert process.group_signals == [signal.SIGTERM]
+    clock.advance(30)
+    await settle()
+    process.stdout.close()
+    process.stderr.close()
+    result = await asyncio.wait_for(task, timeout=6)
+    assert result.status == "interrupted"
+    assert signal.SIGKILL in process.group_signals
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_seconds_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idle timeout is configurable via ``idle_timeout_seconds``
+    (serve ``--idle-timeout-seconds``). Default stays 1800; a shorter
+    value reaps a silent run sooner and is reflected in the event."""
+    monkeypatch.setattr(orchestrator, "IDLE_CHECK_INTERVAL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(orchestrator, "IDLE_HARD_KILL_GRACE_SECONDS", 30.0, raising=False)
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    clock = FakeClock()
+    process = FakeProcess(stdout=[], stderr=[], close_stdout=False, close_stderr=False)
+    install_fake_process_group(monkeypatch, process)
+
+    task = asyncio.create_task(
+        RunProcess(
+            session=session,
+            run=run,
+            command=ProcessCommand(argv=("codex", "exec", "--json", "hi")),
+            event_bus=bus,
+            process_factory=FakeFactory(process),
+            clock=clock,
+            sleep=clock.sleep,
+            idle_timeout_seconds=120,
+        ).run()
+    )
+    await flush_asyncio()
+
+    # Silent for just over 2 min → reaped, though the 1800s default
+    # would still be warm here.
+    clock.advance(180)
+    await flush_asyncio()
+    assert process.group_signals == [signal.SIGTERM]
+
+    clock.advance(30)
+    await flush_asyncio()
+    process.stdout.close()
+    process.stderr.close()
+    result = await asyncio.wait_for(task, timeout=6)
+    events = [e for e in await bus.replay(session_id=session.id) if e.run_id == run.id]
+    timeout_event = next(e for e in events if e.event == "run.timed_out_idle")
+    assert result.status == "interrupted"
+    assert timeout_event.data["idle_seconds"] == 120
+
+
+@pytest.mark.asyncio
+async def test_run_manager_threads_idle_timeout_to_run_process() -> None:
+    """``RunManager(idle_timeout_seconds=...)`` reaches the spawned
+    ``RunProcess`` so the serve flag actually takes effect."""
+    bus = InMemoryEventBus()
+    session = make_session()
+    run = make_run(session)
+    process = FakeProcess()
+    manager = RunManager(
+        event_bus=bus,
+        process_factory=FakeFactory(process),
+        idle_timeout_seconds=99,
+    )
+    rp = manager.start(
+        session=session,
+        run=run,
+        command=ProcessCommand(argv=("codex", "exec", "--json", "hi")),
+    )
+    try:
+        assert rp._idle_timeout_seconds == 99
+    finally:
+        process.finish()
+        await asyncio.wait_for(manager.wait(run.id), timeout=1)

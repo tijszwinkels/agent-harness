@@ -1312,22 +1312,48 @@ def external_session_id_from_codex_path(path: str | Path) -> str:
     return f"codex_{match.group('uuid')}"
 
 
-def transcript_identity_from_path(path: str | Path) -> TranscriptIdentity:
+def _resolves_within(path: Path, root: Path) -> bool:
+    # Symlink-tolerant containment check. Never raises: a path outside
+    # ``root`` (ValueError) or an unresolvable one (OSError, e.g. a
+    # symlink loop) simply doesn't match.
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def transcript_identity_from_path(path: str | Path, *, home: str | Path | None = None) -> TranscriptIdentity:
+    # Literal part-matching alone misses symlinked agent dirs (a common
+    # dotfiles/backup setup, e.g. ``~/.claude`` -> ``~/visible-for-backup/
+    # claude``): macOS FSEvents reports fully resolved paths, so no
+    # ``.claude`` component ever appears and every event for the session
+    # was dropped as "Unsupported transcript path". Each branch therefore
+    # falls back to a resolved-path containment check against the
+    # well-known root under ``home``. The literal check short-circuits
+    # first, so already-classifying paths never touch the filesystem.
     transcript_path = Path(path)
     parts = transcript_path.parts
-    if ".claude" in parts and "projects" in parts:
+    home_path = Path(home).expanduser() if home is not None else Path.home()
+    if (".claude" in parts and "projects" in parts) or _resolves_within(
+        transcript_path, home_path / ".claude" / "projects"
+    ):
         return TranscriptIdentity(
             backend="claude-code",
             path=transcript_path,
             session_id=external_session_id_from_claude_path(transcript_path),
         )
-    if ".codex" in parts and "sessions" in parts:
+    if (".codex" in parts and "sessions" in parts) or _resolves_within(
+        transcript_path, home_path / ".codex" / "sessions"
+    ):
         return TranscriptIdentity(
             backend="codex",
             path=transcript_path,
             session_id=external_session_id_from_codex_path(transcript_path),
         )
-    if ".pi" in parts and "agent" in parts and "sessions" in parts:
+    if (".pi" in parts and "agent" in parts and "sessions" in parts) or _resolves_within(
+        transcript_path, home_path / ".pi" / "agent" / "sessions"
+    ):
         return TranscriptIdentity(
             backend="pi",
             path=transcript_path,

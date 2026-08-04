@@ -71,6 +71,52 @@ def test_codex_transcript_path_and_external_id_helpers() -> None:
     assert transcript_identity_from_path(path).session_id == "codex_123e4567-e89b-12d3-a456-426614174000"
 
 
+def test_transcript_identity_resolves_symlinked_agent_dirs(tmp_path: Path) -> None:
+    # macOS FSEvents reports fully resolved paths. When ``~/.claude`` is a
+    # symlink (e.g. -> ``~/visible-for-backup/claude``), the reported path
+    # contains no literal ``.claude`` component, so part-matching alone
+    # classified the transcript as unsupported and every event was dropped —
+    # only the injected user message reached the DB, never the assistant
+    # output. Classification must fall back to comparing resolved paths
+    # against the well-known agent roots under ``home``.
+    home = tmp_path
+    backing = home / "visible-for-backup"
+    (backing / "claude" / "projects" / "-tmp-proj").mkdir(parents=True)
+    (backing / "codex" / "sessions" / "2026" / "08" / "04").mkdir(parents=True)
+    (backing / "pi" / "agent" / "sessions" / "--tmp-proj--").mkdir(parents=True)
+    (home / ".claude").symlink_to(backing / "claude")
+    (home / ".codex").symlink_to(backing / "codex")
+    (home / ".pi").symlink_to(backing / "pi")
+
+    claude_resolved = (
+        backing / "claude" / "projects" / "-tmp-proj"
+        / "123e4567-e89b-12d3-a456-426614174000.jsonl"
+    )
+    identity = transcript_identity_from_path(claude_resolved, home=home)
+    assert identity.backend == "claude-code"
+    assert identity.session_id == "ses_123e4567e89b12d3a456426614174000"
+
+    codex_resolved = (
+        backing / "codex" / "sessions" / "2026" / "08" / "04"
+        / "rollout-2026-08-04T10-30-00-123e4567-e89b-12d3-a456-426614174000.jsonl"
+    )
+    identity = transcript_identity_from_path(codex_resolved, home=home)
+    assert identity.backend == "codex"
+    assert identity.session_id == "codex_123e4567-e89b-12d3-a456-426614174000"
+
+    pi_resolved = (
+        backing / "pi" / "agent" / "sessions" / "--tmp-proj--"
+        / "2026-08-04T10-30-00_123e4567-e89b-12d3-a456-426614174000.jsonl"
+    )
+    identity = transcript_identity_from_path(pi_resolved, home=home)
+    assert identity.backend == "pi"
+    assert identity.session_id == "ses_123e4567e89b12d3a456426614174000"
+
+    # Paths outside every known agent root must still be rejected.
+    with pytest.raises(ValueError, match="Unsupported transcript path"):
+        transcript_identity_from_path(tmp_path / "elsewhere" / "x.jsonl", home=home)
+
+
 def test_parser_logs_malformed_json_without_crashing(caplog: pytest.LogCaptureFixture) -> None:
     identity = transcript_identity_from_path(
         claude_transcript_path("/home/me/project", "123e4567-e89b-12d3-a456-426614174000", home="/tmp/home")

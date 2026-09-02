@@ -60,6 +60,32 @@ def test_openapi_documents_patch_session() -> None:
         "type": "string",
         "minLength": 1,
     }
+    # effort is patchable mid-session (change the reasoning level without
+    # recreating the session); same optional/non-empty shape as title.
+    assert patch_request["properties"]["effort"]["type"] == "string"
+    assert patch_request["properties"]["effort"]["minLength"] == 1
+
+
+def test_openapi_documents_session_effort() -> None:
+    """``effort`` is documented on Session and CreateSessionRequest as a
+    nullable free-form string — the harness deliberately does NOT constrain it
+    to an enum (same as ``model``); the caller owns validation."""
+    schemas = _openapi_spec()["components"]["schemas"]
+
+    for name in ("Session", "CreateSessionRequest"):
+        effort = schemas[name]["properties"]["effort"]
+        assert effort["type"] == ["string", "null"]
+        assert "enum" not in effort
+    # Optional everywhere — never in a required list.
+    assert "effort" not in schemas["Session"].get("required", [])
+    assert "effort" not in schemas["CreateSessionRequest"].get("required", [])
+
+
+def test_openapi_documents_effort_capability() -> None:
+    caps = _openapi_spec()["components"]["schemas"]["BackendCapabilities"]
+
+    assert caps["properties"]["effort"] == {"type": "boolean"}
+    assert "effort" in caps["required"]
 
 
 def test_openapi_documents_phase3_event_types() -> None:

@@ -379,6 +379,17 @@ components:
           description: |
             Null means "use the backend CLI's own configured default" — the command builder omits
             `--model`. pi callers rely on this.
+        effort:
+          type: [string, "null"]
+          description: |
+            Reasoning/thinking level applied to every run in this session. Null means "emit no
+            flag", so the backend CLI falls back to its own configured default. Deliberately NOT
+            an enum: like `model`, the value is free-form and the harness does not validate it —
+            the caller owns the value space. `low|medium|high|xhigh|max` is accepted by all three
+            backends (verified 2026-09-02); each CLI spells the flag differently
+            (`claude --effort`, `codex -c model_reasoning_effort=`, `pi --thinking`).
+            Mutable mid-session via `PATCH /v1/sessions/{id}` — argv is rebuilt per run, so a
+            change takes effect on the next turn without recreating the session.
         project:
           $ref: "#/components/schemas/Project"
         title:
@@ -549,6 +560,7 @@ components:
         - session_id_choice
         - max_budget
         - mcp
+        - effort
         - sandbox
         - tools
       properties:
@@ -569,6 +581,8 @@ components:
         max_budget:
           type: boolean
         mcp:
+          type: boolean
+        effort:
           type: boolean
         sandbox:
           oneOf:
@@ -624,6 +638,11 @@ components:
         model:
           type: [string, "null"]
           description: Optional; omit to use the backend CLI's own configured default.
+        effort:
+          type: [string, "null"]
+          description: |
+            Optional reasoning/thinking level; omit to use the backend CLI's own configured
+            default. Unvalidated free-form, like `model`.
         project:
           $ref: "#/components/schemas/Project"
         title:
@@ -644,6 +663,13 @@ components:
         title:
           type: string
           minLength: 1
+        effort:
+          type: string
+          minLength: 1
+          description: |
+            New reasoning/thinking level for subsequent runs. Changing it does NOT cost the
+            conversation — the command builder rebuilds argv per run, so the next turn uses the
+            new level in the same session.
 
     CreateRunRequest:
       type: object

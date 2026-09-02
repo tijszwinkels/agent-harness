@@ -135,6 +135,37 @@ def _model_flag(session: Session) -> tuple[str, ...]:
     return ("--model", session.model) if session.model is not None else ()
 
 
+def _effort_flag(session: Session) -> tuple[str, ...]:
+    # Reasoning/thinking level for this run; empty when the session doesn't pin
+    # one, so the backend CLI falls back to its own configured default (same
+    # contract as ``_model_flag``). The three CLIs spell the same idea
+    # differently — verified against the real binaries 2026-09-02:
+    #
+    #   claude-code  --effort <level>
+    #   codex        -c model_reasoning_effort=<level>   (after ``exec``)
+    #   pi           --thinking <level>
+    #
+    # claude's flag is PER-INVOCATION and is NOT inherited across ``--resume``:
+    # a resumed run without it silently falls back to the user's settings.json
+    # default. That is why the claude builder splats this into its shared argv
+    # prefix rather than onto the session-creating branch only.
+    #
+    # The value is not validated here — like ``model`` it is free-form and the
+    # caller owns the value space. (codex in particular does no local
+    # validation either: a bad level is forwarded and the API 400s mid-run.)
+    if session.effort is None:
+        return ()
+    if session.backend == "claude-code":
+        return ("--effort", session.effort)
+    if session.backend == "codex":
+        return ("-c", f"model_reasoning_effort={session.effort}")
+    if session.backend == "pi":
+        return ("--thinking", session.effort)
+    raise CommandBuildError(
+        f"No reasoning-effort flag is defined for backend {session.backend!r}",
+    )
+
+
 @dataclass(frozen=True)
 class ProcessCommand:
     argv: tuple[str, ...]
@@ -197,6 +228,7 @@ class CodexCommandBuilder:
                     "resume",
                     "--json",
                     *_model_flag(session),
+                    *_effort_flag(session),
                     *bypass,
                     session.codex_resume_id,
                     # ``--`` ends option parsing so a ``-``-prefixed prompt is
@@ -209,7 +241,16 @@ class CodexCommandBuilder:
             )
 
         return ProcessCommand(
-            argv=("codex", "exec", "--json", *_model_flag(session), *bypass, "--", text),
+            argv=(
+                "codex",
+                "exec",
+                "--json",
+                *_model_flag(session),
+                *_effort_flag(session),
+                *bypass,
+                "--",
+                text,
+            ),
             cwd=session.project.path,
         )
 
@@ -281,6 +322,11 @@ class ClaudeCodeCommandBuilder:
             "--append-system-prompt",
             CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
             *_model_flag(session),
+            # Shared prefix, not a per-branch flag: claude's --effort is
+            # per-invocation and is NOT carried by --resume, so every run has
+            # to re-state it or turn 2 silently drops to the settings.json
+            # default.
+            *_effort_flag(session),
         )
         if session.bypass_permissions:
             argv = (*argv, "--dangerously-skip-permissions")
@@ -367,6 +413,7 @@ class PiCommandBuilder:
                 "pi",
                 "-p",
                 *_model_flag(session),
+                *_effort_flag(session),
                 *fork,
                 "--session-id",
                 session_uuid,

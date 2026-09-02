@@ -8,7 +8,14 @@ import pytest
 
 import agent_harness.orchestrator as orchestrator
 from agent_harness.events import InMemoryEventBus
-from agent_harness.models import Event, Message, Project, Run, Session
+from agent_harness.models import (
+    CreateSessionRequest,
+    Event,
+    Message,
+    Project,
+    Run,
+    Session,
+)
 from agent_harness.orchestrator import (
     ClaudeCodeCommandBuilder,
     CommandBuildError,
@@ -24,6 +31,7 @@ from agent_harness.orchestrator import (
     validate_fork_source,
     validate_session_resume_target,
 )
+from agent_harness.repository import InMemoryRepository
 
 _PARENT_ID = "ses_3eb0e45b9d724deabdc3b472e0c4c2fc"
 _PARENT_UUID = "3eb0e45b-9d72-4dea-bdc3-b472e0c4c2fc"
@@ -479,6 +487,217 @@ def test_claude_code_command_builder_omits_model_when_none() -> None:
     # session flags still present, just no --model pair.
     assert "--session-id" in command.argv
     assert command.argv[-2:] == ("--", "go")
+
+
+# ── per-session effort (reasoning / thinking level) ───────────────────────────
+# ``Session.effort`` mirrors ``Session.model``: ``None`` emits nothing, so each
+# CLI keeps its own configured default. The canonical value space
+# (low|medium|high|xhigh|max) is valid on all three backends, but each spells
+# the flag differently — verified against the real CLIs 2026-09-02.
+
+
+def test_codex_command_builder_emits_effort_as_config_override() -> None:
+    # codex has no dedicated flag: the level rides in as a ``-c`` config
+    # override, placed after the ``exec`` subcommand.
+    session = make_session("codex").model_copy(update={"effort": "high"})
+    command = CodexCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert command.argv == (
+        "codex",
+        "exec",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "-c",
+        "model_reasoning_effort=high",
+        "--",
+        "go",
+    )
+
+
+def test_codex_command_builder_emits_effort_on_the_resume_path() -> None:
+    # The resume branch builds its own argv, so it needs the flag too —
+    # otherwise effort silently applies to turn 1 only.
+    session = make_session("codex").model_copy(
+        update={
+            "codex_resume_id": "019e0500-0000-0000-0000-000000000000",
+            "effort": "max",
+        },
+    )
+    command = CodexCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("follow-up"),
+    )
+
+    assert command.argv == (
+        "codex",
+        "exec",
+        "resume",
+        "--json",
+        "--model",
+        "gpt-5.4",
+        "-c",
+        "model_reasoning_effort=max",
+        "019e0500-0000-0000-0000-000000000000",
+        "--",
+        "follow-up",
+    )
+
+
+def test_claude_code_command_builder_emits_effort_flag() -> None:
+    session = make_session("claude-code").model_copy(
+        update={"id": _PARENT_ID, "effort": "xhigh"}
+    )
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"), is_first_run=True,
+    )
+
+    assert command.argv == (
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--append-system-prompt",
+        orchestrator.CLAUDE_PRINT_MODE_SYSTEM_PROMPT,
+        "--model",
+        "gpt-5.4",
+        "--effort",
+        "xhigh",
+        "--session-id",
+        _PARENT_UUID,
+        "--",
+        "go",
+    )
+
+
+def test_claude_code_command_builder_repeats_effort_on_every_resumed_run() -> None:
+    # claude's ``--effort`` is PER-INVOCATION and is NOT inherited across
+    # ``--resume``: a resumed run without the flag silently falls back to the
+    # user's settings.json default. So it has to live in the shared argv
+    # prefix, emitted on turn 2, 3, ... as well as turn 1. This is the whole
+    # reason the flag can't hang off the session-creating branch.
+    session = make_session("claude-code").model_copy(
+        update={"id": _PARENT_ID, "effort": "low"}
+    )
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"), is_first_run=False,
+    )
+
+    assert "--resume" in command.argv
+    effort_idx = command.argv.index("--effort")
+    assert command.argv[effort_idx + 1] == "low"
+
+
+def test_claude_code_command_builder_emits_effort_on_the_external_resume_path() -> None:
+    # Same per-invocation trap for observed (external) claude sessions.
+    session = make_session("claude-code").model_copy(
+        update={"id": _PARENT_ID, "origin": "external", "effort": "medium"}
+    )
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "--resume" in command.argv
+    effort_idx = command.argv.index("--effort")
+    assert command.argv[effort_idx + 1] == "medium"
+
+
+def test_claude_code_command_builder_emits_effort_on_the_fork_path() -> None:
+    session = _forked_child("claude-code").model_copy(update={"effort": "high"})
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"), is_first_run=True,
+    )
+
+    assert "--fork-session" in command.argv
+    effort_idx = command.argv.index("--effort")
+    assert command.argv[effort_idx + 1] == "high"
+
+
+def test_pi_command_builder_emits_effort_as_thinking_flag() -> None:
+    session = make_session("pi").model_copy(
+        update={"id": _PARENT_ID, "effort": "medium"}
+    )
+    command = PiCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--model",
+        "gpt-5.4",
+        "--thinking",
+        "medium",
+        "--session-id",
+        _PARENT_UUID,
+        "go",
+    )
+
+
+def test_codex_command_builder_omits_effort_when_none() -> None:
+    session = make_session("codex")  # effort defaults to None
+    command = CodexCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "-c" not in command.argv
+    assert command.argv == ("codex", "exec", "--json", "--model", "gpt-5.4", "--", "go")
+
+
+def test_claude_code_command_builder_omits_effort_when_none() -> None:
+    session = make_session("claude-code").model_copy(update={"id": _PARENT_ID})
+    command = ClaudeCodeCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"), is_first_run=True,
+    )
+
+    assert "--effort" not in command.argv
+
+
+def test_patched_effort_is_picked_up_by_the_next_built_command() -> None:
+    # ``effort`` is mutable mid-session via ``PATCH /v1/sessions/{id}``: argv is
+    # rebuilt per run, so the NEXT run picks the new level up without the caller
+    # having to recreate the session. Guards the whole chain — the patch
+    # whitelist carries the field, the repo's generic ``model_copy`` persists
+    # it, and the builder reads it back.
+    repo = InMemoryRepository()
+    session = repo.create_session(
+        CreateSessionRequest(
+            backend="codex",
+            model="gpt-5.4",
+            project=Project(path="/workspace/project", name="project"),
+            effort="low",
+        )
+    )
+    assert "model_reasoning_effort=low" in CodexCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("turn one"),
+    ).argv
+
+    repatched = repo.patch_session(session.id, {"effort": "max"})
+
+    assert "model_reasoning_effort=max" in CodexCommandBuilder().build(
+        session=repatched, run=make_run(repatched), message=Message.user("turn two"),
+    ).argv
+
+
+def test_pi_command_builder_omits_effort_when_none() -> None:
+    session = make_session("pi").model_copy(update={"id": _PARENT_ID})
+    command = PiCommandBuilder().build(
+        session=session, run=make_run(session), message=Message.user("go"),
+    )
+
+    assert "--thinking" not in command.argv
+    assert command.argv == (
+        "pi",
+        "-p",
+        "--model",
+        "gpt-5.4",
+        "--session-id",
+        _PARENT_UUID,
+        "go",
+    )
 
 
 # ── fork mechanics ─────────────────────────────────────────────────────────────

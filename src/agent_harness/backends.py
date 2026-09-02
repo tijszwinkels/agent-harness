@@ -36,6 +36,7 @@ def default_backend_registry() -> BackendRegistry:
         session_id_choice=True,
         max_budget=True,
         mcp=True,
+        effort=True,
         sandbox=None,
         tools="granular",
         interrupt_external_runs=False,
@@ -50,6 +51,7 @@ def default_backend_registry() -> BackendRegistry:
         session_id_choice=False,
         max_budget=False,
         mcp=True,
+        effort=True,
         sandbox=["read-only", "workspace-write", "danger"],
         tools="granular",
         interrupt_external_runs=False,
@@ -65,7 +67,8 @@ def default_backend_registry() -> BackendRegistry:
     # explicitly "Non-interactive mode" (interactive_pty True). ``mcp`` stays
     # False — a genuine pi limitation (no MCP flag in ``pi --help``), unlike
     # claude/codex. pi has no sandbox levels (unlike codex) and no budget flag;
-    # its tool allow/deny lists make ``tools`` granular.
+    # its tool allow/deny lists make ``tools`` granular. ``effort`` is True on all
+# three backends — pi spells it ``--thinking <level>`` (verified 2026-09-02).
     pi = BackendCapabilities(
         fork=True,
         subagents=False,
@@ -76,6 +79,7 @@ def default_backend_registry() -> BackendRegistry:
         session_id_choice=True,
         max_budget=False,
         mcp=False,
+        effort=True,
         sandbox=None,
         tools="granular",
         interrupt_external_runs=False,

@@ -202,6 +202,7 @@ class SQLiteRepository:
         session = Session(
             backend=request.backend,
             model=request.model,
+            effort=request.effort,
             project=request.project,
             title=request.title,
             bypass_permissions=request.bypass_permissions,

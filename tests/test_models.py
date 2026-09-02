@@ -9,6 +9,7 @@ from agent_harness.models import (
     ForkSessionRequest,
     ForkSessionResponse,
     Message,
+    PatchSessionRequest,
     Project,
     Run,
     Session,
@@ -97,6 +98,59 @@ def test_session_and_request_model_is_optional() -> None:
         )
 
 
+def test_session_and_request_effort_is_optional() -> None:
+    # ``effort`` mirrors ``model``: None means "emit no flag", so each backend
+    # CLI falls back to its own configured default (today's behaviour,
+    # unchanged). A supplied value must be non-empty. The harness does NOT
+    # validate the level — like ``model`` it is free-form; the caller owns the
+    # value space (low|medium|high|xhigh|max on all three backends).
+    request = CreateSessionRequest(
+        backend="claude-code", project=Project(path="/tmp/proj", name="proj"),
+    )
+    assert request.effort is None
+
+    session = Session(backend="claude-code", project=Project(path="/tmp/proj", name="proj"))
+    assert session.effort is None
+
+    assert (
+        CreateSessionRequest(
+            backend="claude-code",
+            project=Project(path="/tmp/proj", name="proj"),
+            effort="xhigh",
+        ).effort
+        == "xhigh"
+    )
+
+    with pytest.raises(ValidationError):
+        CreateSessionRequest(
+            backend="claude-code", effort="", project=Project(path="/tmp/proj", name="proj"),
+        )
+    with pytest.raises(ValidationError):
+        Session(backend="claude-code", effort="", project=Project(path="/tmp/proj", name="proj"))
+
+
+def test_patch_session_request_carries_effort() -> None:
+    # ``effort`` is mutable mid-session so a caller can change the reasoning
+    # level WITHOUT recreating the session; the next run rebuilds argv.
+    assert PatchSessionRequest().effort is None
+    assert PatchSessionRequest(effort="high").effort == "high"
+
+    with pytest.raises(ValidationError):
+        PatchSessionRequest(effort="")
+
+
+def test_forked_child_inherits_effort() -> None:
+    # forked_child enumerates the inherited fields explicitly — effort has to
+    # be in that list or a fork silently drops back to the CLI default.
+    parent = Session(
+        backend="claude-code",
+        project=Project(path="/tmp/proj", name="proj"),
+        effort="max",
+    )
+
+    assert Session.forked_child(parent).effort == "max"
+
+
 def test_session_carries_forked_from() -> None:
     # forked_from records the parent session a fork descends from; defaults None.
     session = Session(backend="claude-code", project=Project(path="/tmp/p", name="p"))
@@ -157,11 +211,13 @@ def test_backend_capabilities_capture_v1_shape() -> None:
         session_id_choice=True,
         max_budget=True,
         mcp=True,
+        effort=True,
         sandbox=None,
         tools="granular",
     )
 
     assert capabilities.tools == "granular"
+    assert capabilities.effort is True
     assert capabilities.interrupt_external_runs is False
 
 

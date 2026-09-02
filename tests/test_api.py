@@ -75,6 +75,39 @@ def test_session_create_without_model_succeeds() -> None:
     assert session["model"] is None
 
 
+def test_session_create_with_effort_round_trips() -> None:
+    # ``effort`` is accepted on create and echoed back on the Session.
+    # HarnessModel forbids extra keys, so an unknown field would 422 —
+    # this also pins that the request model actually declares it.
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/sessions",
+        json={
+            "backend": "claude-code",
+            "project": {"path": "/tmp/proj", "name": "proj"},
+            "effort": "xhigh",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["effort"] == "xhigh"
+
+
+def test_session_create_without_effort_defaults_to_null() -> None:
+    # Omitting effort keeps today's behaviour bit-for-bit: no flag is emitted
+    # and each backend CLI uses its own configured default.
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/sessions",
+        json={"backend": "codex", "project": {"path": "/tmp/proj", "name": "proj"}},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["effort"] is None
+
+
 def test_session_create_rejects_unknown_backend() -> None:
     client = TestClient(create_app())
 
@@ -846,6 +879,34 @@ def test_patch_session_updates_title_and_returns_session() -> None:
     # Re-fetch to confirm persistence.
     fresh = client.get(f"/v1/sessions/{session['id']}").json()
     assert fresh["title"] == "renamed"
+
+
+def test_patch_session_updates_effort_without_recreating_the_session() -> None:
+    # The point of making effort patchable: a caller can raise/lower the
+    # reasoning level mid-conversation and keep the transcript. The next run
+    # rebuilds argv, so it takes effect on the following turn.
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+    assert session["effort"] is None
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"effort": "max"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["effort"] == "max"
+    assert response.json()["title"] == "initial"
+    # Re-fetch to confirm persistence.
+    assert client.get(f"/v1/sessions/{session['id']}").json()["effort"] == "max"
+
+
+def test_patch_session_rejects_empty_effort() -> None:
+    # min_length=1 — same guard as title. "Leave unchanged" is spelled by
+    # omitting the field, not by sending "".
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+
+    assert client.patch(
+        f"/v1/sessions/{session['id']}", json={"effort": ""}
+    ).status_code == 422
 
 
 def test_patch_session_with_empty_body_is_a_noop_returning_session() -> None:

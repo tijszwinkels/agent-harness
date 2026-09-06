@@ -75,6 +75,39 @@ def test_session_create_without_model_succeeds() -> None:
     assert session["model"] is None
 
 
+def test_session_create_with_effort_round_trips() -> None:
+    # ``effort`` is accepted on create and echoed back on the Session.
+    # HarnessModel forbids extra keys, so an unknown field would 422 —
+    # this also pins that the request model actually declares it.
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/sessions",
+        json={
+            "backend": "claude-code",
+            "project": {"path": "/tmp/proj", "name": "proj"},
+            "effort": "xhigh",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["effort"] == "xhigh"
+
+
+def test_session_create_without_effort_defaults_to_null() -> None:
+    # Omitting effort keeps today's behaviour bit-for-bit: no flag is emitted
+    # and each backend CLI uses its own configured default.
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/sessions",
+        json={"backend": "codex", "project": {"path": "/tmp/proj", "name": "proj"}},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["effort"] is None
+
+
 def test_session_create_rejects_unknown_backend() -> None:
     client = TestClient(create_app())
 
@@ -848,6 +881,34 @@ def test_patch_session_updates_title_and_returns_session() -> None:
     assert fresh["title"] == "renamed"
 
 
+def test_patch_session_updates_effort_without_recreating_the_session() -> None:
+    # The point of making effort patchable: a caller can raise/lower the
+    # reasoning level mid-conversation and keep the transcript. The next run
+    # rebuilds argv, so it takes effect on the following turn.
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+    assert session["effort"] is None
+
+    response = client.patch(f"/v1/sessions/{session['id']}", json={"effort": "max"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["effort"] == "max"
+    assert response.json()["title"] == "initial"
+    # Re-fetch to confirm persistence.
+    assert client.get(f"/v1/sessions/{session['id']}").json()["effort"] == "max"
+
+
+def test_patch_session_rejects_empty_effort() -> None:
+    # min_length=1 — same guard as title. "Leave unchanged" is spelled by
+    # omitting the field, not by sending "".
+    client = TestClient(create_app())
+    session = _create_session(client, title="initial")
+
+    assert client.patch(
+        f"/v1/sessions/{session['id']}", json={"effort": ""}
+    ).status_code == 422
+
+
 def test_patch_session_with_empty_body_is_a_noop_returning_session() -> None:
     client = TestClient(create_app())
     session = _create_session(client, title="initial")
@@ -1032,10 +1093,11 @@ def _new_session(client: TestClient, backend: str = "claude-code", **extra) -> d
     return client.post("/v1/sessions", json=payload).json()
 
 
-def test_fork_session_happy_path_claude_launches_forked_run() -> None:
+@pytest.mark.parametrize("backend", ["claude-code", "pi"])
+def test_fork_session_inherits_effort_and_launches_forked_run(backend) -> None:
     manager = _AcceptingRunManager()
     client = TestClient(create_app(run_manager=manager))
-    parent = _new_session(client, "claude-code", title="Parent")
+    parent = _new_session(client, backend, title="Parent", effort="high")
 
     response = client.post(f"/v1/sessions/{parent['id']}/forks", json={"message": "thread reply"})
 
@@ -1045,7 +1107,8 @@ def test_fork_session_happy_path_claude_launches_forked_run() -> None:
     assert child["id"] != parent["id"]
     assert child["origin"] == "harness"
     assert child["forked_from"] == parent["id"]
-    assert child["backend"] == "claude-code"
+    assert child["backend"] == backend
+    assert child["effort"] == "high"
     # No title given → inherit parent's.
     assert child["title"] == "Parent"
     # A run was started in the fork; bridge tracks it via run["id"].
@@ -1054,8 +1117,46 @@ def test_fork_session_happy_path_claude_launches_forked_run() -> None:
     # The launched command forked the PARENT conversation into the child id.
     assert len(manager.submitted) == 1
     argv = manager.submitted[0].argv
-    assert "--fork-session" in argv
-    assert "--resume" in argv
+    if backend == "claude-code":
+        assert "--fork-session" in argv
+        assert "--resume" in argv
+        assert argv[argv.index("--effort") + 1] == "high"
+    else:
+        assert "--fork" in argv
+        assert argv[argv.index("--thinking") + 1] == "high"
+
+
+@pytest.mark.parametrize("backend", ["claude-code", "codex", "pi"])
+def test_effort_patch_affects_new_submissions_only(backend, monkeypatch) -> None:
+    manager = _AcceptingRunManager()
+    repo = InMemoryRepository()
+    client = TestClient(create_app(repository=repo, run_manager=manager))
+    session = _new_session(client, backend, effort="low")
+    url = f"/v1/sessions/{session['id']}"
+    monkeypatch.setattr("agent_harness.api.claude_conversation_exists", lambda session: True)
+
+    assert client.post(f"{url}/runs", json={"message": "First"}).status_code == 202
+    if backend == "codex":
+        # Simulate the observer discovering the backend's rollout UUID.
+        repo.patch_session(session["id"], {"codex_resume_id": "123e4567-e89b-12d3-a456-426614174000"})
+    assert client.patch(url, json={"effort": "high"}).status_code == 200
+    assert client.post(f"{url}/runs", json={"message": "Continue"}).status_code == 202
+    assert client.patch(url, json={"effort": None}).status_code == 200
+    assert client.post(f"{url}/runs", json={"message": "Continue again"}).status_code == 202
+
+    first, second, cleared = [command.argv for command in manager.submitted]
+    if backend == "codex":
+        assert "model_reasoning_effort=low" in first
+        assert "model_reasoning_effort=high" in second
+        assert "resume" in second
+        assert "-c" not in cleared
+    else:
+        flag = "--effort" if backend == "claude-code" else "--thinking"
+        assert first[first.index(flag) + 1] == "low"
+        assert second[second.index(flag) + 1] == "high"
+        assert flag not in cleared
+        resume_flag = "--resume" if backend == "claude-code" else "--session-id"
+        assert second[second.index(resume_flag) + 1] == cleared[cleared.index(resume_flag) + 1]
 
 
 def test_fork_session_without_message_creates_child_and_no_run() -> None:

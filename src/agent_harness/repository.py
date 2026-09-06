@@ -61,6 +61,7 @@ class InMemoryRepository:
         session = Session(
             backend=request.backend,
             model=request.model,
+            effort=request.effort,
             project=request.project,
             title=request.title,
             bypass_permissions=request.bypass_permissions,
@@ -314,7 +315,7 @@ class InMemoryRepository:
                     self.upsert_session(incoming)
                 elif existing.origin == "external":
                     self.upsert_session(
-                        incoming.model_copy(update={"stats": existing.stats})
+                        incoming.model_copy(update={"stats": existing.stats, "effort": existing.effort})
                     )
                 elif existing.origin == "harness" and incoming.origin == "harness":
                     # Harness→harness update: the observer emits this
@@ -343,7 +344,8 @@ class InMemoryRepository:
                     # just-written field. Preserve existing
                     # codex_resume_id whenever the incoming is None,
                     # mirroring the stats pattern above.
-                    updates: dict[str, object] = {"stats": existing.stats}
+                    # Effort is owned by create/PATCH, never by transcript snapshots.
+                    updates: dict[str, object] = {"stats": existing.stats, "effort": existing.effort}
                     if (
                         incoming.codex_resume_id is None
                         and existing.codex_resume_id is not None

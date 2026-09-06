@@ -939,6 +939,18 @@ class ExternalTranscriptObserver:
         is pending. Buffered events are replayed via
         ``_flush_pending_materialization`` once the session arrives.
         """
+        # Parsers synthesize sessions without harness overrides. Keep the
+        # published payload consistent with PATCH, including an explicit clear.
+        session_data = event.data.get("session")
+        if (
+            event.event == "session.updated" and isinstance(session_data, dict)
+            and event.session_id and self._repository is not None
+            and self._session_exists(event.session_id)
+        ):
+            effort = self._repository.get_session(event.session_id).effort
+            event = event.model_copy(update={
+                "data": {**event.data, "session": {**session_data, "effort": effort}},
+            })
         published_event: Event
         try:
             published_event = await self._event_bus.publish(event)

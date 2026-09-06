@@ -91,8 +91,8 @@ paths:
       description: |
         Updates the listed user-mutable fields and bumps `updated_at`.
         Absent fields are left untouched (set-if-present semantics via
-        `model_dump(exclude_unset=True)`). Explicit `null` for any field
-        is rejected with 422 — there is no "clear field" path. Empty
+        `model_dump(exclude_unset=True)`). Explicit `null` clears the effort override;
+        null title is rejected with 422. Empty
         payload `{}` is a 200 noop that returns the session unchanged.
         Publishes a `session.updated` event listing the changed fields.
       requestBody:
@@ -379,6 +379,18 @@ components:
           description: |
             Null means "use the backend CLI's own configured default" — the command builder omits
             `--model`. pi callers rely on this.
+        effort:
+          type: [string, "null"]
+          minLength: 1
+          description: |
+            Reasoning/thinking level applied to every run in this session. Null means "emit no
+            flag", leaving defaults and any saved resume settings to the backend CLI. Like
+            `model`, this is a non-empty free-form string: the harness does not validate supported
+            levels. Values depend on the CLI version and selected model; they are not universal.
+            Flags: `claude --effort`, `codex -c model_reasoning_effort=`, `pi --thinking`.
+            PATCH changes commands built after the update without recreating the session;
+            running and already-queued commands retain their original effort. Forks inherit
+            the parent's effort. Null clears the override but does not erase CLI session settings.
         project:
           $ref: "#/components/schemas/Project"
         title:
@@ -549,6 +561,7 @@ components:
         - session_id_choice
         - max_budget
         - mcp
+        - effort
         - sandbox
         - tools
       properties:
@@ -569,6 +582,8 @@ components:
         max_budget:
           type: boolean
         mcp:
+          type: boolean
+        effort:
           type: boolean
         sandbox:
           oneOf:
@@ -624,6 +639,13 @@ components:
         model:
           type: [string, "null"]
           description: Optional; omit to use the backend CLI's own configured default.
+        effort:
+          type: [string, "null"]
+          minLength: 1
+          description: |
+            Optional reasoning/thinking level; omit to use the backend CLI's own configured
+            default. Non-empty free-form string, like `model`; supported values depend on the
+            backend CLI version and model. Null emits no override.
         project:
           $ref: "#/components/schemas/Project"
         title:
@@ -638,12 +660,19 @@ components:
         Patch payload for `PATCH /v1/sessions/{id}`. Only user-mutable
         fields are listed; everything else on Session is derived
         (status, stats, updated_at) or immutable (id, backend, origin,
-        created_at). Omit a field to leave it unchanged; explicit `null`
-        is rejected with 422.
+        created_at). Omit a field to leave it unchanged. Null effort clears the override;
+        null title is rejected with 422.
       properties:
         title:
           type: string
           minLength: 1
+        effort:
+          type: [string, "null"]
+          minLength: 1
+          description: |
+            New reasoning/thinking level for commands built after this update, in the same
+            conversation. Running and already-queued commands are unchanged. Null clears the
+            override so no effort flag is emitted; backend resume settings may still apply.
 
     CreateRunRequest:
       type: object

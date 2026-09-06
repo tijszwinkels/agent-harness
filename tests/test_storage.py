@@ -1195,6 +1195,7 @@ def _forkable_parent(repo, *, backend: str = "claude-code", title: str | None = 
             project=Project(path="/repo", name="repo"),
             title=title,
             bypass_permissions=True,
+            effort="high",
         )
     )
 
@@ -1212,6 +1213,7 @@ def test_inmemory_create_forked_session_inherits_fields_and_records_parent() -> 
     assert child.model == parent.model
     assert child.project == parent.project
     assert child.bypass_permissions is True
+    assert child.effort == parent.effort == "high"
     # No title given → inherit the parent's.
     assert child.title == parent.title
     # Child is a real, retrievable session with its own (empty) message log.
@@ -1240,4 +1242,46 @@ def test_sqlite_create_forked_session_persists_after_reopen(tmp_path) -> None:
     assert stored.forked_from == parent.id
     assert stored.origin == "harness"
     assert stored.model == parent.model
+    assert stored.effort == "high"
+    reopened.close()
+
+
+def test_sqlite_create_session_persists_effort_across_reopen(tmp_path) -> None:
+    """``effort`` lands in the session JSON blob — no schema/migration work.
+    Rows written before the field existed deserialize on the pydantic default
+    (None), which is why SCHEMA_VERSION is untouched."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    with_effort = repository.create_session(
+        CreateSessionRequest(
+            backend="pi",
+            project=Project(path="/repo", name="repo"),
+            effort="medium",
+        )
+    )
+    without = repository.create_session(
+        CreateSessionRequest(backend="pi", project=Project(path="/repo", name="repo"))
+    )
+    repository.close()
+
+    # Simulate a row written by the pre-effort schema, rather than storing null.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "update sessions set payload = ? where id = ?",
+            (without.model_dump_json(exclude={"effort"}), without.id),
+        )
+
+    reopened = open_sqlite_repository(db_path)
+    assert reopened.get_session(with_effort.id).effort == "medium"
+    assert reopened.get_session(without.id).effort is None
+    reopened.patch_session(with_effort.id, {"effort": "high"})
+    reopened.close()
+
+    reopened = open_sqlite_repository(db_path)
+    assert reopened.get_session(with_effort.id).effort == "high"
+    reopened.patch_session(with_effort.id, {"effort": None})
+    reopened.close()
+
+    reopened = open_sqlite_repository(db_path)
+    assert reopened.get_session(with_effort.id).effort is None
     reopened.close()

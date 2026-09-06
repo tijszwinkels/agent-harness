@@ -123,6 +123,11 @@ class BackendCapabilities(HarnessModel):
     session_id_choice: bool
     max_budget: bool
     mcp: bool
+    # True when the backend CLI accepts a per-invocation reasoning-effort
+    # level (see ``Session.effort``). All three do today, each spelling it
+    # differently; declared per backend rather than assumed by callers so a
+    # future backend without one has to say so explicitly.
+    effort: bool
     sandbox: list[Literal["read-only", "workspace-write", "danger"]] | None
     tools: ToolMode
     interrupt_external_runs: bool = False
@@ -154,6 +159,12 @@ class Session(HarnessModel):
     # pi callers omit the model; the command builder then omits ``--model`` so
     # the CLI falls back. A given value must still be non-empty.
     model: str | None = Field(default=None, min_length=1)
+    # Reasoning/thinking level for every run in this session. ``None`` means
+    # "emit no flag", leaving defaults and resume behavior to the CLI.
+    # Free-form like ``model``: supported values depend on the backend CLI
+    # version and model. PATCH affects commands built after the update;
+    # running and already-queued commands keep their original effort.
+    effort: str | None = Field(default=None, min_length=1)
     project: Project
     title: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -190,14 +201,15 @@ class Session(HarnessModel):
     def forked_child(cls, parent: "Session", *, title: str | None = None) -> "Session":
         """A new harness-owned child that forks ``parent``.
 
-        Inherits the parent's backend / model / project / bypass_permissions,
-        records ``forked_from``, and keeps the parent's title unless
-        overridden. Always ``origin="harness"`` — the fork is harness-owned
-        even when the parent is an observed (external) session.
+        Inherits the parent's backend / model / effort / project /
+        bypass_permissions, records ``forked_from``, and keeps the parent's
+        title unless overridden. Always ``origin="harness"`` — the fork is
+        harness-owned even when the parent is an observed (external) session.
         """
         return cls(
             backend=parent.backend,
             model=parent.model,
+            effort=parent.effort,
             project=parent.project.model_copy(deep=True),
             title=title if title is not None else parent.title,
             bypass_permissions=parent.bypass_permissions,
@@ -223,6 +235,9 @@ class CreateSessionRequest(HarnessModel):
     # Optional: omit to let the backend CLI use its own configured default
     # (pi callers rely on this). A given value must be non-empty.
     model: str | None = Field(default=None, min_length=1)
+    # Optional reasoning/thinking level; omit to let the backend CLI use its
+    # own configured default. Unvalidated free-form, like ``model``.
+    effort: str | None = Field(default=None, min_length=1)
     project: Project
     title: str | None = None
     bypass_permissions: bool = False
@@ -232,10 +247,11 @@ class PatchSessionRequest(HarnessModel):
     # Patch payload for ``PATCH /v1/sessions/{id}``. Only the listed fields
     # are user-mutable; everything else on Session is either derived
     # (status, stats, updated_at) or immutable (id, backend, origin,
-    # created_at). Unset fields are left untouched. Explicit ``null`` is
-    # rejected at the route layer to avoid a silent "clear field" path
-    # that no current consumer wants — omit the field instead.
+    # created_at). Unset fields are left untouched. Null title is rejected
+    # at the route layer; null effort clears the per-session override.
     title: str | None = Field(default=None, min_length=1)
+    # Commands built after a patch use the new effort in the same conversation.
+    effort: str | None = Field(default=None, min_length=1)
 
 
 class ForkSessionRequest(HarnessModel):

@@ -160,13 +160,10 @@ class Session(HarnessModel):
     # the CLI falls back. A given value must still be non-empty.
     model: str | None = Field(default=None, min_length=1)
     # Reasoning/thinking level for every run in this session. ``None`` means
-    # "emit no flag", so each backend CLI falls back to its own configured
-    # default. Free-form and deliberately unvalidated here, exactly like
-    # ``model`` — the caller owns the value space (``low|medium|high|xhigh|max``
-    # is valid on all three backends; each CLI spells the flag differently, see
-    # ``orchestrator._effort_flag``). Mutable mid-session via
-    # ``PATCH /v1/sessions/{id}``: argv is rebuilt per run, so a change lands on
-    # the next turn without recreating the session.
+    # "emit no flag", leaving defaults and resume behavior to the CLI.
+    # Free-form like ``model``: supported values depend on the backend CLI
+    # version and model. PATCH affects commands built after the update;
+    # running and already-queued commands keep their original effort.
     effort: str | None = Field(default=None, min_length=1)
     project: Project
     title: str | None = None
@@ -250,13 +247,10 @@ class PatchSessionRequest(HarnessModel):
     # Patch payload for ``PATCH /v1/sessions/{id}``. Only the listed fields
     # are user-mutable; everything else on Session is either derived
     # (status, stats, updated_at) or immutable (id, backend, origin,
-    # created_at). Unset fields are left untouched. Explicit ``null`` is
-    # rejected at the route layer to avoid a silent "clear field" path
-    # that no current consumer wants — omit the field instead.
+    # created_at). Unset fields are left untouched. Null title is rejected
+    # at the route layer; null effort clears the per-session override.
     title: str | None = Field(default=None, min_length=1)
-    # Changing the reasoning level must NOT cost the conversation: the command
-    # builder rebuilds argv per run, so the next turn picks the new level up
-    # in the same session.
+    # Commands built after a patch use the new effort in the same conversation.
     effort: str | None = Field(default=None, min_length=1)
 
 

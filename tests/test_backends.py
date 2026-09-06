@@ -44,11 +44,7 @@ def test_pi_backend_registered_with_honest_capabilities() -> None:
 
 
 def test_every_backend_declares_effort_support() -> None:
-    """All three CLIs accept a per-invocation reasoning-effort level over the
-    same value space (low|medium|high|xhigh|max), verified 2026-09-02 —
-    ``claude --effort``, ``codex -c model_reasoning_effort=``, ``pi
-    --thinking``. The capability is declared per backend (rather than assumed
-    by callers) so a future backend without one has to say so explicitly."""
+    """Effort support is distinct from the backend/model's accepted levels."""
     registry = default_backend_registry()
 
     assert all(backend.capabilities.effort for backend in registry.list())

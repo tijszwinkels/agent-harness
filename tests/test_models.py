@@ -102,8 +102,8 @@ def test_session_and_request_effort_is_optional() -> None:
     # ``effort`` mirrors ``model``: None means "emit no flag", so each backend
     # CLI falls back to its own configured default (today's behaviour,
     # unchanged). A supplied value must be non-empty. The harness does NOT
-    # validate the level — like ``model`` it is free-form; the caller owns the
-    # value space (low|medium|high|xhigh|max on all three backends).
+    # validate the level — like ``model`` it is free-form; the caller selects
+    # a value supported by the backend CLI version and model.
     request = CreateSessionRequest(
         backend="claude-code", project=Project(path="/tmp/proj", name="proj"),
     )

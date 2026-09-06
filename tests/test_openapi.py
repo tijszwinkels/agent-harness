@@ -60,9 +60,8 @@ def test_openapi_documents_patch_session() -> None:
         "type": "string",
         "minLength": 1,
     }
-    # effort is patchable mid-session (change the reasoning level without
-    # recreating the session); same optional/non-empty shape as title.
-    assert patch_request["properties"]["effort"]["type"] == "string"
+    # Null clears the override; omission leaves it unchanged.
+    assert patch_request["properties"]["effort"]["type"] == ["string", "null"]
     assert patch_request["properties"]["effort"]["minLength"] == 1
 
 
@@ -75,6 +74,7 @@ def test_openapi_documents_session_effort() -> None:
     for name in ("Session", "CreateSessionRequest"):
         effort = schemas[name]["properties"]["effort"]
         assert effort["type"] == ["string", "null"]
+        assert effort["minLength"] == 1
         assert "enum" not in effort
     # Optional everywhere — never in a required list.
     assert "effort" not in schemas["Session"].get("required", [])

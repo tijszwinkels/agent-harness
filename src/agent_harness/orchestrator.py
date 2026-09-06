@@ -137,9 +137,8 @@ def _model_flag(session: Session) -> tuple[str, ...]:
 
 def _effort_flag(session: Session) -> tuple[str, ...]:
     # Reasoning/thinking level for this run; empty when the session doesn't pin
-    # one, so the backend CLI falls back to its own configured default (same
-    # contract as ``_model_flag``). The three CLIs spell the same idea
-    # differently — verified against the real binaries 2026-09-02:
+    # one, leaving default/resume behavior to the CLI. Syntax checked against
+    # installed CLIs on 2026-09-06; see specs/2026-09-06-session-effort.md.
     #
     #   claude-code  --effort <level>
     #   codex        -c model_reasoning_effort=<level>   (after ``exec``)
@@ -150,9 +149,8 @@ def _effort_flag(session: Session) -> tuple[str, ...]:
     # default. That is why the claude builder splats this into its shared argv
     # prefix rather than onto the session-creating branch only.
     #
-    # The value is not validated here — like ``model`` it is free-form and the
-    # caller owns the value space. (codex in particular does no local
-    # validation either: a bad level is forwarded and the API 400s mid-run.)
+    # Like ``model``, the value is free-form. CLI versions and models accept
+    # different levels and may reject or normalize unsupported values.
     if session.effort is None:
         return ()
     if session.backend == "claude-code":

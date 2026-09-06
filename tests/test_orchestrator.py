@@ -491,9 +491,8 @@ def test_claude_code_command_builder_omits_model_when_none() -> None:
 
 # ── per-session effort (reasoning / thinking level) ───────────────────────────
 # ``Session.effort`` mirrors ``Session.model``: ``None`` emits nothing, so each
-# CLI keeps its own configured default. The canonical value space
-# (low|medium|high|xhigh|max) is valid on all three backends, but each spells
-# the flag differently — verified against the real CLIs 2026-09-02.
+# CLI controls defaults/resume settings. Supported values depend on the CLI
+# version and model; the harness passes the caller's value through.
 
 
 def test_codex_command_builder_emits_effort_as_config_override() -> None:
@@ -523,7 +522,7 @@ def test_codex_command_builder_emits_effort_on_the_resume_path() -> None:
     session = make_session("codex").model_copy(
         update={
             "codex_resume_id": "019e0500-0000-0000-0000-000000000000",
-            "effort": "max",
+            "effort": "xhigh",
         },
     )
     command = CodexCommandBuilder().build(
@@ -538,7 +537,7 @@ def test_codex_command_builder_emits_effort_on_the_resume_path() -> None:
         "--model",
         "gpt-5.4",
         "-c",
-        "model_reasoning_effort=max",
+        "model_reasoning_effort=xhigh",
         "019e0500-0000-0000-0000-000000000000",
         "--",
         "follow-up",
@@ -675,9 +674,9 @@ def test_patched_effort_is_picked_up_by_the_next_built_command() -> None:
         session=session, run=make_run(session), message=Message.user("turn one"),
     ).argv
 
-    repatched = repo.patch_session(session.id, {"effort": "max"})
+    repatched = repo.patch_session(session.id, {"effort": "xhigh"})
 
-    assert "model_reasoning_effort=max" in CodexCommandBuilder().build(
+    assert "model_reasoning_effort=xhigh" in CodexCommandBuilder().build(
         session=repatched, run=make_run(repatched), message=Message.user("turn two"),
     ).argv
 

@@ -68,7 +68,7 @@ def default_backend_registry() -> BackendRegistry:
     # False — a genuine pi limitation (no MCP flag in ``pi --help``), unlike
     # claude/codex. pi has no sandbox levels (unlike codex) and no budget flag;
     # its tool allow/deny lists make ``tools`` granular. ``effort`` is True on all
-# three backends — pi spells it ``--thinking <level>`` (verified 2026-09-02).
+    # three backends — pi spells it ``--thinking <level>`` (verified 2026-09-06).
     pi = BackendCapabilities(
         fork=True,
         subagents=False,

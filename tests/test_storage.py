@@ -1264,7 +1264,24 @@ def test_sqlite_create_session_persists_effort_across_reopen(tmp_path) -> None:
     )
     repository.close()
 
+    # Simulate a row written by the pre-effort schema, rather than storing null.
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "update sessions set payload = ? where id = ?",
+            (without.model_dump_json(exclude={"effort"}), without.id),
+        )
+
     reopened = open_sqlite_repository(db_path)
     assert reopened.get_session(with_effort.id).effort == "medium"
     assert reopened.get_session(without.id).effort is None
+    reopened.patch_session(with_effort.id, {"effort": "high"})
+    reopened.close()
+
+    reopened = open_sqlite_repository(db_path)
+    assert reopened.get_session(with_effort.id).effort == "high"
+    reopened.patch_session(with_effort.id, {"effort": None})
+    reopened.close()
+
+    reopened = open_sqlite_repository(db_path)
+    assert reopened.get_session(with_effort.id).effort is None
     reopened.close()

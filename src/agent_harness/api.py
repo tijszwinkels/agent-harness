@@ -183,13 +183,10 @@ def create_app(
     async def patch_session(session_id: str, request: PatchSessionRequest) -> object:
         # ``exclude_unset`` so callers can patch a single field without
         # having to round-trip every other value — and so an absent field
-        # stays at its current repo value. Explicit ``null`` for an
-        # optional field is rejected here rather than silently clearing
-        # the underlying value: the only documented use case (mm-bridge
-        # title sync) never sends null, and a "clear field" path can be
-        # added explicitly later if needed.
+        # stays at its current repo value. Null effort clears the override;
+        # title retains its existing non-null patch contract.
         fields = request.model_dump(exclude_unset=True)
-        if any(v is None for v in fields.values()):
+        if any(value is None and name != "effort" for name, value in fields.items()):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="patch field cannot be null; omit the field to leave it unchanged",

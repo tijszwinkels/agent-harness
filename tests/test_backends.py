@@ -40,3 +40,11 @@ def test_pi_backend_registered_with_honest_capabilities() -> None:
     assert caps.sandbox is None
     assert caps.tools == "granular"
     assert caps.interrupt_external_runs is False
+    assert caps.effort is True
+
+
+def test_every_backend_declares_effort_support() -> None:
+    """Effort support is distinct from the backend/model's accepted levels."""
+    registry = default_backend_registry()
+
+    assert all(backend.capabilities.effort for backend in registry.list())

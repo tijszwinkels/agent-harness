@@ -202,6 +202,7 @@ class SQLiteRepository:
         session = Session(
             backend=request.backend,
             model=request.model,
+            effort=request.effort,
             project=request.project,
             title=request.title,
             bypass_permissions=request.bypass_permissions,
@@ -528,7 +529,7 @@ class SQLiteRepository:
                         self._upsert_session(incoming)
                     elif existing.origin == "external":
                         self._upsert_session(
-                            incoming.model_copy(update={"stats": existing.stats})
+                            incoming.model_copy(update={"stats": existing.stats, "effort": existing.effort})
                         )
                     elif existing.origin == "harness" and incoming.origin == "harness":
                         # Harness→harness update: observer emits this
@@ -551,7 +552,8 @@ class SQLiteRepository:
                         # event landed would otherwise clobber the
                         # just-written field. Same shape as the
                         # stats preservation.
-                        updates: dict[str, object] = {"stats": existing.stats}
+                        # Effort is owned by create/PATCH, never by transcript snapshots.
+                        updates: dict[str, object] = {"stats": existing.stats, "effort": existing.effort}
                         if (
                             incoming.codex_resume_id is None
                             and existing.codex_resume_id is not None

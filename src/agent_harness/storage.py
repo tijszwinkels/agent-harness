@@ -30,7 +30,7 @@ from agent_harness.repository import (
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TModel = TypeVar("TModel", bound=BaseModel)
 RUN_LIFECYCLE_EVENTS = {"run.started", "run.completed", "run.failed", "run.interrupted"}
 RUN_TERMINAL_EVENTS = RUN_LIFECYCLE_EVENTS - {"run.started"}
@@ -83,6 +83,10 @@ create table if not exists observer_offsets (
     updated_at text not null
 );
 
+create index if not exists idx_sessions_codex_resume_id
+    on sessions(json_extract(payload, '$.codex_resume_id'))
+    where json_extract(payload, '$.backend') = 'codex'
+      and json_extract(payload, '$.origin') = 'harness';
 create index if not exists idx_runs_session_id on runs(session_id);
 create index if not exists idx_messages_message_id on messages(message_id);
 create index if not exists idx_messages_session_id on messages(session_id);
@@ -220,6 +224,20 @@ class SQLiteRepository:
     def list_sessions(self) -> list[Session]:
         with self._lock:
             rows = self._connection.execute("select payload from sessions order by rowid").fetchall()
+        return [_model_from_row(row, "payload", Session) for row in rows]
+
+    def find_codex_harness_sessions(self, resume_id: str) -> list[Session]:
+        """Find durable rollout owners without loading every session."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                select payload from sessions
+                where json_extract(payload, '$.codex_resume_id') = ?
+                  and json_extract(payload, '$.backend') = 'codex'
+                  and json_extract(payload, '$.origin') = 'harness'
+                """,
+                (resume_id,),
+            ).fetchall()
         return [_model_from_row(row, "payload", Session) for row in rows]
 
     def get_session(self, session_id: str) -> Session:

@@ -127,6 +127,9 @@ _IGNORED_CLAUDE_RECORD_TYPES = {
 #   "Unsupported Codex transcript shape" warning, spamming logs
 #   (Orion's worth-noting #3 on PR #15).
 _IGNORED_CODEX_RECORD_TYPES = {"compacted", "session_meta", "turn_context"}
+# Event metadata reported by Codex 0.153.4; canonical messages and usage
+# are handled separately. Keep unfamiliar shapes visible as warnings.
+_IGNORED_CODEX_EVENT_TYPES = {"item_completed", "token_usage_record", "world_state"}
 _IGNORED_CODEX_PAYLOAD_TYPES = {
     # ``agent_message`` and ``assistant_message`` are codex's
     # ``event_msg`` form of the assistant turn; the canonical
@@ -552,9 +555,8 @@ class ExternalTranscriptObserver:
     def _resolve_identity(self, transcript_path: Path) -> TranscriptIdentity | None:
         """Resolve the identity that owns events from ``transcript_path``.
 
-        Returns ``None`` when codex's session_meta is in a partial
-        flush — caller should retry on the next tail tick rather than
-        attribute events to the wrong session id.
+        Returns ``None`` when ownership cannot yet be resolved safely;
+        the caller retries without consuming transcript bytes.
         """
         base = transcript_identity_from_path(transcript_path)
         bound = self._path_to_session.get(transcript_path)
@@ -572,6 +574,38 @@ class ExternalTranscriptObserver:
     def _resolve_codex_identity(
         self, transcript_path: Path, base: TranscriptIdentity
     ) -> TranscriptIdentity | None:
+        # Durable ownership wins over spawn timing and cached external
+        # fallbacks. A run's cleanup, a restart, or a delayed first read
+        # can all leave us without an active expectation (issue #37).
+        resume_id = _codex_resume_id_from_external_session_id(base.session_id)
+        if self._repository is not None and resume_id is not None:
+            try:
+                owners = self._repository.find_codex_harness_sessions(resume_id)
+            except Exception:
+                logger.exception("Failed to resolve Codex rollout ownership: path=%s", transcript_path)
+                return None
+            if len(owners) > 1:
+                logger.warning(
+                    "Ambiguous Codex rollout ownership: path=%s resume_id=%s sessions=%s",
+                    transcript_path, resume_id, [session.id for session in owners],
+                )
+                return None
+            if owners:
+                session_id = owners[0].id
+                self.bind_rollout(transcript_path, session_id)
+                self._codex_resolution_cache.pop(transcript_path, None)
+                self._codex_expectations = [
+                    exp for exp in self._codex_expectations if exp.session_id != session_id
+                ]
+                logger.debug(
+                    "Restored Codex rollout ownership: path=%s session_id=%s",
+                    transcript_path, session_id,
+                )
+                return TranscriptIdentity(
+                    backend="codex", path=transcript_path,
+                    session_id=session_id, is_rebound=True,
+                )
+
         # Memoized "we already checked this path and there's no
         # matching expectation". Falls through to the filename-pattern
         # base identity (external codex_<uuid> row) — the desired
@@ -1043,7 +1077,9 @@ class ExternalTranscriptObserver:
             session = self._repository.get_session(session_id)
         except SessionNotFoundError:
             return None
-        if session.status == target_status:
+        # A delayed transcript can restore ownership of an archived session;
+        # observing its history must not undo the user's archive action.
+        if session.status in {target_status, "archived"}:
             return None
 
         updated = session.model_copy(update={"status": target_status, "updated_at": self._clock()})
@@ -1557,7 +1593,11 @@ def _parse_codex_record(
         )
         return events
 
-    if record_type in _IGNORED_CODEX_RECORD_TYPES or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES:
+    if (
+        record_type in _IGNORED_CODEX_RECORD_TYPES
+        or payload_type in _IGNORED_CODEX_PAYLOAD_TYPES
+        or (record_type == "event_msg" and payload_type in _IGNORED_CODEX_EVENT_TYPES)
+    ):
         logger.debug(
             "Ignoring Codex transcript metadata: path=%s type=%s payload_type=%s",
             identity.path,

@@ -82,6 +82,17 @@ class InMemoryRepository:
         with self._lock:
             return [session.model_copy(deep=True) for session in self._sessions.values()]
 
+    def find_codex_harness_sessions(self, resume_id: str) -> list[Session]:
+        """Find durable rollout owners, including idle and archived sessions."""
+        with self._lock:
+            return [
+                session.model_copy(deep=True)
+                for session in self._sessions.values()
+                if session.backend == "codex"
+                and session.origin == "harness"
+                and session.codex_resume_id == resume_id
+            ]
+
     def get_session(self, session_id: str) -> Session:
         with self._lock:
             session = self._sessions.get(session_id)

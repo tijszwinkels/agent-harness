@@ -14,6 +14,7 @@ from agent_harness.models import (
     Session,
     StopReason,
     Usage,
+    merge_observed_session,
     utc_now,
 )
 
@@ -292,68 +293,17 @@ class InMemoryRepository:
                 incoming = Session.model_validate(session_data)
                 with self._lock:
                     existing = self._sessions.get(incoming.id)
-                # The external transcript observer (and the freshness
-                # tick) emit ``session.updated`` payloads built from a
-                # freshly-constructed ``Session`` whose ``stats`` field
-                # defaults to a zero-valued ``SessionStats()``. If a
-                # harness-spawned record already exists under the
-                # canonical ses_<hex> id we skip the upsert entirely
-                # (origin-downgrade guard — Phase 1 incident; a
-                # downgrade caused the bridge to adopt the channel
-                # away from the live session on next MM post).
-                #
-                # For absent or external-origin records we DO upsert,
-                # but we must preserve any accumulated stats on the
-                # existing row. Without this, every assistant /
-                # turn_context line in a multi-turn external-resume
-                # session would wipe prior turns' aggregated token
-                # counts (``run.usage`` is additive into Session.stats
-                # — see ``_materialize_run_usage_event``). PR #11
-                # originally added this guard; the Phase 3 cherry-pick
-                # of the parsers dropped it.
-                if existing is None:
-                    self.upsert_session(incoming)
-                elif existing.origin == "external":
-                    self.upsert_session(
-                        incoming.model_copy(update={"stats": existing.stats, "effort": existing.effort})
-                    )
-                elif existing.origin == "harness" and incoming.origin == "harness":
-                    # Harness→harness update: the observer emits this
-                    # path to set Session.codex_resume_id after a
-                    # codex rollout binds to a harness session
-                    # (specs/2026-05-21-codex-resume.md). Apply the
-                    # same stats-preservation guard that the external
-                    # branch uses — a fresh-constructed Session has
-                    # a zero SessionStats(), and we mustn't wipe the
-                    # accumulated tokens / context_window /
-                    # context_used the harness has already gathered.
-                    # The Phase 1 origin-downgrade guard
-                    # (external→harness rejected) stays intact: only
-                    # matching-origin incoming events fire this branch.
-                    #
-                    # The harness→harness reach is broader than just
-                    # codex_resume_id propagation — once enabled, any
-                    # observer-emitted session.updated for a harness
-                    # session can land here (e.g.
-                    # ``_maybe_publish_status_flip``'s running↔idle
-                    # transitions). Halcyon's NEEDS-FIX on PR #18:
-                    # a status-flip event whose payload was built
-                    # from a snapshot read BEFORE the resume-id
-                    # event landed would carry
-                    # ``codex_resume_id=None`` and clobber the
-                    # just-written field. Preserve existing
-                    # codex_resume_id whenever the incoming is None,
-                    # mirroring the stats pattern above.
-                    # Effort is owned by create/PATCH, never by transcript snapshots.
-                    updates: dict[str, object] = {"stats": existing.stats, "effort": existing.effort}
-                    if (
-                        incoming.codex_resume_id is None
-                        and existing.codex_resume_id is not None
-                    ):
-                        updates["codex_resume_id"] = existing.codex_resume_id
-                    self.upsert_session(
-                        incoming.model_copy(update=updates)
-                    )
+                # Preservation rules live in ``merge_observed_session``
+                # so the in-memory and SQLite paths can't drift: an
+                # observation refreshes the conversation's shape
+                # (backend / model / project / status) and nothing
+                # else. It returns None for the origin-downgrade case
+                # (external observation of a harness-owned session),
+                # which once caused the bridge to adopt a channel away
+                # from its live session.
+                merged = merge_observed_session(incoming, existing)
+                if merged is not None:
+                    self.upsert_session(merged)
             return
 
         if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:

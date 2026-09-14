@@ -28,6 +28,11 @@ from agent_harness.models import (
     Usage,
     utc_now,
 )
+from agent_harness.pi_discovery import (
+    PiSessionFacts,
+    PiTranscriptRegistry,
+    read_pi_head_facts,
+)
 from agent_harness.repository import (
     InMemoryRepository,
     MaterializationDeferred,
@@ -366,6 +371,13 @@ class ExternalTranscriptObserver:
         # the leak; before that, the set grew one-entry-per-run for
         # the observer's lifetime.
         self._codex_resume_id_published: set[str] = set()
+        # Per-transcript pi facts (cwd / provider / model), accumulated
+        # because pi splits them across record types. Bounded LRU: the
+        # operator's ``~/.pi/agent/sessions`` grows a file per terminal
+        # conversation and this observer watches the tree recursively.
+        # Evicting is safe — ``read_pi_head_facts`` re-derives an entry
+        # from the transcript on the next line that needs it.
+        self._pi_registry = PiTranscriptRegistry()
         # Per-session last-seen-transcript-event timestamp. Drives the
         # bidirectional running ↔ idle status transitions: a tick past the
         # threshold flips silent sessions to idle; a fresh event on an idle
@@ -860,8 +872,15 @@ class ExternalTranscriptObserver:
         if resolved_identity is None:
             # Codex partial-flush — defer this line to a later tick.
             return []
+        if resolved_identity.backend == "pi":
+            self._hydrate_pi_facts(transcript_path, resolved_identity.session_id)
         published: list[Event] = []
-        for event in parse_transcript_line(line, identity=resolved_identity, offset=offset):
+        for event in parse_transcript_line(
+            line,
+            identity=resolved_identity,
+            offset=offset,
+            pi_registry=self._pi_registry,
+        ):
             if event.event in ("run.usage", "run.end_turn"):
                 # Parsers emit run.usage / run.end_turn with
                 # ``run_id=None`` (no repository access from the pure
@@ -871,37 +890,9 @@ class ExternalTranscriptObserver:
                 if resolved is None:
                     continue
                 event = resolved
-            elif (
-                resolved_identity.backend == "pi"
-                and event.event == "message"
-                and self._repository is not None
-                and event.session_id is not None
-                and not self._session_exists(event.session_id)
+            elif resolved_identity.backend == "pi" and not self._keep_pi_event(
+                event, path=transcript_path
             ):
-                # External-origin pi sessions aren't synthesized yet: pi
-                # splits cwd (``session`` record) and model
-                # (``model_change`` record) across two records, so a
-                # single record can't build a ``session.updated`` the
-                # way claude/codex do. Rather than buffer a message for a
-                # session the harness doesn't own — which would grow
-                # ``_pending_materialization`` unbounded across the
-                # operator's many interactive pi sessions — skip it. This
-                # scopes pi observation to harness-owned sessions; when
-                # external synthesis lands the guard is removed. See
-                # specs/2026-07-06-pi-transcript-observer.md.
-                #
-                # NB: this SKIPS (not buffers), so unlike claude/codex it
-                # doesn't recover a message for a session that appears
-                # later. That's safe because a HARNESS pi session is
-                # always persisted (POST /v1/sessions) before its run
-                # subprocess spawns, so ``_session_exists`` is already
-                # True by the time pi writes its first rollout line —
-                # only genuinely-external sessions ever hit this branch.
-                logger.debug(
-                    "Skipping pi message for unknown session=%s path=%s",
-                    event.session_id,
-                    transcript_path,
-                )
                 continue
             published_event = await self._publish_via_bus(event)
             if published_event is None:
@@ -1170,6 +1161,87 @@ class ExternalTranscriptObserver:
             return False
         return True
 
+    def _hydrate_pi_facts(self, path: Path, session_id: str) -> None:
+        """Recover a pi transcript's facts once per path, newest first.
+
+        Observer offsets are persisted but the registry is not, so after a
+        restart the observer resumes mid-file, long past the ``session``
+        record that names the cwd.
+
+        Order matters. The **persisted session** is the up-to-date source:
+        it already reflects every ``model_change`` the previous process
+        saw. The transcript's head only reflects the *first* one, so
+        peeking it for a session we already know would drag a long-running
+        conversation back to the model it opened with. Fall back to the
+        head only when the harness has never heard of this session — and
+        then the facts are genuinely new, so they must be announced.
+        """
+        if not self._pi_registry.needs_hydration(path):
+            return
+        session = self._session_if_exists(session_id)
+        if session is not None:
+            # Seed the model WITHOUT a provider: the stored value is
+            # already provider-qualified, so re-attaching one would
+            # double it. Seeding matters — facts are sticky, and an
+            # announcement built from unseeded facts would carry
+            # ``model=None`` and blank the model on the stored row.
+            self._pi_registry.hydrate(
+                path,
+                PiSessionFacts(
+                    cwd=session.project.path,
+                    model=session.model,
+                    created_at=session.created_at,
+                ),
+                already_announced=True,
+            )
+            return
+        self._pi_registry.hydrate(path, read_pi_head_facts(path))
+
+    def _keep_pi_event(self, event: Event, *, path: Path) -> bool:
+        """Whether an observer-synthesized pi event should be published.
+
+        Two drops, both about not lying to subscribers:
+
+        * ``session.updated`` for a session the harness already owns. The
+          repository's origin-downgrade guard would refuse the write
+          anyway, but the event still travels the bus and would show a
+          harness session flipping to ``origin: external``.
+        * ``message`` for a session that does not exist and could not be
+          synthesized — i.e. the transcript never stated a usable cwd, so
+          there is no project path to resume it from. Skipped rather than
+          buffered: an operator accumulates many interactive pi sessions
+          and ``_pending_materialization`` would grow without bound.
+        """
+        if self._repository is None or event.session_id is None:
+            return True
+        if event.event == "session.updated":
+            existing = self._session_if_exists(event.session_id)
+            if existing is not None and existing.origin != "external":
+                logger.debug(
+                    "Not downgrading harness-owned pi session=%s from path=%s",
+                    event.session_id,
+                    path,
+                )
+                return False
+            return True
+        if event.event == "message" and not self._session_exists(event.session_id):
+            logger.warning(
+                "Skipping pi message for session=%s: transcript %s states no "
+                "cwd, so the session cannot be located or resumed",
+                event.session_id,
+                path,
+            )
+            return False
+        return True
+
+    def _session_if_exists(self, session_id: str) -> Session | None:
+        if self._repository is None:
+            return None
+        try:
+            return self._repository.get_session(session_id)
+        except SessionNotFoundError:
+            return None
+
     def _buffer_materialization(self, event: Event) -> None:
         if event.session_id is None:
             return
@@ -1302,6 +1374,19 @@ def pi_session_dir_name(cwd: str | Path) -> str:
     return f"--{inner}--"
 
 
+def pi_session_dir(cwd: str | Path, *, home: str | Path | None = None) -> Path:
+    """The directory pi keeps ``cwd``'s conversations in.
+
+    pi scopes ``--session-id`` to this directory: run from the wrong cwd
+    and pi reports "No project session found with id ...; creating a new
+    session with that id" and starts a *fresh* conversation (verified
+    against pi v0.84.2, 2026-09-14). Locating it is therefore part of
+    deciding whether a session can be resumed at all.
+    """
+    home_path = Path(home).expanduser() if home is not None else Path.home()
+    return home_path / ".pi" / "agent" / "sessions" / pi_session_dir_name(cwd)
+
+
 def pi_transcript_path(
     cwd: str | Path,
     timestamp: str,
@@ -1309,15 +1394,40 @@ def pi_transcript_path(
     *,
     home: str | Path | None = None,
 ) -> Path:
-    home_path = Path(home).expanduser() if home is not None else Path.home()
-    return (
-        home_path
-        / ".pi"
-        / "agent"
-        / "sessions"
-        / pi_session_dir_name(cwd)
-        / f"{timestamp}_{session_uuid}.jsonl"
-    )
+    return pi_session_dir(cwd, home=home) / f"{timestamp}_{session_uuid}.jsonl"
+
+
+def pi_transcript_header_uuid(path: str | Path) -> str | None:
+    """The session UUID a pi transcript claims in its first record.
+
+    pi opens every transcript with ``{"type":"session","id":<uuid>,...}``.
+    Reading it is how the harness proves a file on disk really is the
+    conversation a session refers to, rather than trusting the filename —
+    a transcript can be moved, truncated or replaced, and pi will happily
+    create a brand-new conversation at any path it is pointed at.
+
+    Returns ``None`` for a missing, empty, unreadable or malformed file,
+    and for a first record that isn't a ``session`` header. Never raises:
+    callers treat ``None`` as "not resumable".
+    """
+    transcript_path = Path(path)
+    try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
+            first = handle.readline()
+    except OSError:
+        logger.debug("pi header: cannot read %s", transcript_path, exc_info=True)
+        return None
+    if not first.strip():
+        return None
+    try:
+        record = json.loads(first)
+    except JSONDecodeError:
+        logger.debug("pi header: malformed first line in %s", transcript_path)
+        return None
+    if not isinstance(record, Mapping) or record.get("type") != "session":
+        return None
+    session_id = record.get("id")
+    return session_id if isinstance(session_id, str) and session_id else None
 
 
 def external_session_id_from_pi_path(path: str | Path) -> str:
@@ -1358,6 +1468,20 @@ def external_session_id_from_codex_path(path: str | Path) -> str:
     if match is None:
         raise ValueError(f"Not a Codex rollout transcript path: {transcript_path}")
     return f"codex_{match.group('uuid')}"
+
+
+def _absolute(path: Path) -> Path:
+    """Absolute form of ``path``, tolerating an unresolvable filesystem.
+
+    ``resolve()`` also normalizes symlinks, which is what we want for a
+    value we will store and later compare; it falls back to a plain
+    ``cwd``-join if the path can't be resolved (e.g. a broken symlink on
+    an older platform).
+    """
+    try:
+        return path.resolve()
+    except OSError:
+        return Path.cwd() / path
 
 
 def _resolves_within(path: Path, root: Path) -> bool:
@@ -1410,7 +1534,13 @@ def transcript_identity_from_path(path: str | Path, *, home: str | Path | None =
     raise ValueError(f"Unsupported transcript path: {transcript_path}")
 
 
-def parse_transcript_line(line: str, *, identity: TranscriptIdentity, offset: int | None = None) -> list[Event]:
+def parse_transcript_line(
+    line: str,
+    *,
+    identity: TranscriptIdentity,
+    offset: int | None = None,
+    pi_registry: PiTranscriptRegistry | None = None,
+) -> list[Event]:
     stripped = line.strip()
     if not stripped:
         return []
@@ -1421,7 +1551,9 @@ def parse_transcript_line(line: str, *, identity: TranscriptIdentity, offset: in
         logger.warning("Malformed transcript JSONL line: backend=%s path=%s", identity.backend, identity.path)
         return []
 
-    return parse_transcript_record(record, identity=identity, offset=offset)
+    return parse_transcript_record(
+        record, identity=identity, offset=offset, pi_registry=pi_registry
+    )
 
 
 def parse_transcript_record(
@@ -1429,6 +1561,7 @@ def parse_transcript_record(
     *,
     identity: TranscriptIdentity,
     offset: int | None = None,
+    pi_registry: PiTranscriptRegistry | None = None,
 ) -> list[Event]:
     if not isinstance(record, Mapping):
         logger.warning(
@@ -1444,7 +1577,9 @@ def parse_transcript_record(
     if identity.backend == "codex":
         return _parse_codex_record(record, identity=identity, offset=offset)
     if identity.backend == "pi":
-        return _parse_pi_record(record, identity=identity, offset=offset)
+        return _parse_pi_record(
+            record, identity=identity, offset=offset, registry=pi_registry
+        )
 
     logger.warning("Unsupported transcript backend: %s", identity.backend)
     return []
@@ -1687,12 +1822,10 @@ def _parse_codex_record(
     return []
 
 
-# pi rollout record-types we intentionally drop on the floor. All are
-# metadata that carry no conversational content for a data-plane
-# consumer:
+# pi records that produce no conversational message. Session and model
+# metadata are accumulated before this classification is applied:
 #
-# - ``session``: rollout header (cwd + uuid); no model, so it can't
-#   drive session synthesis on its own (see the deviations note).
+# - ``session``: rollout header (cwd + uuid), sufficient for synthesis.
 # - ``model_change`` / ``thinking_level_change``: settings changes.
 # - ``custom`` / ``custom_message``: extension bookkeeping (e.g.
 #   plannotator phase).
@@ -1721,15 +1854,25 @@ def _parse_pi_record(
     *,
     identity: TranscriptIdentity,
     offset: int | None,
+    registry: PiTranscriptRegistry | None = None,
 ) -> list[Event]:
     record_type = _string_value(record.get("type"))
+    # pi discloses the cwd (``session``) and the provider+model
+    # (``model_change``) in separate records, so — unlike claude/codex —
+    # synthesis needs the accumulator rather than this one record. Fold
+    # every record in, then emit a ``session.updated`` whenever that
+    # changed something worth telling subscribers about.
+    session_events = _pi_session_events(
+        identity=identity, registry=registry, record=record, offset=offset
+    )
+
     if record_type in _IGNORED_PI_RECORD_TYPES:
         logger.debug(
             "Ignoring pi transcript metadata: path=%s type=%s",
             identity.path,
             record_type,
         )
-        return []
+        return session_events
     if record_type != "message":
         logger.warning(
             "Unsupported pi transcript shape: path=%s type=%s keys=%s",
@@ -1737,7 +1880,7 @@ def _parse_pi_record(
             record_type,
             sorted(str(key) for key in record.keys()),
         )
-        return []
+        return session_events
 
     message = record.get("message") if isinstance(record.get("message"), Mapping) else {}
     role_value = message.get("role")
@@ -1762,7 +1905,7 @@ def _parse_pi_record(
             blocks=[block] if block is not None else [],
             offset=offset,
         )
-        return [event] if event is not None else []
+        return session_events + ([event] if event is not None else [])
 
     role = _role_from_value(role_value)
     if role is None:
@@ -1772,9 +1915,9 @@ def _parse_pi_record(
             identity.path,
             role_value,
         )
-        return []
+        return session_events
 
-    events: list[Event] = []
+    events: list[Event] = list(session_events)
     message_event = _message_event(
         identity=identity,
         role=role,
@@ -1814,6 +1957,66 @@ def _parse_pi_record(
                 )
             )
     return events
+
+
+def _pi_session_events(
+    *,
+    identity: TranscriptIdentity,
+    registry: PiTranscriptRegistry | None,
+    record: Mapping[str, Any],
+    offset: int | None,
+) -> list[Event]:
+    """Fold ``record`` into the accumulator and announce if that moved it.
+
+    Returns at most one ``session.updated`` describing the external pi
+    session the transcript belongs to. Empty when no registry was supplied
+    (the pre-existing, stateless parser contract), when the identity is
+    rebound to a harness session, or when the accumulated facts are
+    unchanged / still missing the cwd.
+
+    The model is deliberately allowed to be ``None``: pi writes the cwd on
+    line 1 and the model only on the following ``model_change``, and the
+    user turn in between is worth surfacing. A model-less session simply
+    resumes without ``--model``, letting pi apply its own default.
+    """
+    if registry is None:
+        return []
+    registry.observe(identity.path, record)
+    if identity.is_rebound:
+        # Same reasoning as ``_session_event_if_complete``: the session
+        # already exists and is harness-owned, and an ``origin=external``
+        # event would mislead bus subscribers even though the
+        # repository's origin-downgrade guard drops the write.
+        return []
+    facts = registry.take_announcement(identity.path)
+    if facts is None or facts.cwd is None:
+        return []
+    session = Session(
+        id=identity.session_id,
+        backend="pi",
+        model=facts.qualified_model,
+        project=Project(path=facts.cwd, name=Path(facts.cwd).name or facts.cwd),
+        status="running",
+        origin="external",
+        # The transcript we are literally reading — the only reliable
+        # resume key. Absolute: the harness hands this to ``pi --session``
+        # with ``cwd`` set to the *project* directory, so a relative path
+        # would resolve against the project and address a different file
+        # (which pi would then happily create). See
+        # ``Session.pi_transcript_path``.
+        pi_transcript_path=str(_absolute(identity.path)),
+        **({"created_at": facts.created_at} if facts.created_at else {}),
+    )
+    return [
+        Event(
+            event="session.updated",
+            session_id=session.id,
+            data={
+                **_source_data(identity, offset=offset),
+                "session": session.model_dump(mode="json"),
+            },
+        )
+    ]
 
 
 def _session_event_if_complete(

@@ -146,7 +146,15 @@ paths:
       description: |
         Starts a harness-origin run and returns immediately with session_id and
         run_id. If the session is external, the harness attempts backend resume;
-        unsupported resume returns 409 Conflict.
+        unsupported resume returns 409 Conflict, whose `detail` names the reason.
+
+        External `pi` sessions resume **headlessly** (`pi -p --session <path>`), appending to the
+        transcript the terminal created. Both of pi's resume forms are create-if-missing —
+        `--session-id <unknown>` warns and starts a new conversation, and `--session <missing
+        path>` writes that file and starts one — so before creating the run the harness verifies
+        the recorded transcript exists and that its `session` header names this session. If it
+        doesn't, the request 409s rather than returning an answer with none of the thread's
+        history.
       requestBody:
         required: true
         content:
@@ -419,6 +427,16 @@ components:
             rollout filename (harness origin), or by the startup backfill from `codex_<uuid>` ids
             (external origin). Null on non-codex sessions and on codex sessions whose first run
             hasn't yet completed binding.
+        pi_transcript_path:
+          type: [string, "null"]
+          description: |
+            pi only: absolute path of the transcript this session was observed in, recorded by
+            the observer. pi resumes a conversation by FILE (`pi -p --session <path>`), and the
+            path cannot be reconstructed from the session id: the directory name mangles `/` to
+            `-` (lossy), the root moves with `PI_CODING_AGENT_DIR` / `--observe-root`, and the
+            filename carries a creation timestamp the id does not encode. Null for non-pi
+            sessions and for harness-origin pi sessions, which address their own conversation by
+            `--session-id` instead.
         forked_from:
           type: [string, "null"]
           description: |

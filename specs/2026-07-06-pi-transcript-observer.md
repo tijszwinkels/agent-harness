@@ -5,6 +5,11 @@ Branch: `feat/pi-observer` (from `main` @ d170e77)
 Closes: "Transcript observation — DEFERRED" in
 `specs/2026-07-05-pi-backend-deviations.md` (pi backend blocker 2).
 
+> **Superseded in part (2026-09-14):** the "harness-owned sessions only"
+> scope below — and the `publish_line` guard that enforced it — were
+> replaced by external pi session discovery. See
+> `specs/2026-09-14-external-pi-sessions.md`.
+
 ## Problem
 
 pi-backend runs complete but the observer emits **nothing** — pi's rollout

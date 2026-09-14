@@ -188,6 +188,16 @@ class Session(HarnessModel):
     # diagnostic field (PR #12 / Phase 4) — this one is the live
     # resume key.
     codex_resume_id: str | None = None
+    # pi-only: the absolute path of the transcript this session was
+    # observed in. pi resumes a conversation by FILE (``--session
+    # <path>``), and the path cannot be reconstructed reliably: the
+    # directory name mangles ``/`` to ``-`` (lossy), the root moves with
+    # ``PI_CODING_AGENT_DIR`` / ``--observe-root``, and the filename
+    # carries a creation timestamp the session id doesn't encode. So the
+    # observer records what it actually saw. ``None`` for non-pi sessions
+    # and for harness-origin pi sessions, which address their own
+    # conversation by ``--session-id`` instead.
+    pi_transcript_path: str | None = Field(default=None, min_length=1)
     # Parent session id this session was forked from
     # (``POST /v1/sessions/{id}/forks``). ``None`` for non-fork sessions.
     # Set once at fork creation; the command builder consumes it on the
@@ -216,6 +226,53 @@ class Session(HarnessModel):
             origin="harness",
             forked_from=parent.id,
         )
+
+
+# A transcript observation is a snapshot of the CONVERSATION, so these are
+# the only Session fields it may overwrite. Everything else — title,
+# effort, bypass_permissions, stats, created_at, forked_from — is owned by
+# the user or the harness and survives a refresh untouched. The allowlist
+# is deliberately the narrow side: a field added to Session later defaults
+# to "preserved", which is the safe direction.
+_OBSERVER_OWNED_FIELDS: tuple[str, ...] = (
+    "backend",
+    "model",
+    "project",
+    "status",
+    "updated_at",
+)
+
+# Observer-owned too, but only when the observation actually carries a
+# value. A payload built from a snapshot taken BEFORE one of these was
+# discovered would otherwise clobber the field with None.
+_OBSERVER_OPTIONAL_FIELDS: tuple[str, ...] = (
+    "codex_resume_id",
+    "pi_transcript_path",
+)
+
+
+def merge_observed_session(incoming: Session, existing: Session | None) -> Session | None:
+    """The Session to store for an observer-emitted ``session.updated``.
+
+    ``None`` means "do not write": an ``origin=external`` observation of a
+    session the harness owns is a downgrade, and downgrading once caused
+    the bridge to adopt a channel away from its live session.
+
+    Shared by both repository implementations so the preservation rules
+    can't drift apart between the in-memory and SQLite paths.
+    """
+    if existing is None:
+        return incoming
+    if existing.origin == "harness" and incoming.origin == "external":
+        return None
+    updates: dict[str, Any] = {
+        field: getattr(incoming, field) for field in _OBSERVER_OWNED_FIELDS
+    }
+    for field in _OBSERVER_OPTIONAL_FIELDS:
+        value = getattr(incoming, field)
+        if value is not None:
+            updates[field] = value
+    return existing.model_copy(update=updates)
 
 
 class Event(HarnessModel):

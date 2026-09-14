@@ -350,9 +350,12 @@ async def test_observer_materializes_pi_assistant_message(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_observer_skips_pi_message_for_unknown_session(tmp_path) -> None:
-    # External-origin pi session (not owned by the harness) — deferred
-    # discovery. The observer must NOT orphan/buffer its messages.
+async def test_observer_skips_pi_message_for_unlocatable_session(tmp_path) -> None:
+    # A transcript that never states its cwd can't be synthesized into a
+    # session (pi resolves --session-id per project dir, so there'd be no
+    # way to resume it) — the observer skips rather than orphans/buffers.
+    # External pi sessions WITH a cwd are discovered and mirrored; see
+    # tests/test_pi_external_sessions.py.
     cwd = "/home/me/project"
     transcript = pi_transcript_path(cwd, "2026-07-06T11-25-51-562Z", GOLDEN_UUID, home=tmp_path)
     transcript.parent.mkdir(parents=True)

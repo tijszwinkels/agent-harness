@@ -70,6 +70,16 @@ Current v1 command mappings:
 - Claude Code external sessions must use the `claude_<uuid>` id shape. The
   harness launches
   `claude --print --output-format stream-json --include-partial-messages --model <model> --resume <uuid> <message>`.
+- pi external sessions use the canonical `ses_<32hex>` id shape (the transcript
+  filename's UUID, dashes stripped). The harness launches
+  `pi -p [--model <provider/model>] --session <transcript-path> <message>`, resuming
+  the exact file the observer read (`Session.pi_transcript_path`) rather than a
+  path rebuilt from the id. Unlike codex and claude, pi appends to the observed
+  transcript itself: the external conversation and the harness-origin runs share
+  one file. `model` is stored provider-qualified (`ollama/glm-5.2:cloud`) and
+  `--provider` is never emitted — pi only honours a `provider/` prefix when
+  `--provider` is absent, so a separately-pinned provider could silently outrank
+  a freshly-chosen model.
 
 Harness-origin sessions currently start a fresh non-interactive backend process.
 They do not yet resume the backend's underlying conversation, because v1 does
@@ -77,6 +87,20 @@ not persist the backend-generated session id emitted by a launched process.
 
 If the backend cannot resume the external conversation,
 `POST /v1/sessions/{id}/runs` returns `409 Conflict` with a clear message.
+
+"Cannot resume" includes the case where the backend would *silently succeed at
+the wrong thing*. Both pi resume forms create rather than fail — an unknown
+`--session-id`, or a `--session` path that doesn't exist — so a moved or deleted
+transcript would otherwise produce a plausible reply with none of the session's
+history. Before creating the run the harness checks the recorded transcript
+exists and that its `session` header names this session, and 409s otherwise. The
+header check, not just the path, is what stops a replaced or truncated file being
+resumed under the wrong session's name.
+
+Resume is always a **local** operation: the harness invokes the backend CLI on
+its own host, against transcripts on its own disk. It cannot continue a session
+whose transcript lives on another machine, and the observer cannot discover one
+either — see the observer note in the README.
 
 ## Catch-Up Semantics
 

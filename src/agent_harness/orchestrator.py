@@ -135,6 +135,37 @@ def _model_flag(session: Session) -> tuple[str, ...]:
     return ("--model", session.model) if session.model is not None else ()
 
 
+def _pi_session_flags(session: Session, session_uuid: str) -> tuple[str, ...]:
+    """How this run addresses its pi conversation.
+
+    A harness-origin session owns its id, so ``--session-id`` is right:
+    create-if-missing is exactly what the first run wants, and every later
+    run finds the same conversation.
+
+    An observed session does not own its id — the file was created by a
+    human's terminal, lives wherever ``PI_CODING_AGENT_DIR`` /
+    ``--observe-root`` put it, and carries a creation timestamp in its
+    filename that the session id doesn't encode. Reconstructing that path
+    is guesswork, so resume by the path the observer actually saw.
+
+    If that file is not there, RAISE. ``validate_session_resume_target``
+    already checked, but it checked at a different moment: a transcript
+    can vanish between the preflight and the build, and any caller that
+    skips the preflight would otherwise reach here too. Falling back to
+    ``--session-id`` at this point would be the exact failure the whole
+    design exists to prevent — pi creating a fresh conversation and
+    answering as though the thread never happened. There is no safe
+    default here, so there isn't one.
+
+    One resolution, whose result is used: checking and then re-resolving
+    would leave a window where the file reappears between the two reads
+    and the argv is built from the stale ``None``.
+    """
+    if session.origin != "external":
+        return ("--session-id", session_uuid)
+    return ("--session", str(_require_pi_resume_target(session)))
+
+
 def _effort_flag(session: Session) -> tuple[str, ...]:
     # Reasoning/thinking level for this run; empty when the session doesn't pin
     # one, leaving default/resume behavior to the CLI. Syntax checked against
@@ -299,6 +330,65 @@ def claude_conversation_exists(session: Session, *, home: str | Path | None = No
     return claude_transcript_path(session.project.path, claude_uuid, home=home).exists()
 
 
+def _require_pi_resume_target(session: Session) -> Path:
+    """``pi_resume_target`` or a ``CommandBuildError`` naming the reason."""
+    target = pi_resume_target(session)
+    if target is None:
+        raise CommandBuildError(
+            f"Cannot resume external pi session {session.id}: its pi "
+            f"transcript ({session.pi_transcript_path or 'never observed'}) "
+            "is missing, unreadable, or belongs to a different "
+            "conversation — resuming would silently start a new one",
+        )
+    return target
+
+
+def pi_resume_target(session: Session) -> Path | None:
+    """The transcript ``pi --session`` may safely resume, else ``None``.
+
+    Fail-closed on purpose. pi treats BOTH resume forms as create-if-
+    missing: ``--session-id <unknown>`` warns and starts a new
+    conversation, and ``--session <nonexistent path>`` writes that exact
+    file and starts one too (both verified against pi v0.84.2,
+    2026-09-14, rc=0 with no prior context in the request). There is no
+    "resume or fail" mode to ask for, so the harness has to establish the
+    conversation really is there before handing pi the flag — otherwise a
+    moved or deleted transcript produces a confident answer with none of
+    the history the user is reading.
+
+    Three things must hold, and all three are cheap:
+
+    1. the observer recorded a path (``Session.pi_transcript_path``),
+    2. the file exists and is non-empty,
+    3. its first record is a ``session`` header whose ``id`` is this
+       session's UUID.
+
+    (3) is what stops a *different* conversation being resumed under this
+    session's name after a file was moved, truncated or reused — a
+    filename match alone would accept it.
+    """
+    if session.pi_transcript_path is None:
+        return None
+    try:
+        session_uuid = _harness_session_id_as_uuid(session.id)
+    except CommandBuildError:
+        return None
+    path = Path(session.pi_transcript_path)
+    # Local import avoids any orchestrator<->observer import-order coupling.
+    from agent_harness.observer import pi_transcript_header_uuid
+
+    header_uuid = pi_transcript_header_uuid(path)
+    if header_uuid is None or header_uuid.lower() != session_uuid.lower():
+        logger.warning(
+            "pi transcript %s does not identify session %s (header id=%s)",
+            path,
+            session.id,
+            header_uuid,
+        )
+        return None
+    return path
+
+
 class ClaudeCodeCommandBuilder:
     def build(
         self,
@@ -413,8 +503,7 @@ class PiCommandBuilder:
                 *_model_flag(session),
                 *_effort_flag(session),
                 *fork,
-                "--session-id",
-                session_uuid,
+                *_pi_session_flags(session, session_uuid),
                 *approve,
                 text,
             ),
@@ -471,6 +560,12 @@ def validate_fork_source(parent: Session) -> None:
 
 
 def validate_session_resume_target(session: Session) -> None:
+    """Raise ``CommandBuildError`` when an external session can't be resumed.
+
+    Called before ``POST /v1/runs`` creates a run, so the caller gets a
+    truthful 409 instead of a backend silently answering from a blank
+    conversation.
+    """
     if session.origin != "external":
         return
     if session.backend == "codex":
@@ -487,6 +582,12 @@ def validate_session_resume_target(session: Session) -> None:
         # Validates session.id resolves to a claude UUID under any of the
         # accepted shapes (ses_<hex>, legacy claude_<uuid>, raw UUID).
         _harness_session_id_as_uuid(session.id)
+        return
+    if session.backend == "pi":
+        # Same check the builder makes, run early so the caller gets a 409
+        # instead of a created-then-failed run. The builder repeats it
+        # because the transcript can vanish in between.
+        _require_pi_resume_target(session)
         return
     raise CommandBuildError(f"Cannot resume external session for backend {session.backend}")
 

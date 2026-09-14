@@ -141,8 +141,20 @@ sessions and run arbitrary commands as the service user. Therefore:
 ## Observing external sessions
 
 The observer watches each backend's transcript files with `watchfiles` and
-replays their records through the same event bus as harness-owned runs. To try
-it against a safe fake transcript instead of your real sessions:
+replays their records through the same event bus as harness-owned runs.
+
+> **The observer only sees the machine it runs on.** It is a filesystem
+> watcher over local paths (`~/.claude/projects`, `~/.codex/sessions`,
+> `~/.pi/agent/sessions`) — nothing about it reaches across a network. A
+> terminal session on your laptop does **not** appear in a harness running on a
+> server, no matter how the two are otherwise connected. To surface laptop
+> sessions you need either (a) a harness + bridge running on the laptop itself,
+> or (b) transport that lands the laptop's transcript files under an
+> `--observe-root` on the harness host. Resume has the same constraint in
+> reverse: the harness re-invokes the backend CLI *locally*, so it can only
+> continue a conversation whose transcript is on its own disk.
+
+To try it against a safe fake transcript instead of your real sessions:
 
 ```bash
 mkdir -p /tmp/agent-harness-observer-demo
@@ -164,6 +176,26 @@ Appending to an observed external session uses the same run endpoint. With
   <uuid> <message>`.
 - `claude_<uuid>` sessions launch `claude --print --output-format stream-json
   --include-partial-messages --model <model> --resume <uuid> <message>`.
+- pi `ses_<32hex>` sessions launch `pi -p [--model <provider/model>]
+  --session <transcript-path> <message>` from the session's project path,
+  resuming the exact transcript the observer read. pi appends to the *same*
+  file the terminal created rather than branching into a new one, so this is
+  headless continuation of one conversation — not a fork, and not remote
+  control of a live pi TUI.
+
+  **Close the terminal's pi session before continuing it from elsewhere, and
+  reload it before going back.** An open pi keeps its own in-memory copy of the
+  conversation; headless turns and terminal turns then become *sibling
+  branches* of the same parent, and whoever reopens the file next sees only the
+  branch appended last — the other side's turns are silently absent from the
+  model's context.
+
+  Both pi resume forms are create-if-missing: an unknown `--session-id`, or a
+  `--session` path that doesn't exist, starts a *new* conversation instead of
+  failing. So before creating the run the harness checks the recorded
+  transcript exists and that its `session` header names this session, and
+  returns `409 Conflict` otherwise rather than handing back an answer with no
+  memory of the thread.
 
 Harness-created sessions launch a fresh non-interactive backend process and
 bind the backend's own session id from its output so subsequent turns resume

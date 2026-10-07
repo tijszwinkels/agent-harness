@@ -15,6 +15,7 @@ from agent_harness.models import (
     StopReason,
     Usage,
     merge_observed_session,
+    observed_status,
     utc_now,
 )
 
@@ -202,6 +203,13 @@ class InMemoryRepository:
         """True while the session has a queued or running run."""
         with self._lock:
             return self._has_active_run_locked(session_id)
+
+    def observed_status_for(self, session_id: str, status: str) -> str:
+        """The status an observation of ``session_id`` would be stored with."""
+        with self._lock:
+            return observed_status(
+                status, self._sessions.get(session_id), has_active_run=self._has_active_run_locked(session_id)
+            )
 
     def _has_active_run_locked(self, session_id: str) -> bool:
         return any(

@@ -297,12 +297,148 @@ def test_has_active_run_matches_run_states(harness) -> None:
     assert not repository.has_active_run("ses_unknown")
 
 
-def test_merge_observed_session_rule() -> None:
-    from agent_harness.models import merge_observed_session
+def test_observed_status_rule() -> None:
+    """Observations never decide status while a run is active (either
+    direction) or after an archive; otherwise they apply."""
+    from agent_harness.models import merge_observed_session, observed_status
 
     base = Session(backend="codex", model="m", project=Project(path="/r", name="r"), status="running", origin="harness")
     idle = base.model_copy(update={"status": "idle"})
+    waiting = base.model_copy(update={"status": "waiting_for_input"})
+    archived = base.model_copy(update={"status": "archived"})
     assert merge_observed_session(idle, base, has_active_run=True).status == "running"
     assert merge_observed_session(idle, base, has_active_run=False).status == "idle"
-    waiting = base.model_copy(update={"status": "waiting_for_input"})
-    assert merge_observed_session(base, waiting, has_active_run=True).status == "running"
+    assert merge_observed_session(base, waiting, has_active_run=True).status == "waiting_for_input"
+    assert merge_observed_session(base, waiting, has_active_run=False).status == "running"
+    for active in (True, False):
+        assert merge_observed_session(base, archived, has_active_run=active).status == "archived"
+    assert observed_status("idle", None, has_active_run=True) == "idle"
+
+
+# ----------------------------------------------------------------- round 1
+# Aster's review of aed4f73: the announced status must match the stored one,
+# and active-run precedence must hold in both directions.
+
+
+async def _subscribe(bus, session_id):
+    _, queue = await bus._register(0, session_id=session_id)
+    return queue
+
+
+def _drain(queue) -> list[Event]:
+    out = []
+    while not queue.empty():
+        out.append(queue.get_nowait())
+    return out
+
+
+def _statuses(events, session_id) -> list[str]:
+    return [
+        e.data["session"]["status"] for e in events
+        if e.event == "session.updated" and e.session_id == session_id and isinstance(e.data.get("session"), dict)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_race_announces_the_stored_status_on_replay_and_to_subscribers(harness, tmp_path, monkeypatch) -> None:
+    """The idle flip is decided while no run is active; a new run starts
+    while the publication waits (bus-lock contention). Durable log, replay,
+    subscribers and the row must all end on ``running``, also after later
+    activity."""
+    repository, bus, observer, clock = harness
+    session, first = _harness_session_with_run(repository)
+    rollout = _rollout(tmp_path)
+    observer.bind_rollout(rollout, session.id)
+    _append(rollout, *FIRST)
+    await observer.tail_file(rollout)
+    repository.finish_run(session.id, first.id, status="completed")
+    _append(rollout, LATER)                      # late flush: kicked to running, no active run
+    clock.advance(1)
+    await observer.tail_file(rollout)
+    assert repository.get_session(session.id).status == "running"
+    queue = await _subscribe(bus, session.id)
+
+    original_publish = bus.publish
+    started: list[str] = []
+
+    async def publish_after_create_run(event):
+        if event.event == "session.updated" and not started:
+            run = repository.create_run(session.id, CreateRunRequest(message="next"))
+            repository.start_run(session.id, run.id)
+            started.append(run.id)
+        return await original_publish(event)
+
+    monkeypatch.setattr(bus, "publish", publish_after_create_run)
+    clock.advance(31)
+    await observer.freshness_tick()
+    monkeypatch.setattr(bus, "publish", original_publish)
+
+    assert started, "the race was not exercised"
+    assert repository.get_session(session.id).status == "running"
+    assert _statuses(await bus.replay(session_id=session.id), session.id)[-1] == "running"
+    assert _statuses(_drain(queue), session.id)[-1] == "running"
+
+    # Later fresh activity and silence keep everyone consistent until the run ends.
+    _append(rollout, LATER)
+    clock.advance(1)
+    await observer.tail_file(rollout)
+    clock.advance(40)
+    await observer.freshness_tick()
+    assert repository.get_session(session.id).status == "running"
+    assert _statuses(await bus.replay(session_id=session.id), session.id)[-1] == "running"
+    repository.finish_run(session.id, started[0], status="completed")
+    assert repository.get_session(session.id).status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_active_waiting_session_survives_transcript_activity(harness, tmp_path) -> None:
+    repository, bus, observer, clock = harness
+    session, run = _harness_session_with_run(repository)
+    rollout = _rollout(tmp_path)
+    observer.bind_rollout(rollout, session.id)
+    _append(rollout, *FIRST)
+    await observer.tail_file(rollout)
+    repository.upsert_session(repository.get_session(session.id).model_copy(update={"status": "waiting_for_input"}))
+    before = len(_statuses(await bus.replay(session_id=session.id), session.id))
+    clock.advance(40)
+    await observer.freshness_tick()
+    _append(rollout, LATER)
+    clock.advance(1)
+    await observer.tail_file(rollout)
+    assert repository.get_session(session.id).status == "waiting_for_input"
+    assert "running" not in _statuses(await bus.replay(session_id=session.id), session.id)[before:]
+
+
+@pytest.mark.parametrize("active", [True, False])
+@pytest.mark.asyncio
+async def test_stale_snapshot_cannot_unarchive(harness, tmp_path, active) -> None:
+    """A producer snapshots the session (status running), the user archives it,
+    then the snapshot is published: the row and the announcement stay archived."""
+    repository, bus, observer, clock = harness
+    session, run = _harness_session_with_run(repository)
+    if not active:
+        repository.finish_run(session.id, run.id, status="completed")
+    snapshot = repository.get_session(session.id).model_copy(update={"status": "running", "codex_resume_id": "x"})
+    repository.archive_session(session.id)
+    queue = await _subscribe(bus, session.id)
+    published = await observer._publish_via_bus(
+        Event(event="session.updated", session_id=session.id, data={"session": snapshot.model_dump(mode="json")})
+    )
+    assert repository.get_session(session.id).status == "archived"
+    assert published.data["session"]["status"] == "archived"
+    assert _statuses(_drain(queue), session.id) == ["archived"]
+    assert _statuses(await bus.replay(session_id=session.id), session.id)[-1] == "archived"
+    # The non-status part of the observation still applies.
+    assert repository.get_session(session.id).codex_resume_id == "x"
+
+
+def test_durable_append_reconciles_under_the_repository_lock(tmp_path) -> None:
+    """The SQLite log row itself carries the decided status."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    session, run = _harness_session_with_run(repository)
+    stale = repository.get_session(session.id).model_copy(update={"status": "idle"})
+    appended = repository.append_event(
+        Event(event="session.updated", session_id=session.id, data={"session": stale.model_dump(mode="json")})
+    )
+    assert appended.data["session"]["status"] == "running"
+    assert repository.list_events(session_id=session.id)[-1].data["session"]["status"] == "running"

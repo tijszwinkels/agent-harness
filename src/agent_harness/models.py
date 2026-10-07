@@ -268,6 +268,24 @@ _OBSERVER_OPTIONAL_FIELDS: tuple[str, ...] = (
 )
 
 
+def observed_status(
+    incoming_status: str, existing: Session | None, *, has_active_run: bool
+) -> str:
+    """The status to store (and publish) for an observation.
+
+    Observations never decide the status of a session the harness owns at
+    the moment: an archived session stays archived (the user's action), and
+    while a run is queued or running the run lifecycle (``create_run`` →
+    running, ``finish_run`` → idle) keeps whatever it set, in both
+    directions. Otherwise the observation's status applies.
+    """
+    if existing is None:
+        return incoming_status
+    if existing.status == "archived" or has_active_run:
+        return existing.status
+    return incoming_status
+
+
 def merge_observed_session(
     incoming: Session, existing: Session | None, *, has_active_run: bool = False
 ) -> Session | None:
@@ -278,11 +296,10 @@ def merge_observed_session(
     the bridge to adopt a channel away from its live session.
 
     ``has_active_run``: the session has a queued or running harness run.
-    The run lifecycle (``create_run`` → running, ``finish_run`` → idle) is
-    then the authority on status; an observation may only confirm
-    ``running``, never demote it. Transcript silence during a long tool call
-    is not the end of a run, and a snapshot taken before ``create_run`` must
-    not undo it when it is materialized afterwards.
+    The run lifecycle is then the authority on status (see
+    ``observed_status``): transcript silence during a long tool call is not
+    the end of a run, and a snapshot taken before ``create_run`` (or before
+    an archive) must not undo it when it is materialized afterwards.
 
     Shared by both repository implementations so the preservation rules
     can't drift apart between the in-memory and SQLite paths.
@@ -294,8 +311,7 @@ def merge_observed_session(
     updates: dict[str, Any] = {
         field: getattr(incoming, field) for field in _OBSERVER_OWNED_FIELDS
     }
-    if has_active_run and incoming.status != "running":
-        updates["status"] = existing.status
+    updates["status"] = observed_status(incoming.status, existing, has_active_run=has_active_run)
     for field in _OBSERVER_OPTIONAL_FIELDS:
         value = getattr(incoming, field)
         if value is not None:

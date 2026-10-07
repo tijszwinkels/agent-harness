@@ -20,6 +20,7 @@ from agent_harness.models import (
     StopReason,
     Usage,
     merge_observed_session,
+    observed_status,
     utc_now,
 )
 from agent_harness.repository import (
@@ -525,14 +526,48 @@ class SQLiteRepository:
         # under the same lock. Single materialization point per event;
         # no double-application even if a caller invokes both paths
         # (Falcon's PR #11 bug becomes structurally impossible).
+        #
+        # A ``session.updated`` row carries the status this repository will
+        # store, decided under the same lock as the materialization that
+        # follows (``observed_status``), so the durable log and subscribers
+        # never announce a status the row refused — e.g. an idle flip decided
+        # just before ``create_run`` started a new run.
         with self._lock, self._connection:
-            published = event.with_sequence(self._next_event_sequence_locked())
+            published = self._reconcile_observed_event_locked(event)
+            published = published.with_sequence(self._next_event_sequence_locked())
             self._insert_event(published)
         return published.model_copy(deep=True)
+
+    def observed_status_for(self, session_id: str, status: str) -> str:
+        """The status an observation of ``session_id`` would be stored with."""
+        with self._lock:
+            return observed_status(
+                status,
+                self._find_session_locked(session_id),
+                has_active_run=self._has_active_run_locked(session_id),
+            )
+
+    def _reconcile_observed_event_locked(self, event: Event) -> Event:
+        session_data = event.data.get("session") if event.event == "session.updated" else None
+        if not isinstance(session_data, dict) or not isinstance(session_data.get("id"), str):
+            return event
+        status = session_data.get("status")
+        if not isinstance(status, str):
+            return event
+        session_id = session_data["id"]
+        decided = observed_status(
+            status,
+            self._find_session_locked(session_id),
+            has_active_run=self._has_active_run_locked(session_id),
+        )
+        if decided == status:
+            return event
+        return event.model_copy(update={"data": {**event.data, "session": {**session_data, "status": decided}}})
 
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
         with self._lock, self._connection:
             if store_event:
+                event = self._reconcile_observed_event_locked(event)
                 self._insert_event(event)
 
             if event.event == "session.updated":

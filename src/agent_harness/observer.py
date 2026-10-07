@@ -1198,6 +1198,12 @@ class ExternalTranscriptObserver:
         ):
             existing = self._repository.get_session(event.session_id)
             overrides: dict[str, Any] = {"effort": existing.effort}
+            # Announce the status the repository will keep (archived, or the
+            # run lifecycle's while a run is active), not the raw observation.
+            # The durable repository re-decides this atomically at append.
+            observed_status_for = getattr(self._repository, "observed_status_for", None)
+            if callable(observed_status_for) and isinstance(session_data.get("status"), str):
+                overrides["status"] = observed_status_for(event.session_id, session_data["status"])
             overrides["title"], overrides["title_source"] = observed_title(
                 session_data.get("title"), session_data.get("title_source"), existing
             )
@@ -1227,6 +1233,7 @@ class ExternalTranscriptObserver:
                     self._buffer_materialization(published_event)
                     return published_event
                 raise
+            await self._correct_published_status(published_event)
         # When a session arrives (either freshly registered by the
         # rollout's session_meta event or the explicit
         # ``session.updated`` carrying its row), flush any events that
@@ -1340,13 +1347,15 @@ class ExternalTranscriptObserver:
         # observing its history must not undo the user's archive action.
         if session.status in {target_status, "archived"}:
             return None
-        if target_status == "idle":
-            # Freshness only demotes ``running``: other states (e.g.
-            # ``waiting_for_input``) are not transcript-liveness claims.
-            # And while a harness run is queued or running, the run
-            # lifecycle owns the status — silence is not completion.
-            if session.status != "running" or self._has_active_run(session_id):
-                return None
+        # While a harness run is queued or running, the run lifecycle owns
+        # the status in both directions: silence is not completion, and
+        # activity does not override e.g. ``waiting_for_input``.
+        if self._has_active_run(session_id):
+            return None
+        # Freshness only demotes ``running``: other states (e.g.
+        # ``waiting_for_input``) are not transcript-liveness claims.
+        if target_status == "idle" and session.status != "running":
+            return None
 
         updated = session.model_copy(update={"status": target_status, "updated_at": self._clock()})
         data: dict[str, Any] = {"session": updated.model_dump(mode="json")}
@@ -1391,6 +1400,30 @@ class ExternalTranscriptObserver:
             )
             return None
         return event.model_copy(update={"run_id": active_run_id})
+
+    async def _correct_published_status(self, published: Event) -> None:
+        """In-memory bus only: if the run lifecycle changed the session
+        between our reconciliation and materialization, the announced status
+        differs from the stored one. Announce the stored session so
+        subscribers end up consistent. (The durable bus decides atomically
+        at append and never needs this.)"""
+        session_data = published.data.get("session") if published.event == "session.updated" else None
+        if not isinstance(session_data, dict) or not published.session_id or self._repository is None:
+            return
+        try:
+            stored = self._repository.get_session(published.session_id)
+        except SessionNotFoundError:
+            return
+        if session_data.get("status") == stored.status:
+            return
+        correction = Event(
+            event="session.updated",
+            session_id=stored.id,
+            data={**{k: v for k, v in published.data.items() if k != "session"},
+                  "session": stored.model_dump(mode="json")},
+        )
+        await self._event_bus.publish(correction)
+        self._repository.materialize_event(correction, store_event=True)
 
     def _has_active_run(self, session_id: str) -> bool:
         """True while the session has a queued or running harness run.

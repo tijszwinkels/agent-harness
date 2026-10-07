@@ -162,16 +162,16 @@ async def test_expired_lease_with_fresh_transcript_stays_running_until_silent(ha
 async def test_stale_duplicate_and_reordered_updates_are_ignored(harness, tmp_path) -> None:
     repository, bus, observer, clock = harness
     await _observed(observer, tmp_path)
-    _, accepted = repository.apply_live_state(SESSION_ID, claim("busy", 5))
+    _, accepted, _changed = repository.apply_live_state(SESSION_ID, claim("busy", 5))
     assert accepted is not None
     # Duplicate and older updates from the same producer change nothing.
     for stale in (claim("busy", 5), claim("idle", 4), claim("idle", 0)):
-        _, accepted = repository.apply_live_state(SESSION_ID, stale)
+        _, accepted, _changed = repository.apply_live_state(SESSION_ID, stale)
         assert accepted is None
         assert repository.get_session(SESSION_ID).status == "running"
     # Reordered delivery: idle(7) arrives before busy(6) → busy(6) is stale.
     repository.apply_live_state(SESSION_ID, claim("idle", 7))
-    _, accepted = repository.apply_live_state(SESSION_ID, claim("busy", 6))
+    _, accepted, _changed = repository.apply_live_state(SESSION_ID, claim("busy", 6))
     assert accepted is None
     assert repository.get_session(SESSION_ID).status == "idle"
     assert not repository.status_owned(SESSION_ID)
@@ -182,7 +182,7 @@ async def test_new_producer_after_companion_restart_replaces_the_claim(harness, 
     repository, bus, observer, clock = harness
     await _observed(observer, tmp_path)
     repository.apply_live_state(SESSION_ID, claim("busy", 900, producer="companion-old"))
-    _, accepted = repository.apply_live_state(SESSION_ID, claim("idle", 1, producer="companion-new"))
+    _, accepted, _changed = repository.apply_live_state(SESSION_ID, claim("idle", 1, producer="companion-new"))
     assert accepted is not None
     assert repository.get_session(SESSION_ID).status == "idle"
     assert not repository.status_owned(SESSION_ID)
@@ -446,3 +446,136 @@ def test_api_idle_records_the_settled_boundary(tmp_path) -> None:
     size = transcript.stat().st_size
     assert repository.observation_superseded(SESSION_ID, size - 10)
     assert not repository.observation_superseded(SESSION_ID, size)
+
+
+# --------------------------------------------------------------- review round 2
+
+
+def _append_model_change(path: Path, model: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"type":"model_change","provider":"openai-codex","modelId":"' + model + '"}\n')
+
+
+@pytest.mark.asyncio
+async def test_settled_metadata_change_tailed_late_keeps_status_but_applies_metadata(harness, tmp_path) -> None:
+    """Finding 1: a model_change written by the finished turn and tailed after
+    its idle produces a full session.updated; it must not make the session
+    running (row and replay) but its metadata still applies."""
+    repository, bus, observer, clock = harness
+    path = await _observed(observer, tmp_path)
+    repository.apply_live_state(SESSION_ID, claim("busy", 1))
+    _append_model_change(path, "gpt-6-sol")
+    from agent_harness.live_state import transcript_size
+    repository.apply_live_state(SESSION_ID, claim("idle", 2), settled_offset=transcript_size(str(path)))
+    before = len(_statuses(await bus.replay(session_id=SESSION_ID)))
+    clock.advance(1)
+    await observer.tail_file(path)
+    session = repository.get_session(SESSION_ID)
+    assert session.status == "idle"
+    assert "running" not in _statuses(await bus.replay(session_id=SESSION_ID))[before:]
+    assert session.model is not None and "gpt-6-sol" in session.model
+
+
+@pytest.mark.asyncio
+async def test_api_publishes_when_status_changes_during_its_awaits(tmp_path, monkeypatch) -> None:
+    """Finding 2: an observation sets running while the idle request waits on
+    its transcript stat; the claim's change back to idle must be published."""
+    import agent_harness.api as api_module
+    from httpx import ASGITransport, AsyncClient
+
+    for kind in ("memory", "sqlite"):
+        transcript = _transcript(tmp_path / kind)
+        if kind == "memory":
+            repository = InMemoryRepository()
+            bus = InMemoryEventBus()
+        else:
+            repository = open_sqlite_repository(tmp_path / kind / "harness.db")
+            bus = DurableEventBus(repository)
+        repository.upsert_session(Session(id=SESSION_ID, backend="pi", origin="external", status="idle",
+                                          project=Project(path=CWD, name="agents"),
+                                          pi_transcript_path=str(transcript)))
+        repository.note_live_state_owner(SESSION_ID, "companion")
+        app = create_app(repository=repository, event_bus=bus)
+
+        original = api_module.transcript_size
+
+        def slow_size(path):
+            # The observation lands while the request is between its awaits.
+            running = repository.get_session(SESSION_ID).model_copy(update={"status": "running"})
+            repository.upsert_session(running)
+            return original(path)
+
+        monkeypatch.setattr(api_module, "transcript_size", slow_size)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body = {"source": "companion", "producer": "p", "sequence": 1, "state": "idle"}
+            response = await client.put(f"/v1/sessions/{SESSION_ID}/live-state", json=body)
+        assert response.json()["status"] == "idle"
+        assert repository.get_session(SESSION_ID).status == "idle"
+        assert _statuses(await bus.replay(session_id=SESSION_ID))[-1] == "idle", kind
+        monkeypatch.setattr(api_module, "transcript_size", original)
+
+
+def test_owner_beyond_first_chunk_is_found_incrementally_and_survives_restart(tmp_path, monkeypatch) -> None:
+    """Finding 5: an owner entry far into a long transcript (appended when the
+    feature was activated) is found by successive bounded scans, persisted,
+    and still known after the harness restarts."""
+    import agent_harness.live_state as live_state
+
+    monkeypatch.setattr(live_state, "OWNER_SCAN_CHUNK_BYTES", 64 * 1024)
+    monkeypatch.setattr(live_state, "OWNER_SCAN_BLOCK_BYTES", 8 * 1024)
+    path = _transcript(tmp_path, owner=False)
+    with path.open("a", encoding="utf-8") as handle:
+        for index in range(1500):  # ~200 KiB of history before the marker
+            handle.write('{"type":"message","message":{"role":"user","content":[{"type":"text","text":"history '
+                         + str(index) + ' ' + "x" * 100 + '"}]}}\n')
+        handle.write(OWNER_LINE)
+    clock = Clock()
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    repository.clock = clock
+    repository.upsert_session(Session(id=SESSION_ID, backend="pi", origin="external", status="idle",
+                                      project=Project(path=CWD, name="agents"), pi_transcript_path=str(path)))
+    client = TestClient(create_app(repository=repository, event_bus=DurableEventBus(repository)))
+    url = f"/v1/sessions/{SESSION_ID}/live-state"
+    statuses = []
+    for sequence in range(1, 10):
+        response = client.put(url, json={"source": "companion", "producer": "p", "sequence": sequence, "state": "busy"})
+        statuses.append(response.status_code)
+        if response.status_code == 200:
+            break
+        clock.advance(11)  # past the rescan rate limit
+    assert statuses[0] == 409 and statuses[-1] == 200, statuses
+    client.close()
+    repository._connection.close()
+
+    reopened = open_sqlite_repository(tmp_path / "harness.db")
+    assert reopened.live_state_owner(SESSION_ID) == "companion"
+    reopened.apply_live_state(SESSION_ID, claim("busy", 1, producer="after-restart"))
+    assert reopened.status_owned(SESSION_ID)
+
+
+def test_owner_scan_memory_is_bounded_for_one_huge_line(tmp_path, monkeypatch) -> None:
+    """Finding 6: a single 8 MiB JSONL record is not read into memory whole."""
+    import tracemalloc
+
+    import agent_harness.live_state as live_state
+
+    monkeypatch.setattr(live_state, "OWNER_SCAN_BLOCK_BYTES", 64 * 1024)
+    path = tmp_path / "huge.jsonl"
+    with path.open("wb") as handle:
+        handle.write(b'{"type":"message","text":"' + b"y" * (8 * 1024 * 1024) + b'"}\n')
+        handle.write(OWNER_LINE.encode())
+    tracemalloc.start()
+    owner, cursor = live_state.scan_owner_chunk(str(path), 0, budget=32 * 1024 * 1024)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert owner == "companion"
+    assert peak < 1024 * 1024, peak
+
+
+def test_owner_marker_inside_a_long_line_is_ignored(tmp_path) -> None:
+    import agent_harness.live_state as live_state
+
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b'{"type":"message","text":"' + b"z" * 20000
+                     + b' agent-harness.live-state-owner "agent-harness.live-state-owner" ' + b"z" * 20000 + b'"}\n')
+    assert live_state.scan_owner_chunk(str(path), 0)[0] is None

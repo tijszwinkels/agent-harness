@@ -29,7 +29,7 @@ from agent_harness.models import (
     observed_title,
     utc_now,
 )
-from agent_harness.live_state import OWNER_ENTRY_TYPE, owner_from_entry
+from agent_harness.live_state import OWNER_ENTRY_TYPE, event_offset, owner_from_entry
 from agent_harness.codex_names import CodexNameIndex
 from agent_harness.native_titles import (
     CLEARED,
@@ -1206,7 +1206,9 @@ class ExternalTranscriptObserver:
             # The durable repository re-decides this atomically at append.
             observed_status_for = getattr(self._repository, "observed_status_for", None)
             if callable(observed_status_for) and isinstance(session_data.get("status"), str):
-                overrides["status"] = observed_status_for(event.session_id, session_data["status"])
+                overrides["status"] = observed_status_for(
+                    event.session_id, session_data["status"], event_offset(event)
+                )
             overrides["title"], overrides["title_source"] = observed_title(
                 session_data.get("title"), session_data.get("title_source"), existing
             )

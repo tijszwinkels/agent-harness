@@ -21,14 +21,17 @@ session rows, so a rollback to a version without this module stays safe.
 Ownership: a producer may only report sessions it drives. Companion's Pi
 process writes a custom transcript entry (``OWNER_ENTRY_TYPE``, data
 ``{"source": "companion"}``) into each conversation it runs; the harness
-learns the owner from that entry (while tailing, or by a bounded scan of the
-session's own recorded transcript path) and accepts claims only from that
-source. A terminal Pi session has no such entry and cannot be claimed.
+learns the owner from that entry (while tailing, or by an incremental,
+bounded scan of the session's own recorded transcript path), persists it
+(SQLite: a separate ``live_state_owners`` table, which older harness versions
+simply ignore), and accepts claims only from that source. A terminal Pi session has no such entry and cannot be claimed.
 
 Settled boundary: an ``idle`` claim records how far the session's transcript
 reached when it arrived. Lines before that offset were written by the turn
 that just ended; observing them later (the watcher is asynchronous) must not
-make the session look busy again. Lines after it are new activity.
+change the session's status — whether through a running-kick or a metadata
+``session.updated`` — though non-status metadata still applies. Lines after
+it are new activity.
 
 Ordering: each producer (one per producer process lifetime) numbers its
 updates. A claim whose sequence is not newer than the last accepted claim of
@@ -52,10 +55,8 @@ MAX_OWNERS = 4096
 # Custom Pi transcript entry that names the producer allowed to report a session.
 OWNER_ENTRY_TYPE = "agent-harness.live-state-owner"
 OWNER_MARKER = f'"{OWNER_ENTRY_TYPE}"'.encode()
-# Upper bound for scanning a transcript for the owner entry (bytes).
-MAX_OWNER_SCAN_BYTES = 64 * 1024 * 1024
-# A session without a known owner is re-scanned at most this often.
-OWNER_RESCAN_SECONDS = 30
+# A session without a known owner is scanned (one more chunk) at most this often.
+OWNER_RESCAN_SECONDS = 10
 
 
 class LiveStateRejected(Exception):
@@ -82,30 +83,82 @@ def owner_from_entry(line: str | bytes) -> str | None:
     return None
 
 
-def scan_transcript_owner(path: str | None) -> str | None:
-    """Look for the owner entry in a session's own transcript.
+# Owner scans read the transcript in blocks of this size, a bounded number
+# of bytes per call (``OWNER_SCAN_CHUNK_BYTES``), continuing where the last
+# call stopped, so even a very long transcript is covered eventually.
+OWNER_SCAN_BLOCK_BYTES = 1024 * 1024
+OWNER_SCAN_CHUNK_BYTES = 16 * 1024 * 1024
+# The owner entry is a short line; a "line" around a marker match longer
+# than this is ignored rather than read.
+OWNER_LINE_WINDOW = 4096
+
+
+def event_offset(event: object) -> int | None:
+    """Transcript offset an observer event came from, if any."""
+    data = getattr(event, "data", None)
+    offset = data.get("offset") if isinstance(data, dict) else None
+    return offset if isinstance(offset, int) and offset >= 0 else None
+
+
+def _owner_at(handle, position: int) -> str | None:
+    """Parse the (short) line around ``position`` as an owner entry."""
+    window_start = max(0, position - OWNER_LINE_WINDOW)
+    handle.seek(window_start)
+    window = handle.read(2 * OWNER_LINE_WINDOW)
+    relative = position - window_start
+    newline_before = window.rfind(b"\n", 0, relative)
+    if newline_before == -1 and window_start > 0:
+        return None  # longer than the window: not an owner entry
+    line_start = newline_before + 1
+    line_end = window.find(b"\n", relative)
+    if line_end == -1:
+        return None  # incomplete or too long
+    return owner_from_entry(window[line_start:line_end])
+
+
+def scan_owner_chunk(path: str | None, start: int, budget: int | None = None) -> tuple[str | None, int]:
+    """Look for the owner entry in ``[start, start + budget)`` of a session's
+    own transcript. Returns ``(owner, next_start)``.
 
     ``path`` comes from the harness's session record (never from a request).
-    Reads at most ``MAX_OWNER_SCAN_BYTES``, line by line.
+    Memory is bounded by one block plus a line window, however long the
+    transcript's lines are; the caller keeps ``next_start`` to continue.
     """
+    import os
     from pathlib import Path
 
     if not path:
-        return None
+        return None, start
+    if budget is None:
+        budget = OWNER_SCAN_CHUNK_BYTES
     try:
         with Path(path).open("rb") as handle:
-            read = 0
-            for line in handle:
-                read += len(line)
-                if read > MAX_OWNER_SCAN_BYTES:
-                    return None
-                if OWNER_MARKER in line:
-                    owner = owner_from_entry(line)
+            size = os.fstat(handle.fileno()).st_size
+            if start > size:
+                start = 0  # truncated or replaced: start over
+            end = min(size, start + budget)
+            # Re-read a marker's length before ``start`` so a marker split by
+            # the previous chunk boundary is still found.
+            position = max(0, start - len(OWNER_MARKER))
+            carry = b""
+            while position < end:
+                handle.seek(position)
+                block = handle.read(min(OWNER_SCAN_BLOCK_BYTES, end - position))
+                if not block:
+                    break
+                buffer = carry + block
+                buffer_start = position - len(carry)
+                found = buffer.find(OWNER_MARKER)
+                while found != -1:
+                    owner = _owner_at(handle, buffer_start + found)
                     if owner is not None:
-                        return owner
+                        return owner, end
+                    found = buffer.find(OWNER_MARKER, found + 1)
+                position += len(block)
+                carry = buffer[-len(OWNER_MARKER):]
+            return None, end
     except OSError:
-        return None
-    return None
+        return None, start
 
 
 def transcript_size(path: str | None) -> int | None:
@@ -164,6 +217,7 @@ class LiveStateRegistry:
         self._claims: dict[str, LiveClaim] = {}
         self._owners: dict[str, str] = {}
         self._owner_scans: dict[str, datetime] = {}
+        self._scan_cursors: dict[str, int] = {}
 
     # ---- ownership
 
@@ -175,6 +229,14 @@ class LiveStateRegistry:
         self._owner_scans.pop(session_id, None)
         while len(self._owners) > MAX_OWNERS:
             del self._owners[next(iter(self._owners))]
+
+    def scan_cursor(self, session_id: str) -> int:
+        return self._scan_cursors.get(session_id, 0)
+
+    def set_scan_cursor(self, session_id: str, offset: int) -> None:
+        self._scan_cursors[session_id] = offset
+        while len(self._scan_cursors) > MAX_OWNERS:
+            del self._scan_cursors[next(iter(self._scan_cursors))]
 
     def should_scan_owner(self, session_id: str, now: datetime) -> bool:
         """Rate-limit transcript scans for sessions without a known owner."""

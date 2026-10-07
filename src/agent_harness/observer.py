@@ -465,6 +465,10 @@ class ExternalTranscriptObserver:
                 end_offset=offset,
                 transcript_uuid=_transcript_uuid(identity),
             )
+            if slots is None:
+                # Unreadable or truncated below the consumed offset: keep
+                # the stored title; the next new line retries hydration.
+                continue
             self._native_titles.hydrate(path, slots)
             name = effective_native_title(identity.backend, slots)
             updated = _apply_native_name(session, name)
@@ -1053,24 +1057,24 @@ class ExternalTranscriptObserver:
 
         Once per transcript per process (and after LRU eviction). From
         offset 0 the ordered tail supplies every record, so there is
-        nothing to scan; never reads past what was consumed.
+        nothing to scan; never reads past what was consumed. A prefix that
+        can't be recovered in full leaves the transcript unhydrated — its
+        name stays unknown, so nothing is applied — and is retried on the
+        next line.
         """
         if identity.backend not in ("pi", "claude-code"):
             return
         if not self._native_titles.needs_hydration(path):
             return
         offset = self._state.next_offset(path)
-        slots = (
-            scan_native_titles(
-                path,
-                identity.backend,
-                end_offset=offset,
-                transcript_uuid=_transcript_uuid(identity),
-            )
-            if offset > 0
-            else {}
+        slots = scan_native_titles(
+            path,
+            identity.backend,
+            end_offset=offset,
+            transcript_uuid=_transcript_uuid(identity),
         )
-        self._native_titles.hydrate(path, slots)
+        if slots is not None:
+            self._native_titles.hydrate(path, slots)
 
     def _known_to_exist(self, session_id: str) -> bool:
         # Sessions are never deleted, so a positive answer is cached; this

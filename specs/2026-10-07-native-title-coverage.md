@@ -75,6 +75,12 @@ don't count as conversation activity.
   rebuilt from complete lines up to the persisted offset. From offset 0,
   ordered replay supplies them. So a new generated title after a restart
   still loses to the earlier custom title.
+- **Incomplete prefix.** A rebuild counts only if it recovers the whole
+  consumed prefix. An unreadable file, or one truncated below or
+  misaligned with the offset, leaves the transcript unhydrated. Nothing is
+  applied, the stored title is kept, and the rebuild is retried on the
+  next line. Once the tail realigns with a regrown file, the prefix is the
+  file as it now is.
 - **Startup backfill.** One pass over persisted offsets, using the
   watched path spelling. Each external pi or claude session that is
   untitled or natively titled gets the name, or removal, from its
@@ -92,10 +98,12 @@ don't count as conversation activity.
   `--codex-name-index PATH` overrides the derivation for custom homes or
   roots. Only that one file is read; `~/.codex` is not watched.
 - **Refresh.** One `stat` per freshness tick (10 s). An unchanged file is
-  skipped. Appended complete lines are read from the last offset. The file
-  is re-read whole if it was replaced (new inode), truncated, or rewritten
-  in place, which is detected by comparing the bytes just before the
-  consumed offset.
+  skipped. If the same file grew and the bytes just before the consumed
+  offset are unchanged, only the appended complete lines are read.
+  Anything else is re-read whole: a replacement (new inode), a
+  truncation, a same-size change, or a changed tail. An in-place rewrite
+  further back that coincides with growth is not detected; codex never
+  does that.
 - **Applying names.** Names apply to `codex_<uuid>` external sessions,
   with `codex_resume_id` as the join. A cached name for a thread whose
   rollout isn't discovered yet waits for discovery and never creates a
@@ -110,9 +118,13 @@ don't count as conversation activity.
   - it has no more malformed lines than before (codex's rewrite keeps
     lines it can't parse).
 
-  A truncated or in-place rewritten file is re-read, but nothing is
-  inferred from it. A missing or unreadable file changes nothing, and a
-  file that disappears and reappears is a fresh start.
+  The baseline is the set of thread IDs with a valid entry in the
+  previous read, not every name ever cached. A name retained from an
+  older read, for example across a damaged replacement, is never inferred
+  removed by a later rewrite. A truncated or in-place rewritten file is
+  re-read, but nothing is inferred from it. A missing or unreadable file
+  changes nothing, and a file that disappears and reappears starts a
+  fresh baseline.
 - **Startup.** Every external codex session gets its cached name or
   removal. A stored native title whose thread is absent from the index is
   cleared only when the startup read was complete and contained no

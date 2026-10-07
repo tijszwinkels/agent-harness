@@ -150,25 +150,31 @@ def scan_native_titles(
     *,
     end_offset: int,
     transcript_uuid: str | None = None,
-) -> dict[str, NativeName]:
+) -> dict[str, NativeName] | None:
     """Slots recovered from the first ``end_offset`` bytes of a transcript.
 
     Only complete (newline-terminated) lines inside the bound count: the
     observer has consumed exactly that prefix, and reading further would
-    apply names ahead of the ordered tail. Never raises — an unreadable
-    file yields no slots, which is "unknown", never a removal.
+    apply names ahead of the ordered tail. Never raises.
+
+    ``None`` when the prefix can't be recovered in full — the file is
+    unreadable, or shorter than (or no longer line-aligned at) the
+    consumed offset, e.g. after truncation. Callers then keep the stored
+    title and try again later rather than trusting partial slots: a
+    missing custom slot would otherwise let a generated title (or its
+    removal) take over.
     """
     slots: dict[str, NativeName] = {}
-    markers = tuple(marker.encode() for marker in _MARKERS.get(backend, ()))
-    if not markers or end_offset <= 0:
+    if end_offset <= 0:
         return slots
+    markers = tuple(marker.encode() for marker in _MARKERS.get(backend, ()))
+    consumed = 0
     try:
         with Path(path).open("rb") as handle:
-            consumed = 0
             for line in handle:
-                consumed += len(line)
-                if consumed > end_offset or not line.endswith(b"\n"):
+                if consumed + len(line) > end_offset or not line.endswith(b"\n"):
                     break
+                consumed += len(line)
                 if not any(marker in line for marker in markers):
                     continue
                 found = native_title_slot_from_line(
@@ -178,7 +184,12 @@ def scan_native_titles(
                     slots[found[0]] = found[1]
     except OSError:
         logger.debug("native title scan: cannot read %s", path, exc_info=True)
-        return {}
+        return None
+    if consumed != end_offset:
+        logger.debug(
+            "native title scan: %s has %d of %d consumed bytes", path, consumed, end_offset
+        )
+        return None
     return slots
 
 
@@ -234,8 +245,13 @@ class NativeTitleTracker:
         self._entry(Path(path)).slots[slot] = name
 
     def effective(self, path: str | Path, backend: str) -> NativeName | None:
+        """The current name, or ``None`` until the slots are trustworthy.
+
+        Records observed before a successful hydration are kept, but say
+        nothing on their own: the prefix they follow is still unknown.
+        """
         entry = self._entries.get(Path(path))
-        if entry is None:
+        if entry is None or not entry.hydrated:
             return None
         return effective_native_title(backend, entry.slots)
 

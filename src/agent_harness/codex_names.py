@@ -106,6 +106,11 @@ class CodexNameIndex:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._names: dict[str, NativeName] = {}
+        # Ids with a valid entry in the file as last read. Distinct from
+        # ``_names``, which also keeps last-known names for ids no longer in
+        # the file: only an id that was *present* and is gone after a
+        # trustworthy replacement counts as removed.
+        self._present: set[str] = set()
         self._identity: tuple[int, int] | None = None
         self._stamp: tuple[int, int] | None = None  # (size, mtime_ns)
         self._offset = 0
@@ -128,14 +133,16 @@ class CodexNameIndex:
     def refresh(self) -> dict[str, NativeName]:
         """Reconcile with the file; return ids whose current name changed.
 
-        Removal inference — a previously named id absent after the file
-        was replaced — requires: a file we had read before, a new file
+        Removal inference — an id with a valid entry in the previous read
+        and none after the file was replaced — requires: a new file
         identity (codex's write-then-rename), a successful read ending in
         a complete line, and no more malformed lines than the previous
-        snapshot (codex's rewrite keeps lines it can't parse; garbage is
-        not a removal). A truncated or rewritten-in-place file is re-read
-        but never used to infer removals; a missing or unreadable one
-        changes nothing.
+        read (codex's rewrite keeps lines it can't parse; garbage is not a
+        removal). Names cached from older reads but absent from the
+        previous one are never inferred removed. A truncated or
+        rewritten-in-place file is re-read but never used to infer
+        removals; a missing or unreadable one changes nothing, and a file
+        that reappears starts a fresh baseline.
         """
         try:
             stat = self.path.stat()
@@ -146,6 +153,7 @@ class CodexNameIndex:
             # removals from. Cached names stay.
             self._identity = None
             self._stamp = None
+            self._present = set()
             self._offset = 0
             self._tail_probe = b""
             self._trusted = False
@@ -158,9 +166,15 @@ class CodexNameIndex:
         if identity == self._identity and stamp == self._stamp:
             return {}
         try:
+            # Fast path only for growth of the same file whose consumed
+            # tail is unchanged. A same-size change (a rewrite in place)
+            # or a shrink is re-read whole. The tail sample can't see a
+            # rewrite further back combined with growth; codex never does
+            # that (it appends, or renames a rewritten file into place).
             if (
                 identity == self._identity
-                and stat.st_size >= self._offset
+                and self._stamp is not None
+                and stat.st_size > self._stamp[0]
                 and self._tail_probe == self._probe(self._offset)
             ):
                 return self._append(self._read_from(self._offset), stamp)
@@ -177,14 +191,13 @@ class CodexNameIndex:
         for thread_id, previous in self._names.items():
             if thread_id in names:
                 continue
-            if may_infer_removals and isinstance(previous, str):
-                names[thread_id] = CLEARED
-            else:
-                names[thread_id] = previous
+            removed = may_infer_removals and thread_id in self._present
+            names[thread_id] = CLEARED if removed and isinstance(previous, str) else previous
         for thread_id, name in names.items():
             if self._names.get(thread_id) != name:
                 changes[thread_id] = name
         self._names = names
+        self._present = set(snapshot.names)
         self._identity = identity
         self._stamp = stamp
         self._offset = snapshot.offset
@@ -203,6 +216,7 @@ class CodexNameIndex:
             if self._names.get(thread_id) != name
         }
         self._names.update(snapshot.names)
+        self._present.update(snapshot.names)
         self._offset = snapshot.offset
         self._tail_probe = self._probe(snapshot.offset)
         self._malformed += snapshot.malformed

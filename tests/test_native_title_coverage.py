@@ -13,6 +13,7 @@ import pytest
 
 from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.models import Project, Session
+from agent_harness.native_titles import CLEARED
 from agent_harness.observer import (
     ExternalTranscriptObserver,
     claude_transcript_path,
@@ -371,12 +372,104 @@ async def test_claude_announcements_advertise_the_explicit_title(tmp_path) -> No
         assert _title(repository, CLAUDE_ID) == ("bridge", None), kind
 
 
+@pytest.mark.asyncio
+async def test_unreadable_prefix_keeps_the_stored_title_until_it_recovers(tmp_path) -> None:
+    """A failed startup scan must not hydrate empty slots: the custom slot
+    would look absent and a generated title (or its removal) would win."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    transcript = _claude(tmp_path, [CLAUDE_USER, _ai("generated"), _custom("chosen")])
+    await _observer(repository, DurableEventBus(repository)).tail_file(transcript)
+    repository.set_observer_offset(str(transcript), transcript.stat().st_size)
+    repository.close()
+
+    transcript.chmod(0)
+    reopened = open_sqlite_repository(db_path)
+    try:
+        if os.access(transcript, os.R_OK):
+            pytest.skip("running with privileges that ignore file modes")
+        observer = _observer(reopened, DurableEventBus(reopened))
+        assert _title(reopened, CLAUDE_ID) == ("chosen", "native")
+        transcript.chmod(0o600)
+
+        _append(transcript, _ai(""))
+        await observer.tail_file(transcript)
+        assert _title(reopened, CLAUDE_ID) == ("chosen", "native")
+        _append(transcript, _ai("regenerated"))
+        await observer.tail_file(transcript)
+        assert _title(reopened, CLAUDE_ID) == ("chosen", "native")
+    finally:
+        transcript.chmod(0o600)
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_truncated_transcript_does_not_resurrect_a_cleared_name(tmp_path) -> None:
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    transcript = _claude(tmp_path, [CLAUDE_USER, _custom("old")])
+    truncated_size = transcript.stat().st_size
+    _append(transcript, _custom(""))
+    await _observer(repository, DurableEventBus(repository)).tail_file(transcript)
+    assert _title(repository, CLAUDE_ID) == (None, "native")
+    repository.close()
+
+    with transcript.open("r+b") as handle:
+        handle.truncate(truncated_size)
+    reopened = open_sqlite_repository(db_path)
+    try:
+        observer = _observer(reopened, DurableEventBus(reopened))
+        assert _title(reopened, CLAUDE_ID) == (None, "native")
+        _append(transcript, CLAUDE_USER)
+        await observer.tail_file(transcript)
+        assert _title(reopened, CLAUDE_ID) == (None, "native")
+        # Regrown past the old offset: once the tail realigns, the prefix is
+        # the file as it now is — the genuinely latest record wins, and the
+        # truncated-away ``old`` never comes back.
+        while transcript.stat().st_size <= observer._state.next_offset(transcript):
+            _append(transcript, CLAUDE_USER)
+        await observer.tail_file(transcript)
+        assert _title(reopened, CLAUDE_ID) == (None, "native")
+        _append(transcript, _custom("after truncation"))
+        await observer.tail_file(transcript)
+        assert _title(reopened, CLAUDE_ID) == ("after truncation", "native")
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_eviction_rehydrates_from_the_consumed_prefix(tmp_path) -> None:
+    from agent_harness.native_titles import NativeTitleTracker
+
+    repository = InMemoryRepository()
+    transcript = _claude(tmp_path, [CLAUDE_USER, _ai("generated"), _custom("chosen")])
+    observer = _observer(repository)
+    await observer.tail_file(transcript)
+    observer._native_titles = NativeTitleTracker(max_entries=1)  # forget everything
+
+    _append(transcript, _ai("regenerated"))
+    await observer.tail_file(transcript)
+    assert _title(repository, CLAUDE_ID) == ("chosen", "native")
+    _append(transcript, _custom(""))
+    await observer.tail_file(transcript)
+    assert _title(repository, CLAUDE_ID) == ("regenerated", "native")
+
+
+def test_records_observed_before_hydration_say_nothing() -> None:
+    from agent_harness.native_titles import NativeTitleTracker
+
+    tracker = NativeTitleTracker()
+    tracker.observe("t.jsonl", "ai", CLEARED)
+    assert tracker.effective("t.jsonl", "claude-code") is None
+    tracker.hydrate("t.jsonl", {"custom": "chosen"})
+    assert tracker.effective("t.jsonl", "claude-code") == "chosen"
+
+
 # --------------------------------------------------------------------------- #
 # codex name index                                                             #
 # --------------------------------------------------------------------------- #
 
 from agent_harness.codex_names import CodexNameIndex, default_codex_name_index  # noqa: E402
-from agent_harness.native_titles import CLEARED  # noqa: E402
 from agent_harness.settings import ObserverSettings  # noqa: E402
 
 T1 = "123e4567-e89b-12d3-a456-426614174000"
@@ -712,3 +805,51 @@ def test_cli_passes_an_explicit_codex_name_index(monkeypatch, tmp_path) -> None:
     settings = captured["observer_settings"]
     assert settings.roots == (root,)
     assert settings.codex_name_index_path() == tmp_path / "n.jsonl"
+
+
+def test_index_retained_names_are_not_removed_by_a_later_rewrite(tmp_path) -> None:
+    """T1 survives a damaged replacement; a later clean rewrite that never
+    contained T1 must not be read as removing it."""
+    index_path = tmp_path / "session_index.jsonl"
+    _write(index_path, [_entry(T1, "one"), _entry(T2, "two")])
+    index = CodexNameIndex(index_path)
+    index.refresh()
+
+    _replace(index_path, [_entry(T2, "two")], raw='{"id": "' + T1 + '", broken\n')
+    assert index.refresh() == {}
+    _replace(index_path, [_entry(T2, "two!")], raw='{"id": "' + T1 + '", broken\n')
+    assert index.refresh() == {T2: "two!"}
+    assert index.get(T1) == "one"
+
+
+def test_index_recreated_file_starts_a_fresh_baseline(tmp_path) -> None:
+    index_path = tmp_path / "session_index.jsonl"
+    _write(index_path, [_entry(T1, "one"), _entry(T2, "two")])
+    index = CodexNameIndex(index_path)
+    index.refresh()
+    index_path.unlink()
+    index.refresh()
+    _write(index_path, [_entry(T2, "two")])
+    index.refresh()
+
+    _replace(index_path, [_entry(T2, "two!")])
+    assert index.refresh() == {T2: "two!"}
+    assert index.get(T1) == "one"
+    # ...while a thread present in that baseline is still removable.
+    _replace(index_path, [])
+    assert index.refresh() == {T2: CLEARED}
+
+
+def test_index_in_place_rewrite_before_the_tail_probe_is_seen(tmp_path) -> None:
+    index_path = tmp_path / "session_index.jsonl"
+    _write(index_path, [_entry(T1, "old"), _entry(T2, "x" * 200)])
+    index = CodexNameIndex(index_path)
+    index.refresh()
+
+    content = index_path.read_bytes().replace(b'"old"', b'"new"')
+    with index_path.open("r+b") as handle:
+        handle.write(content)
+    stat = index_path.stat()
+    os.utime(index_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    assert index.refresh() == {T1: "new"}

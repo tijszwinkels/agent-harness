@@ -174,9 +174,12 @@ def test_title_scan_reads_complete_records_up_to_an_offset(tmp_path) -> None:
 
     assert scan(size) == {"name": CLEARED}
     assert scan(end_of_two) == {"name": "two"}
-    assert scan(10) == {}
     assert scan(0) == {}
-    assert scan_native_titles(tmp_path / "missing.jsonl", "pi", end_offset=99) == {}
+    # A prefix that can't be recovered in full is unknown, not empty:
+    # mid-line, beyond the end of the file, or unreadable.
+    assert scan(10) is None
+    assert scan(size + 1) is None
+    assert scan_native_titles(tmp_path / "missing.jsonl", "pi", end_offset=99) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -647,8 +650,9 @@ async def test_an_unterminated_name_is_not_applied_early(tmp_path) -> None:
     _write(transcript, [SESSION_RECORD, _name("done")])
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_name("in flight")))
-    size = transcript.stat().st_size
-    assert scan_native_titles(transcript, "pi", end_offset=size) == {"name": "done"}
+    complete = transcript.read_bytes().rindex(b"\n") + 1
+    assert scan_native_titles(transcript, "pi", end_offset=complete) == {"name": "done"}
+    assert scan_native_titles(transcript, "pi", end_offset=transcript.stat().st_size) is None
     repository = InMemoryRepository()
     observer = _observer(repository)
 

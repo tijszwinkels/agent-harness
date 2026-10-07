@@ -145,8 +145,40 @@ The harness does not own external processes and must not imply that it can prove
 their process state.
 
 An external session is `running` when transcript activity was observed in the
-last 15 seconds. Otherwise it is `idle`. The timestamp source is the observer's
-last accepted transcript event, not process table inspection.
+last 30 seconds (`DEFAULT_IDLE_AFTER_SECONDS`). Otherwise it is `idle`. The
+timestamp source is the observer's last accepted transcript event, not process
+table inspection.
+
+Transcript freshness is only a liveness signal for sessions the harness is not
+running. **While a session has a `queued` or `running` harness run, the run
+lifecycle owns its status**: `create_run` sets it `running`, `finish_run` sets
+it `idle` once no other run is queued or running. A harness run's rollout is
+bound to its session, so its transcript also feeds the freshness map, but 30 s
+of silence (a long tool call, extended thinking) is not the end of a run.
+
+Rule (`models.observed_status`): an observation never decides the status of a
+session that is archived (the user's action) or has an active run (the run
+lifecycle's) — in either direction, so silence cannot demote it and activity
+cannot override e.g. `waiting_for_input`. Enforced at three points:
+
+- the observer skips status flips for sessions with an active run, and the
+  freshness tick only demotes `running`;
+- materializing an observed `session.updated` (`merge_observed_session`)
+  keeps the stored status in those cases (other observer-owned fields still
+  apply), checked under the repository lock;
+- the announced event carries the same decision: the SQLite repository
+  rewrites the `session.updated` status in `append_event`. `DurableEventBus`
+  then materializes it synchronously, under the bus lock and with no await in
+  between (the repository lock itself is released between the two calls), so
+  on the harness's single event loop the durable log, replay and subscribers
+  match the stored row even if a run started while the publication waited for
+  the bus. This relies on all repository writers running on that event loop;
+  it is not atomic against writers on other threads. On the in-memory bus the observer reconciles before publishing and,
+  should the row still differ after materialization, publishes the stored
+  session as a correction.
+
+Once the run has finished, freshness applies again: a late transcript flush
+may mark the session `running`, and the next tick returns it to `idle`.
 
 Archiving an external session affects harness visibility only. It does not stop,
 signal, delete, or otherwise mutate the external backend process or transcript.

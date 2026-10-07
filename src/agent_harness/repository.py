@@ -15,6 +15,7 @@ from agent_harness.models import (
     StopReason,
     Usage,
     merge_observed_session,
+    observed_status,
     utc_now,
 )
 
@@ -198,6 +199,24 @@ class InMemoryRepository:
                 dropped.append(interrupted.model_copy(deep=True))
             return dropped
 
+    def has_active_run(self, session_id: str) -> bool:
+        """True while the session has a queued or running run."""
+        with self._lock:
+            return self._has_active_run_locked(session_id)
+
+    def observed_status_for(self, session_id: str, status: str) -> str:
+        """The status an observation of ``session_id`` would be stored with."""
+        with self._lock:
+            return observed_status(
+                status, self._sessions.get(session_id), has_active_run=self._has_active_run_locked(session_id)
+            )
+
+    def _has_active_run_locked(self, session_id: str) -> bool:
+        return any(
+            run.session_id == session_id and run.status in ("queued", "running")
+            for run in self._runs.values()
+        )
+
     def list_runs(self, session_id: str) -> list[Run]:
         with self._lock:
             if session_id not in self._sessions:
@@ -291,8 +310,12 @@ class InMemoryRepository:
             session_data = event.data.get("session")
             if isinstance(session_data, dict):
                 incoming = Session.model_validate(session_data)
+                # Read, merge and write under one lock so a concurrent
+                # create_run/finish_run cannot interleave with the
+                # active-run check.
                 with self._lock:
                     existing = self._sessions.get(incoming.id)
+                    active = self._has_active_run_locked(incoming.id)
                 # Preservation rules live in ``merge_observed_session``
                 # so the in-memory and SQLite paths can't drift: an
                 # observation refreshes the conversation's shape
@@ -301,9 +324,9 @@ class InMemoryRepository:
                 # (external observation of a harness-owned session),
                 # which once caused the bridge to adopt a channel away
                 # from its live session.
-                merged = merge_observed_session(incoming, existing)
-                if merged is not None:
-                    self.upsert_session(merged)
+                    merged = merge_observed_session(incoming, existing, has_active_run=active)
+                    if merged is not None:
+                        self.upsert_session(merged)
             return
 
         if event.event in {"run.started", "run.completed", "run.failed", "run.interrupted"}:

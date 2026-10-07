@@ -194,6 +194,10 @@ def read_pi_head_facts(
     after a restart the observer resumes mid-file with no idea what the
     session's cwd is. Rather than drop those turns, peek the head — the
     same move ``_peek_session_meta`` makes for codex. Never raises.
+
+    Titles are left out: the peek looks ahead of the observer's offset,
+    and a name taken from there would be replayed out of order (see
+    :func:`read_pi_native_title` for the offset-bounded scan).
     """
     facts = PiSessionFacts()
     try:
@@ -212,7 +216,7 @@ def read_pi_head_facts(
                 facts = facts.merged_with(pi_facts_from_record(record))
     except OSError:
         logger.debug("pi head peek: cannot read %s", path, exc_info=True)
-    return facts
+    return facts.conversation
 
 
 def read_pi_native_title(
@@ -236,7 +240,9 @@ def read_pi_native_title(
                 consumed += len(line)
                 if end_offset is not None and consumed > end_offset:
                     break
-                if b"session_info" not in line:
+                # An unterminated last line is still being written; the
+                # observer defers it too.
+                if not line.endswith(b"\n") or b"session_info" not in line:
                     continue
                 try:
                     record = json.loads(line)

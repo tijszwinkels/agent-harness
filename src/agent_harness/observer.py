@@ -421,16 +421,28 @@ class ExternalTranscriptObserver:
         except Exception:
             logger.exception("Failed to backfill pi native titles from repository")
             return
+        offsets_by_resolved: dict[Path, int] | None = None
         for session in sessions:
             if session.backend != "pi" or session.title is not None:
                 continue
             if session.pi_transcript_path is None or not native_title_may_replace(session):
                 continue
             path = Path(session.pi_transcript_path)
-            # 0 means "no persisted offset under this key" (for a session
-            # the observer already created, typically a different spelling
-            # of the path) — fall back to the whole file.
-            end_offset = self._state.next_offset(path) or None
+            end_offset = self._state.next_offset(path)
+            if end_offset == 0:
+                # ``pi_transcript_path`` is stored resolved while offsets
+                # are keyed by the watched spelling (e.g. under a
+                # symlinked root). Resolve the keys once, lazily.
+                if offsets_by_resolved is None:
+                    offsets_by_resolved = {
+                        _absolute(key): offset
+                        for key, offset in self._state.next_offsets.items()
+                    }
+                end_offset = offsets_by_resolved.get(_absolute(path), 0)
+            if end_offset == 0:
+                # Nothing consumed yet: the tail will replay every name in
+                # order, and scanning ahead of it would reorder them.
+                continue
             title = read_pi_native_title(path, end_offset=end_offset)
             if title is None:
                 continue
@@ -1022,15 +1034,26 @@ class ExternalTranscriptObserver:
         """
         # Parsers synthesize sessions without harness overrides. Keep the
         # published payload consistent with PATCH, including an explicit clear.
+        # The title follows the same precedence the repository applies, so
+        # subscribers never see a native name the stored row refused.
         session_data = event.data.get("session")
         if (
             event.event == "session.updated" and isinstance(session_data, dict)
             and event.session_id and self._repository is not None
             and self._session_exists(event.session_id)
         ):
-            effort = self._repository.get_session(event.session_id).effort
+            existing = self._repository.get_session(event.session_id)
+            overrides: dict[str, Any] = {"effort": existing.effort}
+            native_title = (
+                session_data.get("title_source") == "native"
+                and session_data.get("title") is not None
+                and native_title_may_replace(existing)
+            )
+            if not native_title:
+                overrides["title"] = existing.title
+                overrides["title_source"] = existing.title_source
             event = event.model_copy(update={
-                "data": {**event.data, "session": {**session_data, "effort": effort}},
+                "data": {**event.data, "session": {**session_data, **overrides}},
             })
         published_event: Event
         try:
@@ -1286,10 +1309,11 @@ class ExternalTranscriptObserver:
                 already_announced=True,
             )
             return
+        # The head peek deliberately carries no title: it looks ahead of
+        # the offset. Resuming mid-file, the current name may sit anywhere
+        # before the offset, so scan exactly that consumed prefix. From
+        # offset 0 the tail replays every ``session_info`` in order.
         facts = read_pi_head_facts(path)
-        # Resuming mid-file: the current name may sit anywhere before the
-        # offset, well past the head. From offset 0 the tail itself will
-        # replay every ``session_info`` in order, so no scan is needed.
         offset = self._state.next_offset(path)
         if offset > 0:
             title = read_pi_native_title(path, end_offset=offset)

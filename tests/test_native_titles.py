@@ -438,21 +438,66 @@ async def test_startup_backfill_names_pre_existing_sessions(tmp_path) -> None:
         reopened.close()
 
 
+def _backfill_repository(transcript: Path, *, offset: int | None, **sessions):
+    # SQLite: the offset store lives there, as in production.
+    repository = open_sqlite_repository(transcript.with_suffix(".db"))
+    if offset is not None:
+        repository.set_observer_offset(str(transcript), offset)
+    base = dict(backend="pi", project=Project(path=CWD, name="project"),
+                pi_transcript_path=str(transcript.resolve()))
+    for session_id, update in sessions.items():
+        repository.upsert_session(Session(id=session_id, **base, **update))
+    return repository
+
+
 def test_startup_backfill_leaves_titled_and_harness_sessions_alone(tmp_path) -> None:
     transcript = _transcript(tmp_path)
     _write(transcript, [SESSION_RECORD, _name("native")])
-    repository = InMemoryRepository()
-    base = dict(backend="pi", project=Project(path=CWD, name="project"),
-                pi_transcript_path=str(transcript))
-    repository.upsert_session(Session(id="ses_a", origin="external", title="explicit", **base))
-    repository.upsert_session(Session(id="ses_b", origin="harness", **base))
-    repository.upsert_session(Session(id="ses_c", origin="external", **base))
+    repository = _backfill_repository(
+        transcript,
+        offset=transcript.stat().st_size,
+        ses_a={"origin": "external", "title": "explicit"},
+        ses_b={"origin": "harness"},
+        ses_c={"origin": "external"},
+    )
 
     _observer(repository)
 
     assert repository.get_session("ses_a").title == "explicit"
     assert repository.get_session("ses_b").title is None
     assert repository.get_session("ses_c").title == "native"
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_never_reads_ahead_of_an_unconsumed_transcript(tmp_path) -> None:
+    """No consumed prefix (offset missing or zero): the tail replays every
+    name in order, so the backfill must not jump ahead to the last one."""
+    for offset in (None, 0):
+        home = tmp_path / f"home-{offset}"
+        transcript = _transcript(home)
+        _write(transcript, [SESSION_RECORD, _name("first"), _name("second")])
+        repository = _backfill_repository(transcript, offset=offset, ses_x={"origin": "external"})
+        _observer(repository)
+        assert repository.get_session("ses_x").title is None
+
+
+def test_startup_backfill_resolves_a_differently_spelled_offset_key(tmp_path) -> None:
+    """Offsets are keyed by the watched spelling (here under a symlinked
+    root); ``pi_transcript_path`` is stored resolved."""
+    real = tmp_path / "real"
+    transcript = _transcript(real)
+    _write(transcript, [SESSION_RECORD, _name("first")])
+    end_of_first = transcript.stat().st_size
+    _append(transcript, _name("unread"))
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    watched = link / transcript.relative_to(real)
+    repository = _backfill_repository(transcript, offset=None, ses_x={"origin": "external"})
+    repository.set_observer_offset(str(watched), end_of_first)
+
+    _observer(repository)
+
+    assert repository.get_session("ses_x").title == "first"
 
 
 # --------------------------------------------------------------------------- #
@@ -514,3 +559,88 @@ async def test_claude_rename_leaves_harness_sessions_alone(tmp_path) -> None:
     await observer.tail_file(transcript)
 
     assert repository.get_session(CLAUDE_SESSION_ID).title == "bridge channel"
+
+
+# --------------------------------------------------------------------------- #
+# Review regressions                                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _repositories(tmp_path):
+    yield "memory", InMemoryRepository(), None
+    sqlite = open_sqlite_repository(tmp_path / "harness.db")
+    yield "sqlite", sqlite, DurableEventBus(sqlite)
+
+
+@pytest.mark.asyncio
+async def test_published_payloads_respect_an_explicit_title(tmp_path) -> None:
+    """Announcements after a PATCH must advertise what the row stores, not
+    the transcript's name: subscribers use the payload as the label."""
+    for kind, repository, bus in _repositories(tmp_path):
+        transcript = _transcript(tmp_path / kind)
+        _write(transcript, [SESSION_RECORD, _name("native")])
+        observer = _observer(repository, bus=bus)
+        await observer.tail_file(transcript)
+        repository.patch_session(SESSION_ID, {"title": "channel", "title_source": None})
+
+        _append(transcript, MODEL_CHANGE, ASSISTANT_RECORD, _name("native 2"))
+        published = await observer.tail_file(transcript)
+
+        sessions = [e.data["session"] for e in published if e.event == "session.updated"]
+        assert sessions, kind
+        assert {(s["title"], s["title_source"]) for s in sessions} == {("channel", None)}, kind
+        stored = repository.get_session(SESSION_ID)
+        assert (stored.title, stored.title_source) == ("channel", None), kind
+
+
+@pytest.mark.asyncio
+async def test_published_payloads_carry_a_native_title_once_accepted(tmp_path) -> None:
+    transcript = _transcript(tmp_path)
+    _write(transcript, [SESSION_RECORD, _name("native")])
+    observer = _observer(InMemoryRepository())
+    await observer.tail_file(transcript)
+
+    _append(transcript, MODEL_CHANGE)
+    published = await observer.tail_file(transcript)
+
+    assert [(e.data["session"]["title"], e.data["session"]["title_source"])
+            for e in published] == [("native", "native")]
+
+
+@pytest.mark.asyncio
+async def test_discovery_publishes_names_in_transcript_order(tmp_path) -> None:
+    for kind, repository, bus in _repositories(tmp_path):
+        transcript = _transcript(tmp_path / kind)
+        _write(transcript, [SESSION_RECORD, _name("first"), _name("second")])
+
+        published = await _observer(repository, bus=bus).tail_file(transcript)
+
+        assert _titles(published) == [None, "first", "second"], kind
+        assert repository.get_session(SESSION_ID).title == "second", kind
+
+
+@pytest.mark.asyncio
+async def test_an_unterminated_name_is_not_applied_early(tmp_path) -> None:
+    transcript = _transcript(tmp_path)
+    _write(transcript, [SESSION_RECORD, _name("done")])
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_name("in flight")))
+    assert read_pi_native_title(transcript) == "done"
+    repository = InMemoryRepository()
+    observer = _observer(repository)
+
+    await observer.tail_file(transcript)
+    assert repository.get_session(SESSION_ID).title == "done"
+
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    await observer.tail_file(transcript)
+    assert repository.get_session(SESSION_ID).title == "in flight"
+
+
+def test_head_peek_carries_no_title(tmp_path) -> None:
+    from agent_harness.pi_discovery import read_pi_head_facts
+
+    path = tmp_path / "t.jsonl"
+    _write(path, [SESSION_RECORD, _name("ahead")])
+    assert read_pi_head_facts(path).title is None

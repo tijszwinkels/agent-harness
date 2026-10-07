@@ -37,7 +37,10 @@ session whose title is unset or itself native. It never replaces an
 explicit title, e.g. the bridge's channel name, and never touches a
 harness-owned session. PATCHing `title` makes it explicit
 (`title_source: null`); later native renames are then ignored. Forks
-inherit `title_source` together with an inherited title.
+inherit `title_source` together with an inherited title. The observer
+applies the same decision to every published `session.updated` payload
+for an existing session, so subscribers see the stored title, never a
+native name the row refused.
 
 **Names.** Whitespace runs, including newlines, collapse to one space
 (as pi does). Missing, non-string and blank names are ignored. pi itself
@@ -53,6 +56,10 @@ ignores title-only changes, because a pi announcement marks the session
 `running`. A metadata-only transcript therefore stays idle however
 often it is renamed.
 
+**Order.** Names are applied in transcript order. The bounded head
+peek, which looks ahead of the offset, carries no title, and an
+unterminated last line is never read for a name.
+
 **Restart.**
 - Known session: registry hydration seeds the stored native title, so
   later announcements carry it and later renames are applied.
@@ -61,7 +68,11 @@ often it is renamed.
   The bounded head peek would miss names further into the file.
 - Startup backfill: untitled external pi sessions that have a recorded
   `pi_transcript_path` get the latest name before the persisted offset.
-  Later records are tailed normally, which keeps renames in order. The
+  The offset is looked up by the stored resolved path, falling back to
+  resolving the watched spellings, e.g. under a symlinked root. Rows
+  with no consumed prefix are skipped, because the tail replays their
+  names. Later records are tailed normally, which keeps renames in
+  order. The
   row is written directly, with no event and no `updated_at` bump, like
   the codex resume-id backfill. The scan filters lines on a byte
   substring before decoding JSON (~0.3 s warm for ~400 MB of
@@ -77,3 +88,9 @@ often it is renamed.
 - Native renames are not applied to harness-owned sessions, even
   untitled ones.
 - Clearing a pi name does not clear the harness title.
+- Rollback: `Session` validates with `extra="forbid"`, and this
+  revision writes `title_source` (including `null`) into every session
+  row it saves. Before rolling back to an older harness, restore a
+  pre-deploy database backup, or strip the key, e.g.
+  `update sessions set payload = json_remove(payload, '$.title_source')`
+  with the harness stopped. Earlier added fields carry the same hazard.

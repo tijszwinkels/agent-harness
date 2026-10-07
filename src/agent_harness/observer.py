@@ -26,12 +26,15 @@ from agent_harness.models import (
     ToolResultBlock,
     ToolUseBlock,
     Usage,
+    native_title_may_replace,
+    normalize_native_title,
     utc_now,
 )
 from agent_harness.pi_discovery import (
     PiSessionFacts,
     PiTranscriptRegistry,
     read_pi_head_facts,
+    read_pi_native_title,
 )
 from agent_harness.repository import (
     InMemoryRepository,
@@ -109,8 +112,11 @@ def _codex_resume_id_from_external_session_id(session_id: str) -> str | None:
 #   conversational.
 # - ``queue-operation``: claude-code's internal queue housekeeping.
 # - ``system``: claude system-message hooks; not conversational.
+# - ``custom-title``: the user's ``/rename``. Not a message; the observer
+#   propagates it to ``Session.title`` (see ``native_title_from_record``).
 _IGNORED_CLAUDE_RECORD_TYPES = {
     "attachment",
+    "custom-title",
     "last-prompt",
     "pr-link",
     "queue-operation",
@@ -393,6 +399,59 @@ class ExternalTranscriptObserver:
         # codex_resume_id on existing external codex sessions whose
         # field is None. One-shot per process startup.
         self._backfill_codex_resume_id_from_external_ids()
+        # Native conversation names written before this process (or
+        # before the harness learned to read them) sit behind the
+        # persisted offsets and would never be tailed again.
+        self._backfill_pi_native_titles()
+
+    def _backfill_pi_native_titles(self) -> None:
+        """Give untitled external pi sessions their transcript's name.
+
+        One pass per startup over external pi sessions that have no title
+        and a recorded transcript. Reads each transcript only up to the
+        persisted offset — later records are still to be tailed, and
+        scanning them here would replay their names out of order. Writes
+        the row directly, like the codex backfill: no event, no
+        ``updated_at`` bump, so a startup never looks like activity.
+        """
+        if self._repository is None:
+            return
+        try:
+            sessions = self._repository.list_sessions()
+        except Exception:
+            logger.exception("Failed to backfill pi native titles from repository")
+            return
+        offsets_by_resolved: dict[Path, int] | None = None
+        for session in sessions:
+            if session.backend != "pi" or session.title is not None:
+                continue
+            if session.pi_transcript_path is None or not native_title_may_replace(session):
+                continue
+            path = Path(session.pi_transcript_path)
+            end_offset = self._state.next_offset(path)
+            if end_offset == 0:
+                # ``pi_transcript_path`` is stored resolved while offsets
+                # are keyed by the watched spelling (e.g. under a
+                # symlinked root). Resolve the keys once, lazily.
+                if offsets_by_resolved is None:
+                    offsets_by_resolved = {
+                        _absolute(key): offset
+                        for key, offset in self._state.next_offsets.items()
+                    }
+                end_offset = offsets_by_resolved.get(_absolute(path), 0)
+            if end_offset == 0:
+                # Nothing consumed yet: the tail will replay every name in
+                # order, and scanning ahead of it would reorder them.
+                continue
+            title = read_pi_native_title(path, end_offset=end_offset)
+            if title is None:
+                continue
+            try:
+                self._repository.upsert_session(
+                    session.model_copy(update={"title": title, "title_source": "native"})
+                )
+            except Exception:
+                logger.exception("Failed to write back pi native title for %s", session.id)
 
     def _backfill_codex_resume_id_from_external_ids(self) -> None:
         """Populate ``Session.codex_resume_id`` on existing
@@ -910,7 +969,50 @@ class ExternalTranscriptObserver:
                 )
                 if kick is not None:
                     published.append(kick)
+        # Deliberately outside the loop above: a rename is metadata, so it
+        # neither refreshes ``_last_event_at`` nor flips the session to
+        # running.
+        title = native_title_from_line(resolved_identity.backend, line)
+        if title is not None:
+            renamed = await self._maybe_publish_native_title(
+                resolved_identity, title, offset=offset
+            )
+            if renamed is not None:
+                published.append(renamed)
         return published
+
+    async def _maybe_publish_native_title(
+        self,
+        identity: TranscriptIdentity,
+        title: str,
+        *,
+        offset: int | None,
+    ) -> Event | None:
+        """Propagate a backend-native rename onto an existing session.
+
+        Publishes the stored session with only ``title``/``title_source``
+        changed — status and ``updated_at`` are carried over, so the rename
+        is visible to subscribers without reading as conversation activity.
+        Skipped when the session doesn't exist yet (pi carries the name in
+        its discovery announcement instead), is harness-owned, holds an
+        explicit title, or already has this name.
+        """
+        session = self._session_if_exists(identity.session_id)
+        if session is None or not native_title_may_replace(session):
+            return None
+        if session.title == title:
+            return None
+        updated = session.model_copy(update={"title": title, "title_source": "native"})
+        return await self._publish_via_bus(
+            Event(
+                event="session.updated",
+                session_id=session.id,
+                data={
+                    **_source_data(identity, offset=offset),
+                    "session": updated.model_dump(mode="json"),
+                },
+            )
+        )
 
     async def _publish_via_bus(self, event: Event) -> Event | None:
         """Publish through the bus and route side effects.
@@ -932,15 +1034,26 @@ class ExternalTranscriptObserver:
         """
         # Parsers synthesize sessions without harness overrides. Keep the
         # published payload consistent with PATCH, including an explicit clear.
+        # The title follows the same precedence the repository applies, so
+        # subscribers never see a native name the stored row refused.
         session_data = event.data.get("session")
         if (
             event.event == "session.updated" and isinstance(session_data, dict)
             and event.session_id and self._repository is not None
             and self._session_exists(event.session_id)
         ):
-            effort = self._repository.get_session(event.session_id).effort
+            existing = self._repository.get_session(event.session_id)
+            overrides: dict[str, Any] = {"effort": existing.effort}
+            native_title = (
+                session_data.get("title_source") == "native"
+                and session_data.get("title") is not None
+                and native_title_may_replace(existing)
+            )
+            if not native_title:
+                overrides["title"] = existing.title
+                overrides["title_source"] = existing.title_source
             event = event.model_copy(update={
-                "data": {**event.data, "session": {**session_data, "effort": effort}},
+                "data": {**event.data, "session": {**session_data, **overrides}},
             })
         published_event: Event
         try:
@@ -1191,11 +1304,22 @@ class ExternalTranscriptObserver:
                     cwd=session.project.path,
                     model=session.model,
                     created_at=session.created_at,
+                    title=session.title if session.title_source == "native" else None,
                 ),
                 already_announced=True,
             )
             return
-        self._pi_registry.hydrate(path, read_pi_head_facts(path))
+        # The head peek deliberately carries no title: it looks ahead of
+        # the offset. Resuming mid-file, the current name may sit anywhere
+        # before the offset, so scan exactly that consumed prefix. From
+        # offset 0 the tail replays every ``session_info`` in order.
+        facts = read_pi_head_facts(path)
+        offset = self._state.next_offset(path)
+        if offset > 0:
+            title = read_pi_native_title(path, end_offset=offset)
+            if title is not None:
+                facts = facts.merged_with(PiSessionFacts(title=title))
+        self._pi_registry.hydrate(path, facts)
 
     def _keep_pi_event(self, event: Event, *, path: Path) -> bool:
         """Whether an observer-synthesized pi event should be published.
@@ -1829,8 +1953,9 @@ def _parse_codex_record(
 # - ``model_change`` / ``thinking_level_change``: settings changes.
 # - ``custom`` / ``custom_message``: extension bookkeeping (e.g.
 #   plannotator phase).
-# - ``session_info``: pi's session-name marker (mirrors codex
-#   ``session_meta`` — observability only).
+# - ``session_info``: pi's session-name marker. Not a message; the
+#   observer propagates its name to ``Session.title`` (see
+#   ``native_title_from_record``).
 # - ``compaction`` / ``reload`` / ``branch_summary``: transcript
 #   maintenance markers.
 # - ``provider_transport_failure``: a transport diagnostic; the
@@ -2006,6 +2131,9 @@ def _pi_session_events(
         # ``Session.pi_transcript_path``.
         pi_transcript_path=str(_absolute(identity.path)),
         **({"created_at": facts.created_at} if facts.created_at else {}),
+        # Native name known at announcement time. ``merge_observed_session``
+        # decides whether it may land (never over an explicit title).
+        **({"title": facts.title, "title_source": "native"} if facts.title else {}),
     )
     return [
         Event(
@@ -2017,6 +2145,43 @@ def _pi_session_events(
             },
         )
     ]
+
+
+def native_title_from_record(backend: BackendName, record: object) -> str | None:
+    """The conversation name a transcript record sets, else ``None``.
+
+    pi: ``session_info.name`` (``/name``, ``--name``, ``setSessionName``).
+    claude: ``custom-title.customTitle`` (``/rename``). claude's generated
+    ``ai-title`` is deliberately not a source, and codex keeps thread names
+    outside its rollouts (``session_index.jsonl``), so codex has none.
+    Missing, malformed and blank names are ``None`` — never a clear.
+    """
+    if not isinstance(record, Mapping):
+        return None
+    record_type = record.get("type")
+    if backend == "pi" and record_type == "session_info":
+        return normalize_native_title(record.get("name"))
+    if backend == "claude-code" and record_type == "custom-title":
+        return normalize_native_title(record.get("customTitle"))
+    return None
+
+
+# Cheap pre-filter so ordinary lines are not JSON-decoded a second time.
+_NATIVE_TITLE_MARKERS: dict[str, str] = {
+    "pi": "session_info",
+    "claude-code": "custom-title",
+}
+
+
+def native_title_from_line(backend: BackendName, line: str) -> str | None:
+    marker = _NATIVE_TITLE_MARKERS.get(backend)
+    if marker is None or marker not in line:
+        return None
+    try:
+        record = json.loads(line)
+    except JSONDecodeError:
+        return None
+    return native_title_from_record(backend, record)
 
 
 def _session_event_if_complete(

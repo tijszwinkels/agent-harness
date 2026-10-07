@@ -191,8 +191,11 @@ def create_app(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="patch field cannot be null; omit the field to leave it unchanged",
             )
+        # A client-supplied title is explicit: it stops tracking the
+        # backend's native conversation name (see ``Session.title_source``).
+        repo_fields = {**fields, "title_source": None} if "title" in fields else fields
         try:
-            session = repo.patch_session(session_id, fields)
+            session = repo.patch_session(session_id, repo_fields)
         except SessionNotFoundError as exc:
             logger.warning("Session patch failed because session was not found: %s", session_id)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc

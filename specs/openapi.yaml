@@ -403,6 +403,17 @@ components:
           $ref: "#/components/schemas/Project"
         title:
           type: [string, "null"]
+        title_source:
+          type: [string, "null"]
+          enum: [native, null]
+          description: |
+            Provenance of `title`. `native`: copied by the observer from the backend's own
+            conversation name (pi `session_info.name`, claude `custom-title`) on an
+            `origin: external` session, and updated when that name changes. Null: explicit
+            (set via create, PATCH or fork) or no title. A native name never replaces an
+            explicit title; PATCHing `title` makes it explicit. Blank native names are
+            ignored rather than clearing the title. Renames do not change `status` or
+            `updated_at`.
         bypass_permissions:
           type: boolean
           default: false

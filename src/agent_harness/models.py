@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 BackendName = Literal["claude-code", "codex", "pi"]
 Origin = Literal["harness", "external"]
 SessionStatus = Literal["idle", "running", "waiting_for_input", "archived"]
+TitleSource = Literal["native"]
 RunStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
 RUN_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "interrupted"})
 StopReason = Literal["end_turn", "tool_use", "max_tokens", "interrupted"]
@@ -167,6 +168,14 @@ class Session(HarnessModel):
     effort: str | None = Field(default=None, min_length=1)
     project: Project
     title: str | None = None
+    # Provenance of ``title``. ``"native"`` means the observer copied it
+    # from the backend's own conversation name (pi ``session_info.name``,
+    # claude ``custom-title``) and may replace it when that name changes.
+    # ``None`` means explicit — set by a harness client (create, PATCH,
+    # fork) — or no title at all; a native name never overwrites an
+    # explicit title. Rows written before this field existed load as
+    # ``None``, so their titles are treated as explicit.
+    title_source: TitleSource | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     status: SessionStatus = "idle"
@@ -222,6 +231,7 @@ class Session(HarnessModel):
             effort=parent.effort,
             project=parent.project.model_copy(deep=True),
             title=title if title is not None else parent.title,
+            title_source=None if title is not None else parent.title_source,
             bypass_permissions=parent.bypass_permissions,
             origin="harness",
             forked_from=parent.id,
@@ -272,7 +282,40 @@ def merge_observed_session(incoming: Session, existing: Session | None) -> Sessi
         value = getattr(incoming, field)
         if value is not None:
             updates[field] = value
+    if (
+        incoming.title_source == "native"
+        and incoming.title is not None
+        and native_title_may_replace(existing)
+    ):
+        updates["title"] = incoming.title
+        updates["title_source"] = "native"
     return existing.model_copy(update=updates)
+
+
+def normalize_native_title(value: object) -> str | None:
+    """A backend-native conversation name as a single-line title, or ``None``.
+
+    Whitespace runs (including newlines) collapse to one space, mirroring
+    pi's own normalization. Non-strings and blank names yield ``None``,
+    which callers treat as "no name here" — never as a request to clear
+    an existing title.
+    """
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split()) or None
+
+
+def native_title_may_replace(session: Session) -> bool:
+    """Whether a backend-native conversation name may set ``session.title``.
+
+    Only observed sessions take native names, and only while their title
+    is unset or itself native. An explicit title (create / PATCH / fork,
+    e.g. the bridge's channel name) always wins over a native rename, and
+    a harness-owned session's title belongs to the harness client.
+    """
+    return session.origin == "external" and (
+        session.title is None or session.title_source == "native"
+    )
 
 
 class Event(HarnessModel):

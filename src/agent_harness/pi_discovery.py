@@ -21,13 +21,11 @@ from __future__ import annotations
 import json
 import logging
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Mapping
-
-from agent_harness.models import normalize_native_title
 
 logger = logging.getLogger(__name__)
 
@@ -64,20 +62,10 @@ class PiSessionFacts:
     # to have been created the moment the harness first noticed it, which
     # reorders ``.sessions`` and misreports the session's age.
     created_at: datetime | None = None
-    # pi's conversation name: the latest valid ``session_info.name``
-    # (``/name``, ``--name``, ``pi.setSessionName()``). Not a conversation
-    # fact — a rename alone never warrants a ``running`` announcement — so
-    # announcements ignore it when deciding whether anything changed.
-    title: str | None = None
 
     @property
     def is_announceable(self) -> bool:
         return bool(self.cwd)
-
-    @property
-    def conversation(self) -> "PiSessionFacts":
-        """These facts without the name — what an announcement compares."""
-        return replace(self, title=None)
 
     @property
     def qualified_model(self) -> str | None:
@@ -115,7 +103,6 @@ class PiSessionFacts:
             provider=other.provider or self.provider,
             model=other.model or self.model,
             created_at=other.created_at or self.created_at,
-            title=other.title or self.title,
         )
 
 
@@ -153,10 +140,6 @@ def pi_facts_from_record(record: object) -> PiSessionFacts:
         )
     if record_type == "model_change":
         return _model_facts(record.get("provider"), record.get("modelId"))
-    if record_type == "session_info":
-        # pi itself treats an empty name as "cleared"; the harness keeps
-        # the last valid name instead (see ``normalize_native_title``).
-        return PiSessionFacts(title=normalize_native_title(record.get("name")))
     if record_type == "message":
         # pi stamps ``provider`` and ``model`` on each assistant record.
         # That is the only fact source left for a transcript whose
@@ -194,10 +177,6 @@ def read_pi_head_facts(
     after a restart the observer resumes mid-file with no idea what the
     session's cwd is. Rather than drop those turns, peek the head — the
     same move ``_peek_session_meta`` makes for codex. Never raises.
-
-    Titles are left out: the peek looks ahead of the observer's offset,
-    and a name taken from there would be replayed out of order (see
-    :func:`read_pi_native_title` for the offset-bounded scan).
     """
     facts = PiSessionFacts()
     try:
@@ -216,43 +195,7 @@ def read_pi_head_facts(
                 facts = facts.merged_with(pi_facts_from_record(record))
     except OSError:
         logger.debug("pi head peek: cannot read %s", path, exc_info=True)
-    return facts.conversation
-
-
-def read_pi_native_title(
-    path: str | Path,
-    *,
-    end_offset: int | None = None,
-) -> str | None:
-    """The latest valid ``session_info`` name in a transcript, else ``None``.
-
-    Unlike the head peek this reads the whole file (or its first
-    ``end_offset`` bytes): pi appends ``session_info`` whenever the name
-    changes, so the current name can sit anywhere. Lines are filtered on a
-    byte substring before any JSON parsing, which keeps a scan of a large
-    transcript cheap. Never raises.
-    """
-    title: str | None = None
-    try:
-        with Path(path).open("rb") as handle:
-            consumed = 0
-            for line in handle:
-                consumed += len(line)
-                if end_offset is not None and consumed > end_offset:
-                    break
-                # An unterminated last line is still being written; the
-                # observer defers it too.
-                if not line.endswith(b"\n") or b"session_info" not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except (JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if isinstance(record, Mapping) and record.get("type") == "session_info":
-                    title = normalize_native_title(record.get("name")) or title
-    except OSError:
-        logger.debug("pi title scan: cannot read %s", path, exc_info=True)
-    return title
+    return facts
 
 
 @dataclass(slots=True)
@@ -337,17 +280,12 @@ class PiTranscriptRegistry:
         ``None`` until the cwd is known, and again whenever the facts are
         unchanged since the last announcement — so a re-tail, a duplicate
         watchfiles event or a long run of message records produces exactly
-        one session row, not one per line. A changed ``title`` alone does
-        not count: an announcement marks the session ``running``, and a
-        rename is not activity. The observer propagates renames separately.
+        one session row, not one per line.
         """
         entry = self._entries.get(Path(path))
         if entry is None or not entry.facts.is_announceable:
             return None
-        if (
-            entry.announced is not None
-            and entry.announced.conversation == entry.facts.conversation
-        ):
+        if entry.announced == entry.facts:
             return None
         entry.announced = entry.facts
         return entry.facts
@@ -363,5 +301,4 @@ __all__ = [
     "PiTranscriptRegistry",
     "pi_facts_from_record",
     "read_pi_head_facts",
-    "read_pi_native_title",
 ]

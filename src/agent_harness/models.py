@@ -169,12 +169,19 @@ class Session(HarnessModel):
     project: Project
     title: str | None = None
     # Provenance of ``title``. ``"native"`` means the observer copied it
-    # from the backend's own conversation name (pi ``session_info.name``,
-    # claude ``custom-title``) and may replace it when that name changes.
-    # ``None`` means explicit — set by a harness client (create, PATCH,
-    # fork) — or no title at all; a native name never overwrites an
-    # explicit title. Rows written before this field existed load as
-    # ``None``, so their titles are treated as explicit.
+    # from the backend's own conversation name (pi ``session_info``,
+    # claude ``custom-title``/``ai-title``, the codex name index) and may
+    # replace or clear it when that name changes. ``None`` means explicit —
+    # set by a harness client (create, PATCH, fork) — or no title at all;
+    # a native name never overwrites or clears an explicit title. Rows
+    # written before this field existed load as ``None``, so their titles
+    # are treated as explicit.
+    #
+    # ``title=None`` with ``title_source="native"`` means "the backend's
+    # name was deliberately removed": consumers fall back to project/id,
+    # and a later native name may set it again. In an observation it is
+    # the removal instruction; stored, it records the same state, so the
+    # row and the published payload agree.
     title_source: TitleSource | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -282,27 +289,31 @@ def merge_observed_session(incoming: Session, existing: Session | None) -> Sessi
         value = getattr(incoming, field)
         if value is not None:
             updates[field] = value
-    if (
-        incoming.title_source == "native"
-        and incoming.title is not None
-        and native_title_may_replace(existing)
-    ):
-        updates["title"] = incoming.title
-        updates["title_source"] = "native"
+    updates["title"], updates["title_source"] = observed_title(
+        incoming.title, incoming.title_source, existing
+    )
     return existing.model_copy(update=updates)
 
 
-def normalize_native_title(value: object) -> str | None:
-    """A backend-native conversation name as a single-line title, or ``None``.
+def observed_title(
+    title: object, title_source: object, existing: Session
+) -> tuple[str | None, TitleSource | None]:
+    """The ``(title, title_source)`` to keep after an observation.
 
-    Whitespace runs (including newlines) collapse to one space, mirroring
-    pi's own normalization. Non-strings and blank names yield ``None``,
-    which callers treat as "no name here" — never as a request to clear
-    an existing title.
+    Shared by materialization and by the observer's outgoing payloads so
+    the stored row and what subscribers see can't disagree. Only a
+    ``native`` observation can change anything: a name replaces an
+    unset or native title; a removal (null name) clears a native title
+    to null/``native`` so consumers fall back to project/id. Generic
+    observations — which carry no title — leave the stored title alone.
     """
-    if not isinstance(value, str):
-        return None
-    return " ".join(value.split()) or None
+    if title_source == "native":
+        if isinstance(title, str):
+            if native_title_may_replace(existing):
+                return title, "native"
+        elif title is None and existing.origin == "external" and existing.title_source == "native":
+            return None, "native"
+    return existing.title, existing.title_source
 
 
 def native_title_may_replace(session: Session) -> bool:

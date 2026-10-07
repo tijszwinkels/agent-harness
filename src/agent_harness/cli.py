@@ -67,6 +67,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Observe Claude Code and Codex transcript roots under HOME. This is the default when those roots exist.",
     )
     serve.add_argument(
+        "--codex-name-index",
+        help=(
+            "Codex thread-name index to read (session_index.jsonl). Defaults to the "
+            "index beside an observed <CODEX_HOME>/sessions root; set it for a custom "
+            "codex home or root."
+        ),
+    )
+    serve.add_argument(
         "--no-observer",
         action="store_true",
         help="Disable automatic transcript observation.",
@@ -123,16 +131,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _observer_settings_from_args(args: argparse.Namespace) -> ObserverSettings:
-    settings = ObserverSettings.from_roots(args.observe_root)
+    index = getattr(args, "codex_name_index", None)
+    settings = ObserverSettings.from_roots(args.observe_root, codex_name_index=index)
     if args.no_observer:
         return settings
     if args.observe_default_roots:
         default_settings = ObserverSettings.default_transcript_roots()
-        settings = ObserverSettings.from_roots([*settings.roots, *default_settings.roots])
     else:
         default_settings = ObserverSettings.existing_default_transcript_roots()
-        settings = ObserverSettings.from_roots([*settings.roots, *default_settings.roots])
-    return settings
+    return ObserverSettings.from_roots(
+        [*settings.roots, *default_settings.roots], codex_name_index=index
+    )
 
 
 def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings):

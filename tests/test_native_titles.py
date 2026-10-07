@@ -21,19 +21,20 @@ from agent_harness.models import (
     Project,
     Session,
     merge_observed_session,
-    normalize_native_title,
+)
+from agent_harness.native_titles import (
+    CLEARED,
+    effective_native_title,
+    native_name,
+    native_title_slot,
+    scan_native_titles,
 )
 from agent_harness.observer import (
     ExternalTranscriptObserver,
     claude_transcript_path,
-    native_title_from_record,
     pi_transcript_path,
 )
-from agent_harness.pi_discovery import (
-    PiTranscriptRegistry,
-    pi_facts_from_record,
-    read_pi_native_title,
-)
+from agent_harness.pi_discovery import PiTranscriptRegistry, read_pi_head_facts
 from agent_harness.repository import InMemoryRepository
 from agent_harness.storage import open_sqlite_repository
 
@@ -110,66 +111,72 @@ def _titles(events) -> list[str | None]:
 # --------------------------------------------------------------------------- #
 
 
-def test_session_info_name_becomes_the_title_fact() -> None:
-    assert pi_facts_from_record(_name("Refactor auth")).title == "Refactor auth"
+def test_session_info_name_fills_the_pi_slot() -> None:
+    assert native_title_slot("pi", _name("Refactor auth")) == ("name", "Refactor auth")
 
 
-@pytest.mark.parametrize(
-    "name", [None, "", "   ", "\n\t", 42, ["x"], {"name": "x"}], ids=repr
-)
-def test_missing_blank_or_malformed_names_carry_no_title(name) -> None:
-    assert pi_facts_from_record(_name(name)).title is None
-    assert pi_facts_from_record({"type": "session_info"}).title is None
+@pytest.mark.parametrize("name", ["", "   ", "\n\t"], ids=repr)
+def test_an_explicit_blank_name_is_a_removal(name) -> None:
+    assert native_title_slot("pi", _name(name)) == ("name", CLEARED)
+
+
+@pytest.mark.parametrize("name", [None, 42, ["x"], {"name": "x"}], ids=repr)
+def test_missing_or_malformed_names_say_nothing(name) -> None:
+    assert native_title_slot("pi", _name(name)) is None
+    assert native_title_slot("pi", {"type": "session_info"}) is None
+    assert native_title_slot("pi", ["session_info"]) is None
 
 
 def test_names_are_normalized_to_one_line() -> None:
-    assert normalize_native_title("  Fix\nthe   bug \r\n") == "Fix the bug"
+    assert native_name("  Fix\nthe   bug \r\n") == "Fix the bug"
 
 
 def test_native_title_sources_per_backend() -> None:
-    assert native_title_from_record("pi", _name("p")) == "p"
-    assert (
-        native_title_from_record("claude-code", {"type": "custom-title", "customTitle": "c"})
-        == "c"
+    assert native_title_slot("claude-code", {"type": "custom-title", "customTitle": "c"}) == (
+        "custom", "c",
     )
-    # Generated titles are not the user's name for the conversation.
-    assert native_title_from_record("claude-code", {"type": "ai-title", "aiTitle": "g"}) is None
+    assert native_title_slot("claude-code", {"type": "ai-title", "aiTitle": "g"}) == ("ai", "g")
     # A record type means nothing outside its own backend.
-    assert native_title_from_record("claude-code", _name("p")) is None
-    assert native_title_from_record("codex", _name("p")) is None
+    assert native_title_slot("claude-code", _name("p")) is None
+    assert native_title_slot("codex", _name("p")) is None
 
 
-def test_registry_keeps_the_latest_valid_name() -> None:
-    registry = PiTranscriptRegistry()
-    for record in (SESSION_RECORD, _name("first"), _name("second"), _name(""), _name(7)):
-        registry.observe("t.jsonl", record)
-    assert registry.facts("t.jsonl").title == "second"
+def test_slot_preference_and_fallback() -> None:
+    assert effective_native_title("claude-code", {"ai": "g", "custom": "c"}) == "c"
+    assert effective_native_title("claude-code", {"custom": CLEARED, "ai": "g"}) == "g"
+    assert effective_native_title("claude-code", {"custom": "c", "ai": CLEARED}) == "c"
+    assert effective_native_title("claude-code", {"custom": CLEARED}) is CLEARED
+    assert effective_native_title("claude-code", {"ai": CLEARED}) is CLEARED
+    assert effective_native_title("claude-code", {}) is None
+    assert effective_native_title("pi", {"name": CLEARED}) is CLEARED
 
 
-def test_a_rename_alone_does_not_re_announce_the_session() -> None:
+def test_pi_announcements_carry_no_title() -> None:
     """An announcement marks the session running; a rename is not activity."""
     registry = PiTranscriptRegistry()
     registry.observe("t.jsonl", SESSION_RECORD)
     assert registry.take_announcement("t.jsonl") is not None
     registry.observe("t.jsonl", _name("renamed"))
     assert registry.take_announcement("t.jsonl") is None
-    # ...but the next real announcement carries the current name.
-    registry.observe("t.jsonl", MODEL_CHANGE)
-    assert registry.take_announcement("t.jsonl").title == "renamed"
 
 
-def test_title_scan_reads_the_latest_valid_name_up_to_an_offset(tmp_path) -> None:
+def test_title_scan_reads_complete_records_up_to_an_offset(tmp_path) -> None:
     path = tmp_path / "t.jsonl"
-    _write(path, [SESSION_RECORD, _name("one"), USER_RECORD, _name("two"), _name("  ")])
+    _write(path, [SESSION_RECORD, _name("one"), USER_RECORD, _name("two"), _name(7)])
     with path.open("a", encoding="utf-8") as handle:
         handle.write("{ not json session_info\n")
     end_of_two = sum(len(line) for line in path.read_bytes().splitlines(keepends=True)[:4])
-    _append(path, _name("three"))
+    _append(path, _name("  "))
+    size = path.stat().st_size
 
-    assert read_pi_native_title(path) == "three"
-    assert read_pi_native_title(path, end_offset=end_of_two) == "two"
-    assert read_pi_native_title(path, end_offset=10) is None
-    assert read_pi_native_title(tmp_path / "missing.jsonl") is None
+    def scan(end):
+        return scan_native_titles(path, "pi", end_offset=end)
+
+    assert scan(size) == {"name": CLEARED}
+    assert scan(end_of_two) == {"name": "two"}
+    assert scan(10) == {}
+    assert scan(0) == {}
+    assert scan_native_titles(tmp_path / "missing.jsonl", "pi", end_offset=99) == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -240,7 +247,7 @@ async def test_discovery_carries_the_latest_name(tmp_path) -> None:
     _write(
         transcript,
         [SESSION_RECORD, _name("first"), USER_RECORD, MODEL_CHANGE, ASSISTANT_RECORD,
-         _name("second"), _name("")],
+         _name("second"), _name(None), _name(7)],
     )
     repository = InMemoryRepository()
 
@@ -305,14 +312,14 @@ async def test_metadata_only_transcript_is_not_kept_working_by_renames(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_blank_and_repeated_names_publish_nothing(tmp_path) -> None:
+async def test_malformed_and_repeated_names_publish_nothing(tmp_path) -> None:
     transcript = _transcript(tmp_path)
     _write(transcript, [SESSION_RECORD, _name("same")])
     repository = InMemoryRepository()
     observer = _observer(repository)
     await observer.tail_file(transcript)
 
-    _append(transcript, _name(""), _name(None), _name("same"), {"type": "session_info"})
+    _append(transcript, _name(5), _name(None), _name("same"), {"type": "session_info"})
     published = await observer.tail_file(transcript)
 
     assert published == []
@@ -438,34 +445,48 @@ async def test_startup_backfill_names_pre_existing_sessions(tmp_path) -> None:
         reopened.close()
 
 
-def _backfill_repository(transcript: Path, *, offset: int | None, **sessions):
+def _backfill_repository(transcript: Path, *, offset: int | None, **update):
     # SQLite: the offset store lives there, as in production.
     repository = open_sqlite_repository(transcript.with_suffix(".db"))
     if offset is not None:
         repository.set_observer_offset(str(transcript), offset)
-    base = dict(backend="pi", project=Project(path=CWD, name="project"),
-                pi_transcript_path=str(transcript.resolve()))
-    for session_id, update in sessions.items():
-        repository.upsert_session(Session(id=session_id, **base, **update))
+    repository.upsert_session(
+        Session(
+            id=SESSION_ID,
+            backend="pi",
+            project=Project(path=CWD, name="project"),
+            pi_transcript_path=str(transcript.resolve()),
+            **{"origin": "external", **update},
+        )
+    )
     return repository
 
 
-def test_startup_backfill_leaves_titled_and_harness_sessions_alone(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "update",
+    [{"title": "explicit"}, {"origin": "harness"}, {"origin": "harness", "title": "bridge"}],
+    ids=["explicit", "harness", "harness-titled"],
+)
+def test_startup_backfill_leaves_explicit_and_harness_sessions_alone(tmp_path, update) -> None:
     transcript = _transcript(tmp_path)
     _write(transcript, [SESSION_RECORD, _name("native")])
-    repository = _backfill_repository(
-        transcript,
-        offset=transcript.stat().st_size,
-        ses_a={"origin": "external", "title": "explicit"},
-        ses_b={"origin": "harness"},
-        ses_c={"origin": "external"},
-    )
+    repository = _backfill_repository(transcript, offset=transcript.stat().st_size, **update)
+    before = repository.get_session(SESSION_ID)
 
     _observer(repository)
 
-    assert repository.get_session("ses_a").title == "explicit"
-    assert repository.get_session("ses_b").title is None
-    assert repository.get_session("ses_c").title == "native"
+    assert repository.get_session(SESSION_ID) == before
+
+
+def test_startup_backfill_names_an_untitled_external_session(tmp_path) -> None:
+    transcript = _transcript(tmp_path)
+    _write(transcript, [SESSION_RECORD, _name("native")])
+    repository = _backfill_repository(transcript, offset=transcript.stat().st_size)
+
+    _observer(repository)
+
+    session = repository.get_session(SESSION_ID)
+    assert (session.title, session.title_source) == ("native", "native")
 
 
 @pytest.mark.asyncio
@@ -476,12 +497,12 @@ async def test_startup_backfill_never_reads_ahead_of_an_unconsumed_transcript(tm
         home = tmp_path / f"home-{offset}"
         transcript = _transcript(home)
         _write(transcript, [SESSION_RECORD, _name("first"), _name("second")])
-        repository = _backfill_repository(transcript, offset=offset, ses_x={"origin": "external"})
+        repository = _backfill_repository(transcript, offset=offset)
         _observer(repository)
-        assert repository.get_session("ses_x").title is None
+        assert repository.get_session(SESSION_ID).title is None
 
 
-def test_startup_backfill_resolves_a_differently_spelled_offset_key(tmp_path) -> None:
+def test_startup_backfill_uses_the_watched_spelling_of_the_path(tmp_path) -> None:
     """Offsets are keyed by the watched spelling (here under a symlinked
     root); ``pi_transcript_path`` is stored resolved."""
     real = tmp_path / "real"
@@ -492,12 +513,12 @@ def test_startup_backfill_resolves_a_differently_spelled_offset_key(tmp_path) ->
     link = tmp_path / "link"
     link.symlink_to(real)
     watched = link / transcript.relative_to(real)
-    repository = _backfill_repository(transcript, offset=None, ses_x={"origin": "external"})
+    repository = _backfill_repository(transcript, offset=None)
     repository.set_observer_offset(str(watched), end_of_first)
 
     _observer(repository)
 
-    assert repository.get_session("ses_x").title == "first"
+    assert repository.get_session(SESSION_ID).title == "first"
 
 
 # --------------------------------------------------------------------------- #
@@ -530,11 +551,12 @@ async def test_claude_rename_titles_an_external_session(tmp_path) -> None:
         transcript,
         {"type": "ai-title", "aiTitle": "generated", "sessionId": CLAUDE_UUID},
         {"type": "custom-title", "customTitle": "Chosen\nname", "sessionId": CLAUDE_UUID},
-        {"type": "custom-title", "customTitle": "", "sessionId": CLAUDE_UUID},
+        {"type": "ai-title", "aiTitle": "regenerated", "sessionId": CLAUDE_UUID},
     )
     published = await observer.tail_file(transcript)
 
-    assert _titles(published) == ["Chosen name"]
+    # The custom title outranks a later generated one.
+    assert _titles(published) == ["generated", "Chosen name"]
     session = repository.get_session(CLAUDE_SESSION_ID)
     assert (session.title, session.title_source) == ("Chosen name", "native")
 
@@ -625,7 +647,8 @@ async def test_an_unterminated_name_is_not_applied_early(tmp_path) -> None:
     _write(transcript, [SESSION_RECORD, _name("done")])
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(_name("in flight")))
-    assert read_pi_native_title(transcript) == "done"
+    size = transcript.stat().st_size
+    assert scan_native_titles(transcript, "pi", end_offset=size) == {"name": "done"}
     repository = InMemoryRepository()
     observer = _observer(repository)
 
@@ -639,8 +662,6 @@ async def test_an_unterminated_name_is_not_applied_early(tmp_path) -> None:
 
 
 def test_head_peek_carries_no_title(tmp_path) -> None:
-    from agent_harness.pi_discovery import read_pi_head_facts
-
     path = tmp_path / "t.jsonl"
     _write(path, [SESSION_RECORD, _name("ahead")])
-    assert read_pi_head_facts(path).title is None
+    assert not hasattr(read_pi_head_facts(path), "title")

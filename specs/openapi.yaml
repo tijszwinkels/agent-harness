@@ -407,13 +407,16 @@ components:
           type: [string, "null"]
           enum: [native, null]
           description: |
-            Provenance of `title`. `native`: copied by the observer from the backend's own
-            conversation name (pi `session_info.name`, claude `custom-title`) on an
-            `origin: external` session, and updated when that name changes. Null: explicit
-            (set via create, PATCH or fork) or no title. A native name never replaces an
-            explicit title; PATCHing `title` makes it explicit. Blank native names are
-            ignored rather than clearing the title. Renames do not change `status` or
-            `updated_at`.
+            Provenance of `title`. `native`: the observer tracks the backend's own
+            conversation name on an `origin: external` session (pi `session_info.name`;
+            claude `custom-title`, falling back to its generated `ai-title`; codex
+            `session_index.jsonl` thread names), updating it when that name changes. With
+            `title: null` it means the native name was deliberately removed (a blank name,
+            or a codex index rewrite dropping the thread), so consumers fall back to
+            project/id; a later native name sets it again. Null: explicit (set via create,
+            PATCH or fork) or no title. A native name never replaces or clears an explicit
+            title; PATCHing `title` makes it explicit. Missing or malformed names change
+            nothing. Native renames and removals do not change `status` or `updated_at`.
         bypass_permissions:
           type: boolean
           default: false

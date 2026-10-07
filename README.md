@@ -120,10 +120,16 @@ Key flags:
 - `--database PATH` — use SQLite for durable state (default: in-memory).
 - `--no-observer` — disable automatic observation of transcript roots.
 - `--observe-root PATH` — watch an additional transcript root (repeatable).
+- `--codex-name-index PATH` — codex thread-name index to read. By default the
+  harness reads `session_index.jsonl` beside an observed
+  `<CODEX_HOME>/sessions` root; set this for a custom codex home or root.
 - `--cors-origin ORIGIN` — allow a browser origin (repeatable).
 
 By default the server observes the known Claude Code, Codex, and pi transcript
-roots under `HOME` when those directories exist.
+roots under `HOME` when those directories exist. Observed sessions take the
+backend's own conversation name as their `title` (pi `/name`, claude
+`/rename` or its generated title, codex thread names) unless a client set
+one; see `specs/2026-10-07-native-title-coverage.md`.
 
 ### Security: the API is unauthenticated
 

@@ -506,7 +506,11 @@ def _lifespan(
         if observer_settings.enabled:
             try:
                 observer_settings.validate()
-                observer = ExternalTranscriptObserver(event_bus, repository=repository)
+                observer = ExternalTranscriptObserver(
+                    event_bus,
+                    repository=repository,
+                    codex_name_index=observer_settings.codex_name_index_path(),
+                )
                 # Hand the live observer to the RunManager so
                 # RunProcess can call ``bind_rollout`` (claude pre-bind)
                 # and ``expect_codex_rollout`` (codex pre-bind). Both

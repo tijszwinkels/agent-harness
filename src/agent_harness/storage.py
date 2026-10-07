@@ -528,10 +528,14 @@ class SQLiteRepository:
         # (Falcon's PR #11 bug becomes structurally impossible).
         #
         # A ``session.updated`` row carries the status this repository will
-        # store, decided under the same lock as the materialization that
-        # follows (``observed_status``), so the durable log and subscribers
-        # never announce a status the row refused — e.g. an idle flip decided
-        # just before ``create_run`` started a new run.
+        # store (``observed_status``), so the durable log and subscribers never
+        # announce a status the row refused — e.g. an idle flip decided just
+        # before ``create_run`` started a new run. The repository lock is
+        # released between this append and the materialization that follows;
+        # they agree because ``DurableEventBus.publish`` makes both calls
+        # synchronously, under the bus lock, with no await in between, and all
+        # repository writers run on that same event loop. This is not an
+        # atomic guarantee against writers on other threads.
         with self._lock, self._connection:
             published = self._reconcile_observed_event_locked(event)
             published = published.with_sequence(self._next_event_sequence_locked())

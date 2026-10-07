@@ -167,10 +167,13 @@ cannot override e.g. `waiting_for_input`. Enforced at three points:
   keeps the stored status in those cases (other observer-owned fields still
   apply), checked under the repository lock;
 - the announced event carries the same decision: the SQLite repository
-  rewrites the `session.updated` status in `append_event` under the lock that
-  also covers the materialization, so the durable log, replay and subscribers
+  rewrites the `session.updated` status in `append_event`. `DurableEventBus`
+  then materializes it synchronously, under the bus lock and with no await in
+  between (the repository lock itself is released between the two calls), so
+  on the harness's single event loop the durable log, replay and subscribers
   match the stored row even if a run started while the publication waited for
-  the bus. On the in-memory bus the observer reconciles before publishing and,
+  the bus. This relies on all repository writers running on that event loop;
+  it is not atomic against writers on other threads. On the in-memory bus the observer reconciles before publishing and,
   should the row still differ after materialization, publishes the stored
   session as a correction.
 

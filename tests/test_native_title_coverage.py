@@ -404,6 +404,55 @@ async def test_unreadable_prefix_keeps_the_stored_title_until_it_recovers(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_recovered_prefix_is_reconciled_on_an_ordinary_line(tmp_path) -> None:
+    """Upgrade path: the row is untitled (written before ai-titles were
+    read) and the startup backfill can't read the transcript. The first
+    readable new line is plain conversation; the recovered name must
+    still land, without counting as activity."""
+    db_path = tmp_path / "harness.db"
+    repository = open_sqlite_repository(db_path)
+    transcript = _claude(tmp_path, [CLAUDE_USER, _ai("generated")])
+    await _observer(repository, DurableEventBus(repository)).tail_file(transcript)
+    legacy = repository.get_session(CLAUDE_ID).model_copy(
+        update={"title": None, "title_source": None}
+    )
+    repository.upsert_session(legacy)
+    repository.set_observer_offset(str(transcript), transcript.stat().st_size)
+    repository.close()
+
+    transcript.chmod(0)
+    reopened = open_sqlite_repository(db_path)
+    try:
+        if os.access(transcript, os.R_OK):
+            pytest.skip("running with privileges that ignore file modes")
+        observer = _observer(reopened, DurableEventBus(reopened))
+        assert _title(reopened, CLAUDE_ID) == (None, None)
+        transcript.chmod(0o600)
+
+        renames = []
+        publish = observer._publish_native_name
+
+        async def counting(*args, **kwargs):
+            event = await publish(*args, **kwargs)
+            if event is not None:
+                renames.append(event)
+            return event
+
+        observer._publish_native_name = counting
+        _append(transcript, CLAUDE_USER)
+        await observer.tail_file(transcript)
+        assert _title(reopened, CLAUDE_ID) == ("generated", "native")
+        assert len(renames) == 1
+        # Reconciled once; later ordinary lines don't re-check it.
+        _append(transcript, CLAUDE_USER)
+        await observer.tail_file(transcript)
+        assert len(renames) == 1
+    finally:
+        transcript.chmod(0o600)
+        reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_truncated_transcript_does_not_resurrect_a_cleared_name(tmp_path) -> None:
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)

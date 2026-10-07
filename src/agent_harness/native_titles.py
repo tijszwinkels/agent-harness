@@ -24,6 +24,7 @@ import logging
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Final
@@ -42,6 +43,19 @@ class _Cleared:
 
 CLEARED: Final = _Cleared()
 NativeName = str | _Cleared
+
+
+class ScanFailure(Enum):
+    """Why a consumed prefix couldn't be recovered.
+
+    ``UNREADABLE``: the file couldn't be read; its prefix is presumably
+    intact and worth retrying. ``MISMATCHED``: the file no longer matches
+    the consumed offset (truncated or rewritten), so its old content must
+    not be re-applied.
+    """
+
+    UNREADABLE = "unreadable"
+    MISMATCHED = "mismatched"
 
 # Slot preference per backend, most preferred first.
 SLOT_ORDER: Final[dict[str, tuple[str, ...]]] = {
@@ -150,19 +164,18 @@ def scan_native_titles(
     *,
     end_offset: int,
     transcript_uuid: str | None = None,
-) -> dict[str, NativeName] | None:
+) -> dict[str, NativeName] | ScanFailure:
     """Slots recovered from the first ``end_offset`` bytes of a transcript.
 
     Only complete (newline-terminated) lines inside the bound count: the
     observer has consumed exactly that prefix, and reading further would
     apply names ahead of the ordered tail. Never raises.
 
-    ``None`` when the prefix can't be recovered in full — the file is
-    unreadable, or shorter than (or no longer line-aligned at) the
-    consumed offset, e.g. after truncation. Callers then keep the stored
-    title and try again later rather than trusting partial slots: a
-    missing custom slot would otherwise let a generated title (or its
-    removal) take over.
+    A :class:`ScanFailure` when the prefix can't be recovered in full —
+    the file is unreadable, or shorter than (or no longer line-aligned at)
+    the consumed offset, e.g. after truncation. Callers then keep the
+    stored title rather than trusting partial slots: a missing custom slot
+    would otherwise let a generated title (or its removal) take over.
     """
     slots: dict[str, NativeName] = {}
     if end_offset <= 0:
@@ -184,12 +197,12 @@ def scan_native_titles(
                     slots[found[0]] = found[1]
     except OSError:
         logger.debug("native title scan: cannot read %s", path, exc_info=True)
-        return None
+        return ScanFailure.UNREADABLE
     if consumed != end_offset:
         logger.debug(
             "native title scan: %s has %d of %d consumed bytes", path, consumed, end_offset
         )
-        return None
+        return ScanFailure.MISMATCHED
     return slots
 
 
@@ -261,6 +274,7 @@ __all__ = [
     "NativeName",
     "NativeTitleTracker",
     "SLOT_ORDER",
+    "ScanFailure",
     "effective_native_title",
     "native_name",
     "native_title_slot",

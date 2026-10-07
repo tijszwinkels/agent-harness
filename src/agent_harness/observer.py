@@ -34,6 +34,7 @@ from agent_harness.native_titles import (
     CLEARED,
     NativeName,
     NativeTitleTracker,
+    ScanFailure,
     effective_native_title,
     native_title_slot_from_line,
     scan_native_titles,
@@ -414,6 +415,10 @@ class ExternalTranscriptObserver:
         # an evicted transcript is re-hydrated from its consumed prefix.
         self._native_titles = NativeTitleTracker()
         self._existing_sessions: set[str] = set()
+        # Transcripts whose prefix couldn't be read: once a later read
+        # succeeds, the recovered name is reconciled with the stored row
+        # (the startup backfill, or the line itself, may never get to it).
+        self._title_recovery_pending: set[Path] = set()
         # Names written before this process sit behind the persisted
         # offsets and would never be tailed again.
         self._backfill_native_titles()
@@ -465,9 +470,14 @@ class ExternalTranscriptObserver:
                 end_offset=offset,
                 transcript_uuid=_transcript_uuid(identity),
             )
-            if slots is None:
-                # Unreadable or truncated below the consumed offset: keep
-                # the stored title; the next new line retries hydration.
+            if slots is ScanFailure.UNREADABLE:
+                # Keep the stored title; the next new line retries and
+                # reconciles once the prefix can be read.
+                self._title_recovery_pending.add(path)
+                continue
+            if isinstance(slots, ScanFailure):
+                # Truncated/rewritten below the consumed offset: its old
+                # content must not be re-applied. Keep the stored title.
                 continue
             self._native_titles.hydrate(path, slots)
             name = effective_native_title(identity.backend, slots)
@@ -989,7 +999,7 @@ class ExternalTranscriptObserver:
             return []
         if resolved_identity.backend == "pi":
             self._hydrate_pi_facts(transcript_path, resolved_identity.session_id)
-        self._hydrate_native_titles(transcript_path, resolved_identity)
+        recovered = self._hydrate_native_titles(transcript_path, resolved_identity)
         # A name known before its session exists (a claude title record
         # ahead of the first cwd+model record, a codex index entry ahead
         # of rollout discovery) is applied once this line creates it.
@@ -1041,7 +1051,7 @@ class ExternalTranscriptObserver:
         )
         if slot is not None:
             self._native_titles.observe(transcript_path, *slot)
-        if slot is not None or not existed:
+        if slot is not None or not existed or recovered:
             name = self._native_name(transcript_path, resolved_identity)
             renamed = await self._publish_native_name(
                 resolved_identity.session_id,
@@ -1052,7 +1062,7 @@ class ExternalTranscriptObserver:
                 published.append(renamed)
         return published
 
-    def _hydrate_native_titles(self, path: Path, identity: TranscriptIdentity) -> None:
+    def _hydrate_native_titles(self, path: Path, identity: TranscriptIdentity) -> bool:
         """Rebuild a transcript's title slots from its consumed prefix.
 
         Once per transcript per process (and after LRU eviction). From
@@ -1061,11 +1071,16 @@ class ExternalTranscriptObserver:
         can't be recovered in full leaves the transcript unhydrated — its
         name stays unknown, so nothing is applied — and is retried on the
         next line.
+
+        Returns True when this call recovered a prefix that an earlier
+        read failed on, so the caller reconciles the recovered name even
+        if the current line is ordinary conversation. A prefix that no
+        longer matches the offset (truncation) is not such a recovery.
         """
         if identity.backend not in ("pi", "claude-code"):
-            return
+            return False
         if not self._native_titles.needs_hydration(path):
-            return
+            return False
         offset = self._state.next_offset(path)
         slots = scan_native_titles(
             path,
@@ -1073,8 +1088,17 @@ class ExternalTranscriptObserver:
             end_offset=offset,
             transcript_uuid=_transcript_uuid(identity),
         )
-        if slots is not None:
-            self._native_titles.hydrate(path, slots)
+        if slots is ScanFailure.UNREADABLE:
+            self._title_recovery_pending.add(path)
+            return False
+        if isinstance(slots, ScanFailure):
+            self._title_recovery_pending.discard(path)
+            return False
+        self._native_titles.hydrate(path, slots)
+        if path in self._title_recovery_pending:
+            self._title_recovery_pending.discard(path)
+            return True
+        return False
 
     def _known_to_exist(self, session_id: str) -> bool:
         # Sessions are never deleted, so a positive answer is cached; this

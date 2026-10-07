@@ -79,8 +79,14 @@ don't count as conversation activity.
   consumed prefix. An unreadable file, or one truncated below or
   misaligned with the offset, leaves the transcript unhydrated. Nothing is
   applied, the stored title is kept, and the rebuild is retried on the
-  next line. Once the tail realigns with a regrown file, the prefix is the
-  file as it now is.
+  next line.
+  - **Unreadable.** The prefix is presumably intact. Once a later read
+    succeeds, the recovered name is reconciled with the row, even on an
+    ordinary conversation line, exactly once. This covers a startup
+    backfill that couldn't read the file.
+  - **Truncated or misaligned.** The old content is never re-applied.
+    Once the tail realigns with a regrown file, later title records apply
+    as usual.
 - **Startup backfill.** One pass over persisted offsets, using the
   watched path spelling. Each external pi or claude session that is
   untitled or natively titled gets the name, or removal, from its

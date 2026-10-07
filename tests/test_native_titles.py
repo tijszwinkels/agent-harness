@@ -24,6 +24,7 @@ from agent_harness.models import (
 )
 from agent_harness.native_titles import (
     CLEARED,
+    ScanFailure,
     effective_native_title,
     native_name,
     native_title_slot,
@@ -177,9 +178,10 @@ def test_title_scan_reads_complete_records_up_to_an_offset(tmp_path) -> None:
     assert scan(0) == {}
     # A prefix that can't be recovered in full is unknown, not empty:
     # mid-line, beyond the end of the file, or unreadable.
-    assert scan(10) is None
-    assert scan(size + 1) is None
-    assert scan_native_titles(tmp_path / "missing.jsonl", "pi", end_offset=99) is None
+    assert scan(10) is ScanFailure.MISMATCHED
+    assert scan(size + 1) is ScanFailure.MISMATCHED
+    missing = scan_native_titles(tmp_path / "missing.jsonl", "pi", end_offset=99)
+    assert missing is ScanFailure.UNREADABLE
 
 
 # --------------------------------------------------------------------------- #
@@ -652,7 +654,10 @@ async def test_an_unterminated_name_is_not_applied_early(tmp_path) -> None:
         handle.write(json.dumps(_name("in flight")))
     complete = transcript.read_bytes().rindex(b"\n") + 1
     assert scan_native_titles(transcript, "pi", end_offset=complete) == {"name": "done"}
-    assert scan_native_titles(transcript, "pi", end_offset=transcript.stat().st_size) is None
+    assert (
+        scan_native_titles(transcript, "pi", end_offset=transcript.stat().st_size)
+        is ScanFailure.MISMATCHED
+    )
     repository = InMemoryRepository()
     observer = _observer(repository)
 

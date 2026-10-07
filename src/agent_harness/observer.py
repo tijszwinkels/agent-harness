@@ -1350,7 +1350,7 @@ class ExternalTranscriptObserver:
         # While a harness run is queued or running, the run lifecycle owns
         # the status in both directions: silence is not completion, and
         # activity does not override e.g. ``waiting_for_input``.
-        if self._has_active_run(session_id):
+        if self._status_owned(session_id):
             return None
         # Freshness only demotes ``running``: other states (e.g.
         # ``waiting_for_input``) are not transcript-liveness claims.
@@ -1424,6 +1424,17 @@ class ExternalTranscriptObserver:
         )
         await self._event_bus.publish(correction)
         self._repository.materialize_event(correction, store_event=True)
+
+    def _status_owned(self, session_id: str) -> bool:
+        """An active harness run or an unexpired live ``busy`` claim owns the
+        status; transcript observation must not change it meanwhile."""
+        status_owned = getattr(self._repository, "status_owned", None)
+        if callable(status_owned):
+            try:
+                return bool(status_owned(session_id))
+            except SessionNotFoundError:
+                return False
+        return self._has_active_run(session_id)
 
     def _has_active_run(self, session_id: str) -> bool:
         """True while the session has a queued or running harness run.

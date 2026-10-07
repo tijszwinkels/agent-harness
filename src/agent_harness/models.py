@@ -381,6 +381,28 @@ class CreateSessionRequest(HarnessModel):
     bypass_permissions: bool = False
 
 
+class LiveStateRequest(HarnessModel):
+    """A live busy/idle claim from the process driving an external session
+    (see ``agent_harness.live_state``). Metadata only."""
+
+    # Who reports, e.g. "companion". Informational; not an identity check.
+    source: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")
+    # Opaque id for one producer process lifetime; orders its updates.
+    producer: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    sequence: int = Field(ge=0)
+    state: Literal["busy", "idle"]
+    # How long a ``busy`` claim holds without a renewal.
+    lease_seconds: int = Field(default=45, ge=5, le=120)
+
+
+class LiveStateResponse(HarnessModel):
+    # False when the update was older than what the producer already sent.
+    accepted: bool
+    status: SessionStatus
+    busy: bool
+    expires_at: datetime | None = None
+
+
 class PatchSessionRequest(HarnessModel):
     # Patch payload for ``PATCH /v1/sessions/{id}``. Only the listed fields
     # are user-mutable; everything else on Session is either derived

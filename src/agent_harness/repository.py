@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from threading import RLock
 
 from agent_harness.models import (
+    LiveStateRequest,
     CreateRunRequest,
     CreateSessionRequest,
     Event,
@@ -17,6 +18,12 @@ from agent_harness.models import (
     merge_observed_session,
     observed_status,
     utc_now,
+)
+from agent_harness.live_state import (
+    LiveClaim,
+    LiveStateRegistry,
+    ensure_accepts_live_state,
+    status_for_claim,
 )
 
 
@@ -55,6 +62,10 @@ class MaterializationDeferred(SessionNotFoundError):
 class InMemoryRepository:
     def __init__(self) -> None:
         self._lock = RLock()
+        # Live claims from producers of external sessions (in memory only).
+        self.live_state = LiveStateRegistry()
+        # Injectable for tests that drive time with a fake clock.
+        self.clock = utc_now
         self._sessions: dict[str, Session] = {}
         self._runs: dict[str, Run] = {}
         self._messages: dict[str, list[Message]] = {}
@@ -208,8 +219,43 @@ class InMemoryRepository:
         """The status an observation of ``session_id`` would be stored with."""
         with self._lock:
             return observed_status(
-                status, self._sessions.get(session_id), has_active_run=self._has_active_run_locked(session_id)
+                status, self._sessions.get(session_id), has_active_run=self._status_owned_locked(session_id)
             )
+
+    def status_owned(self, session_id: str) -> bool:
+        """True while something more authoritative than transcript
+        observation owns the status: a queued/running harness run, or an
+        unexpired live ``busy`` claim."""
+        with self._lock:
+            return self._status_owned_locked(session_id)
+
+    def _status_owned_locked(self, session_id: str) -> bool:
+        return self._has_active_run_locked(session_id) or self.live_state.busy(session_id, self.clock())
+
+    def apply_live_state(
+        self, session_id: str, request: LiveStateRequest
+    ) -> tuple[Session, LiveClaim | None]:
+        """Record a live claim and apply it to the session's status.
+
+        Returns the (possibly updated) session and the accepted claim, or
+        ``None`` for a stale/duplicate update. Raises ``SessionNotFoundError``
+        or ``LiveStateRejected``. Claim and status change happen under one
+        lock, so observations materialized concurrently see both.
+        """
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            ensure_accepts_live_state(session)
+            now = self.clock()
+            claim = self.live_state.offer(session_id, request, now)
+            if claim is None:
+                return session.model_copy(deep=True), None
+            status = status_for_claim(session, claim, has_active_run=self._has_active_run_locked(session_id))
+            if status != session.status:
+                session = session.model_copy(update={"status": status, "updated_at": now})
+                self.upsert_session(session)
+            return session.model_copy(deep=True), claim
 
     def _has_active_run_locked(self, session_id: str) -> bool:
         return any(
@@ -315,7 +361,7 @@ class InMemoryRepository:
                 # active-run check.
                 with self._lock:
                     existing = self._sessions.get(incoming.id)
-                    active = self._has_active_run_locked(incoming.id)
+                    active = self._status_owned_locked(incoming.id)
                 # Preservation rules live in ``merge_observed_session``
                 # so the in-memory and SQLite paths can't drift: an
                 # observation refreshes the conversation's shape

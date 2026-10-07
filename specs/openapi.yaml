@@ -54,6 +54,40 @@ paths:
                     items:
                       $ref: "#/components/schemas/Session"
 
+  /v1/sessions/{id}/live-state:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    put:
+      summary: Live busy/idle claim for an external pi session
+      description: |
+        Sent by the process that drives an external pi session live
+        (Companion over Pi RPC). `busy` holds a lease during which the
+        session counts as running and transcript observations cannot change
+        its status; renew it with heartbeats. `idle` sets the session idle
+        once. Claims live in memory; an expired lease falls back to the 30 s
+        transcript rule. Updates whose `sequence` is not newer than the
+        producer's last accepted one are ignored (`accepted: false`).
+        Archived sessions, harness-origin sessions and non-pi backends are
+        rejected with 409. A queued/running harness run keeps owning the status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiveStateRequest"
+      responses:
+        "200":
+          description: Claim processed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveStateResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
   /v1/sessions/{id}:
     parameters:
       - $ref: "#/components/parameters/SessionId"
@@ -686,6 +720,45 @@ components:
           type: boolean
           default: false
 
+    LiveStateRequest:
+      type: object
+      additionalProperties: false
+      required: [source, producer, sequence, state]
+      properties:
+        source:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9_-]{0,31}$"
+          description: Reporting software, e.g. `companion`. Informational.
+        producer:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{1,64}$"
+          description: Opaque id for one producer process lifetime.
+        sequence:
+          type: integer
+          minimum: 0
+        state:
+          type: string
+          enum: [busy, idle]
+        lease_seconds:
+          type: integer
+          minimum: 5
+          maximum: 120
+          default: 45
+    LiveStateResponse:
+      type: object
+      required: [accepted, status, busy]
+      properties:
+        accepted:
+          type: boolean
+        status:
+          type: string
+          enum: [idle, running, waiting_for_input, archived]
+        busy:
+          type: boolean
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
     PatchSessionRequest:
       type: object
       description: |

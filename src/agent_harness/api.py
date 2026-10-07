@@ -16,6 +16,8 @@ from starlette.responses import StreamingResponse
 from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.models import (
+    LiveStateRequest,
+    LiveStateResponse,
     CreateRunRequest,
     CreateRunResponse,
     CreateSessionRequest,
@@ -38,6 +40,7 @@ from agent_harness.orchestrator import (
     validate_fork_source,
     validate_session_resume_target,
 )
+from agent_harness.live_state import LiveStateRejected
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
 from agent_harness.settings import ObserverSettings
 
@@ -178,6 +181,39 @@ def create_app(
             )
         )
         return session
+
+    @app.put("/v1/sessions/{session_id}/live-state")
+    async def put_live_state(session_id: str, request: LiveStateRequest) -> LiveStateResponse:
+        """Live busy/idle claim for an external pi session from the process
+        that drives it (see ``agent_harness.live_state``). Metadata only."""
+        apply_live_state = getattr(repo, "apply_live_state", None)
+        if not callable(apply_live_state):
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="live state unsupported")
+        try:
+            before = repo.get_session(session_id).status
+            session, claim = apply_live_state(session_id, request)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+        except LiveStateRejected as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+        if claim is not None and session.status != before:
+            # Same shape as observer status flips, so SSE consumers update.
+            await events.publish(
+                Event(
+                    event="session.updated",
+                    session_id=session.id,
+                    data={"session": session.model_dump(mode="json"), "live_state": claim.state},
+                )
+            )
+        current = repo.live_state.get(session_id)
+        busy = current is not None and current.busy_at(repo.clock())
+        return LiveStateResponse(
+            accepted=claim is not None,
+            status=session.status,
+            busy=busy,
+            expires_at=current.expires_at if busy else None,
+        )
 
     @app.patch("/v1/sessions/{session_id}")
     async def patch_session(session_id: str, request: PatchSessionRequest) -> object:

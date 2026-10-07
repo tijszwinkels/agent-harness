@@ -1244,6 +1244,11 @@ class ExternalTranscriptObserver:
         older than the configured threshold. Idempotent — only emits a
         ``session.updated`` event on the first flip.
 
+        Transcript silence is only a liveness signal for sessions the
+        harness is not running: a session with a queued or running harness
+        run is left to the run lifecycle (``finish_run`` sets it idle), so a
+        long silent tool call never reads as idle mid-run.
+
         Called periodically by :class:`TranscriptWatchService` and also
         suitable for direct invocation in tests with a fake clock.
         """
@@ -1335,6 +1340,13 @@ class ExternalTranscriptObserver:
         # observing its history must not undo the user's archive action.
         if session.status in {target_status, "archived"}:
             return None
+        if target_status == "idle":
+            # Freshness only demotes ``running``: other states (e.g.
+            # ``waiting_for_input``) are not transcript-liveness claims.
+            # And while a harness run is queued or running, the run
+            # lifecycle owns the status — silence is not completion.
+            if session.status != "running" or self._has_active_run(session_id):
+                return None
 
         updated = session.model_copy(update={"status": target_status, "updated_at": self._clock()})
         data: dict[str, Any] = {"session": updated.model_dump(mode="json")}
@@ -1379,6 +1391,26 @@ class ExternalTranscriptObserver:
             )
             return None
         return event.model_copy(update={"run_id": active_run_id})
+
+    def _has_active_run(self, session_id: str) -> bool:
+        """True while the session has a queued or running harness run.
+
+        Unlike ``_active_run_id_for_session`` this includes ``queued``: a
+        session waiting for its run to start is still busy, not idle.
+        """
+        if self._repository is None:
+            return False
+        has_active_run = getattr(self._repository, "has_active_run", None)
+        if callable(has_active_run):
+            try:
+                return bool(has_active_run(session_id))
+            except SessionNotFoundError:
+                return False
+        try:
+            runs = self._repository.list_runs(session_id)
+        except SessionNotFoundError:
+            return False
+        return any(run.status in ("queued", "running") for run in runs)
 
     def _active_run_id_for_session(self, session_id: str) -> str | None:
         """Return the id of the session's currently-running harness

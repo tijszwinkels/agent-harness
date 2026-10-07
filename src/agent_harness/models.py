@@ -268,12 +268,21 @@ _OBSERVER_OPTIONAL_FIELDS: tuple[str, ...] = (
 )
 
 
-def merge_observed_session(incoming: Session, existing: Session | None) -> Session | None:
+def merge_observed_session(
+    incoming: Session, existing: Session | None, *, has_active_run: bool = False
+) -> Session | None:
     """The Session to store for an observer-emitted ``session.updated``.
 
     ``None`` means "do not write": an ``origin=external`` observation of a
     session the harness owns is a downgrade, and downgrading once caused
     the bridge to adopt a channel away from its live session.
+
+    ``has_active_run``: the session has a queued or running harness run.
+    The run lifecycle (``create_run`` → running, ``finish_run`` → idle) is
+    then the authority on status; an observation may only confirm
+    ``running``, never demote it. Transcript silence during a long tool call
+    is not the end of a run, and a snapshot taken before ``create_run`` must
+    not undo it when it is materialized afterwards.
 
     Shared by both repository implementations so the preservation rules
     can't drift apart between the in-memory and SQLite paths.
@@ -285,6 +294,8 @@ def merge_observed_session(incoming: Session, existing: Session | None) -> Sessi
     updates: dict[str, Any] = {
         field: getattr(incoming, field) for field in _OBSERVER_OWNED_FIELDS
     }
+    if has_active_run and incoming.status != "running":
+        updates["status"] = existing.status
     for field in _OBSERVER_OPTIONAL_FIELDS:
         value = getattr(incoming, field)
         if value is not None:

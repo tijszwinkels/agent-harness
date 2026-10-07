@@ -350,6 +350,23 @@ class SQLiteRepository:
                 dropped.append(interrupted.model_copy(deep=True))
         return dropped
 
+    def has_active_run(self, session_id: str) -> bool:
+        """True while the session has a queued or running run."""
+        with self._lock:
+            return self._has_active_run_locked(session_id)
+
+    def _has_active_run_locked(self, session_id: str) -> bool:
+        row = self._connection.execute(
+            """
+            select 1 from runs
+            where session_id = ?
+              and json_extract(payload, '$.status') in ('queued', 'running')
+            limit 1
+            """,
+            (session_id,),
+        ).fetchone()
+        return row is not None
+
     def list_runs(self, session_id: str) -> list[Run]:
         with self._lock:
             if self._find_session_locked(session_id) is None:
@@ -534,7 +551,11 @@ class SQLiteRepository:
                     # case (external observation of a harness-owned
                     # session), which once caused the bridge to adopt a
                     # channel away from its live session.
-                    merged = merge_observed_session(incoming, existing)
+                    merged = merge_observed_session(
+                        incoming,
+                        existing,
+                        has_active_run=self._has_active_run_locked(incoming.id),
+                    )
                     if merged is not None:
                         self._upsert_session(merged)
                 return

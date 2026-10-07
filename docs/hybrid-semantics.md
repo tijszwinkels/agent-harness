@@ -145,8 +145,27 @@ The harness does not own external processes and must not imply that it can prove
 their process state.
 
 An external session is `running` when transcript activity was observed in the
-last 15 seconds. Otherwise it is `idle`. The timestamp source is the observer's
-last accepted transcript event, not process table inspection.
+last 30 seconds (`DEFAULT_IDLE_AFTER_SECONDS`). Otherwise it is `idle`. The
+timestamp source is the observer's last accepted transcript event, not process
+table inspection.
+
+Transcript freshness is only a liveness signal for sessions the harness is not
+running. **While a session has a `queued` or `running` harness run, the run
+lifecycle owns its status**: `create_run` sets it `running`, `finish_run` sets
+it `idle` once no other run is queued or running. A harness run's rollout is
+bound to its session, so its transcript also feeds the freshness map, but 30 s
+of silence (a long tool call, extended thinking) is not the end of a run. Two
+guards enforce this:
+
+- the freshness tick never demotes a session with an active run, and only
+  demotes `running` (it does not overwrite `waiting_for_input` or `archived`);
+- materializing an observed `session.updated` (`merge_observed_session`) may
+  confirm `running` but never change another status onto a session with an
+  active run, checked under the repository lock, so an idle observation
+  decided before `create_run` or replayed late cannot undo it.
+
+Once the run has finished, freshness applies again: a late transcript flush
+may mark the session `running`, and the next tick returns it to `idle`.
 
 Archiving an external session affects harness visibility only. It does not stop,
 signal, delete, or otherwise mutate the external backend process or transcript.

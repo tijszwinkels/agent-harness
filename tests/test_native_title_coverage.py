@@ -552,6 +552,16 @@ def _rollout(home: Path, thread_id: str = T1) -> Path:
     return path
 
 
+def _bump_mtime(path: Path) -> None:
+    """Make a same-size rewrite visible to stat-based change detection.
+
+    Filesystems with coarse timestamps (ZFS here) keep the mtime of a
+    rewrite made within the same tick, so the test advances it explicitly.
+    """
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+
 def test_index_latest_entry_in_file_order_wins(tmp_path) -> None:
     index_path = tmp_path / "session_index.jsonl"
     _write(index_path, [
@@ -661,6 +671,7 @@ def test_index_untrustworthy_changes_never_infer_removals(tmp_path, damage) -> N
         with index_path.open("r+b") as handle:
             handle.write(rewritten.ljust(len(original) - 1) + b"\n")
             handle.truncate()
+        _bump_mtime(index_path)
     else:
         index_path.unlink()
         index.refresh()
@@ -898,7 +909,6 @@ def test_index_in_place_rewrite_before_the_tail_probe_is_seen(tmp_path) -> None:
     content = index_path.read_bytes().replace(b'"old"', b'"new"')
     with index_path.open("r+b") as handle:
         handle.write(content)
-    stat = index_path.stat()
-    os.utime(index_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    _bump_mtime(index_path)
 
     assert index.refresh() == {T1: "new"}

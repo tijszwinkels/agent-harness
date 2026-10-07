@@ -151,6 +151,10 @@ don't count as conversation activity.
   atomic save) from codex's own removal. Both count as removals.
 - The startup backfill reads transcripts synchronously at observer
   construction.
+- Codex index change detection is stat-based (inode, size, mtime). A
+  same-size, in-place rewrite within one filesystem timestamp tick (coarse
+  on e.g. ZFS) is not noticed until the file changes again. Codex never
+  rewrites the index in place.
 
 ## Rollback
 

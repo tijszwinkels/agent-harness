@@ -59,12 +59,16 @@ def harness(request, tmp_path):
     return repository, bus, observer, clock
 
 
-def _transcript(tmp_path: Path) -> Path:
-    path = pi_transcript_path(CWD, "2026-10-08T09-00-00-000Z", UUID, home=tmp_path)
+OWNER_LINE = '{"type":"custom","id":"o1","customType":"agent-harness.live-state-owner","data":{"source":"companion"}}\n'
+
+
+def _transcript(tmp_path: Path, uuid: str = UUID, *, owner: bool = True) -> Path:
+    path = pi_transcript_path(CWD, "2026-10-08T09-00-00-000Z", uuid, home=tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        '{"type":"session","version":3,"id":"' + UUID + '","cwd":"' + CWD + '"}\n'
-        '{"type":"model_change","provider":"openai-codex","modelId":"gpt-6-astra"}\n'
+        '{"type":"session","version":3,"id":"' + uuid + '","cwd":"' + CWD + '"}\n'
+        + (OWNER_LINE if owner else "")
+        + '{"type":"model_change","provider":"openai-codex","modelId":"gpt-6-astra"}\n'
         '{"type":"message","message":{"role":"user","content":[{"type":"text","text":"plan the release"}]}}\n',
         encoding="utf-8",
     )
@@ -240,6 +244,8 @@ async def test_waiting_session_becomes_running_on_busy_claim(harness, tmp_path) 
 
 def test_scope_only_external_pi_sessions(harness) -> None:
     repository, *_ = harness
+    for sid in ("ses_" + "a" * 32, "codex_x"):
+        repository.note_live_state_owner(sid, "companion")
     with pytest.raises(SessionNotFoundError):
         repository.apply_live_state("ses_" + "f" * 32, claim("busy", 1))
     harness_pi = repository.create_session(
@@ -266,6 +272,7 @@ def test_harness_restart_forgets_claims(tmp_path) -> None:
     first.clock = clock
     first.upsert_session(Session(id=SESSION_ID, backend="pi", origin="external", status="idle",
                                  project=Project(path=CWD, name="agents")))
+    first.note_live_state_owner(SESSION_ID, "companion")
     first.apply_live_state(SESSION_ID, claim("busy", 1))
     assert first.status_owned(SESSION_ID)
     first._connection.close()  # the old process is gone
@@ -273,6 +280,9 @@ def test_harness_restart_forgets_claims(tmp_path) -> None:
     second.clock = clock
     assert second.get_session(SESSION_ID).status == "running"
     assert not second.status_owned(SESSION_ID)
+    # Ownership is in memory too: after a restart the API re-learns it from
+    # the transcript (see test_api_owner_scan_after_restart).
+    second.note_live_state_owner(SESSION_ID, "companion")
     second.apply_live_state(SESSION_ID, claim("busy", 2))
     assert second.status_owned(SESSION_ID)
 
@@ -288,8 +298,10 @@ def test_registry_is_bounded() -> None:
 def test_api_contract(tmp_path) -> None:
     repository = InMemoryRepository()
     bus = InMemoryEventBus()
+    transcript = _transcript(tmp_path)
     repository.upsert_session(Session(id=SESSION_ID, backend="pi", origin="external", status="idle",
-                                      project=Project(path=CWD, name="agents")))
+                                      project=Project(path=CWD, name="agents"),
+                                      pi_transcript_path=str(transcript)))
     client = TestClient(create_app(repository=repository, event_bus=bus))
     url = f"/v1/sessions/{SESSION_ID}/live-state"
     body = {"source": "companion", "producer": "p1", "sequence": 1, "state": "busy", "lease_seconds": 45}
@@ -312,3 +324,125 @@ def test_api_contract(tmp_path) -> None:
     repository.upsert_session(Session(id="ses_" + "b" * 32, backend="pi", origin="harness", status="idle",
                                       project=Project(path="/r", name="r")))
     assert client.put("/v1/sessions/ses_" + "b" * 32 + "/live-state", json=body).status_code == 409
+
+
+# --------------------------------------------------------------- review round 1
+
+
+@pytest.mark.asyncio
+async def test_unrelated_terminal_pi_session_cannot_be_claimed(harness, tmp_path) -> None:
+    """Finding 5: the producer that owns one conversation cannot change a
+    valid, external, unrelated Pi session (no owner entry in its transcript)."""
+    repository, bus, observer, clock = harness
+    await _observed(observer, tmp_path)
+    other_uuid = "9f9f9f9f-1111-4222-8333-444455556666"
+    other_id = "ses_" + other_uuid.replace("-", "")
+    await observer.tail_file(_transcript(tmp_path, other_uuid, owner=False))
+    other = repository.get_session(other_id)
+    assert (other.backend, other.origin) == ("pi", "external")
+    clock.advance(31)
+    await observer.freshness_tick()
+    repository.apply_live_state(SESSION_ID, claim("busy", 1))     # own conversation: fine
+    with pytest.raises(LiveStateRejected):
+        repository.apply_live_state(other_id, claim("busy", 2))
+    assert repository.get_session(other_id).status == "idle"
+    assert not repository.status_owned(other_id)
+
+
+@pytest.mark.asyncio
+async def test_owner_entry_from_another_source_is_not_enough(harness, tmp_path) -> None:
+    repository, bus, observer, clock = harness
+    await _observed(observer, tmp_path)
+    with pytest.raises(LiveStateRejected):
+        repository.apply_live_state(
+            SESSION_ID,
+            LiveStateRequest(source="other-tool", producer="x", sequence=1, state="busy"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_settled_turn_bytes_tailed_late_do_not_revive(harness, tmp_path) -> None:
+    """Finding 2: busy → final assistant bytes written (not yet tailed) → idle →
+    observer tails those bytes: the session stays idle in row, SSE and replay.
+    A genuinely new line afterwards resumes best-effort tracking."""
+    repository, bus, observer, clock = harness
+    path = await _observed(observer, tmp_path)
+    repository.apply_live_state(SESSION_ID, claim("busy", 1))
+    _append_assistant(path, "final answer")
+    from agent_harness.live_state import transcript_size
+    repository.apply_live_state(SESSION_ID, claim("idle", 2), settled_offset=transcript_size(str(path)))
+    assert repository.get_session(SESSION_ID).status == "idle"
+    before = len(_statuses(await bus.replay(session_id=SESSION_ID)))
+    clock.advance(1)
+    await observer.tail_file(path)
+    assert repository.get_session(SESSION_ID).status == "idle"
+    assert "running" not in _statuses(await bus.replay(session_id=SESSION_ID))[before:]
+    clock.advance(5)
+    _append_assistant(path, "a new prompt was answered in a terminal")
+    await observer.tail_file(path)
+    assert repository.get_session(SESSION_ID).status == "running"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed", "interrupted"])
+@pytest.mark.asyncio
+async def test_finished_run_hands_back_to_a_valid_busy_claim(harness, tmp_path, terminal) -> None:
+    """Finding 3: when the higher-priority run ends while Companion's busy
+    claim is still valid, the session stays running (not idle under a claim)."""
+    repository, bus, observer, clock = harness
+    path = await _observed(observer, tmp_path)
+    repository.apply_live_state(SESSION_ID, claim("busy", 1))
+    run = repository.create_run(SESSION_ID, CreateRunRequest(message="continue"))
+    repository.start_run(SESSION_ID, run.id)
+    repository.finish_run(SESSION_ID, run.id, status=terminal)
+    assert repository.get_session(SESSION_ID).status == "running"
+    assert repository.status_owned(SESSION_ID)
+    # And once the claim has lapsed, the run's end means idle as before.
+    run2 = repository.create_run(SESSION_ID, CreateRunRequest(message="again"))
+    repository.start_run(SESSION_ID, run2.id)
+    clock.advance(60)
+    repository.finish_run(SESSION_ID, run2.id, status=terminal)
+    assert repository.get_session(SESSION_ID).status == "idle"
+
+
+def test_api_owner_scan_after_restart(tmp_path) -> None:
+    """Without the observer having seen the owner entry (harness restart), the
+    API learns it from the session's own transcript; without an entry it 409s."""
+    owned = _transcript(tmp_path)
+    other_uuid = "9f9f9f9f-1111-4222-8333-444455556666"
+    unowned = _transcript(tmp_path, other_uuid, owner=False)
+    repository = InMemoryRepository()
+    for sid, path in ((SESSION_ID, owned), ("ses_" + other_uuid.replace("-", ""), unowned)):
+        repository.upsert_session(Session(id=sid, backend="pi", origin="external", status="idle",
+                                          project=Project(path=CWD, name="agents"),
+                                          pi_transcript_path=str(path)))
+    client = TestClient(create_app(repository=repository, event_bus=InMemoryEventBus()))
+    body = {"source": "companion", "producer": "p1", "sequence": 1, "state": "busy"}
+    assert client.put(f"/v1/sessions/{SESSION_ID}/live-state", json=body).json()["status"] == "running"
+    response = client.put("/v1/sessions/ses_" + other_uuid.replace("-", "") + "/live-state", json=body)
+    assert response.status_code == 409
+    assert "not owned" in response.json()["detail"]
+
+
+def test_owner_scan_is_rate_limited() -> None:
+    registry = LiveStateRegistry()
+    assert registry.should_scan_owner("ses_x", START)
+    assert not registry.should_scan_owner("ses_x", START + timedelta(seconds=5))
+    assert registry.should_scan_owner("ses_x", START + timedelta(seconds=31))
+    registry.mark_owner("ses_x", "companion")
+    assert not registry.should_scan_owner("ses_x", START + timedelta(seconds=100))
+
+
+def test_api_idle_records_the_settled_boundary(tmp_path) -> None:
+    transcript = _transcript(tmp_path)
+    repository = InMemoryRepository()
+    repository.upsert_session(Session(id=SESSION_ID, backend="pi", origin="external", status="idle",
+                                      project=Project(path=CWD, name="agents"),
+                                      pi_transcript_path=str(transcript)))
+    client = TestClient(create_app(repository=repository, event_bus=InMemoryEventBus()))
+    url = f"/v1/sessions/{SESSION_ID}/live-state"
+    client.put(url, json={"source": "companion", "producer": "p", "sequence": 1, "state": "busy"})
+    _append_assistant(transcript, "done")
+    client.put(url, json={"source": "companion", "producer": "p", "sequence": 2, "state": "idle"})
+    size = transcript.stat().st_size
+    assert repository.observation_superseded(SESSION_ID, size - 10)
+    assert not repository.observation_superseded(SESSION_ID, size)

@@ -29,6 +29,7 @@ from agent_harness.models import (
     observed_title,
     utc_now,
 )
+from agent_harness.live_state import OWNER_ENTRY_TYPE, owner_from_entry
 from agent_harness.codex_names import CodexNameIndex
 from agent_harness.native_titles import (
     CLEARED,
@@ -997,6 +998,8 @@ class ExternalTranscriptObserver:
         if resolved_identity is None:
             # Codex partial-flush — defer this line to a later tick.
             return []
+        if resolved_identity.backend == "pi" and OWNER_ENTRY_TYPE in line:
+            self._note_live_state_owner(resolved_identity.session_id, line)
         if resolved_identity.backend == "pi":
             self._hydrate_pi_facts(transcript_path, resolved_identity.session_id)
         recovered = self._hydrate_native_titles(transcript_path, resolved_identity)
@@ -1356,6 +1359,10 @@ class ExternalTranscriptObserver:
         # ``waiting_for_input``) are not transcript-liveness claims.
         if target_status == "idle" and session.status != "running":
             return None
+        # Bytes the just-settled turn wrote before its ``idle`` arrived cannot
+        # make the session busy again; only lines after that boundary can.
+        if target_status == "running" and offset is not None and self._observation_superseded(session_id, offset):
+            return None
 
         updated = session.model_copy(update={"status": target_status, "updated_at": self._clock()})
         data: dict[str, Any] = {"session": updated.model_dump(mode="json")}
@@ -1424,6 +1431,17 @@ class ExternalTranscriptObserver:
         )
         await self._event_bus.publish(correction)
         self._repository.materialize_event(correction, store_event=True)
+
+    def _note_live_state_owner(self, session_id: str, line: str) -> None:
+        """Remember which producer may report this session (owner entry)."""
+        owner = owner_from_entry(line)
+        note = getattr(self._repository, "note_live_state_owner", None)
+        if owner is not None and callable(note):
+            note(session_id, owner)
+
+    def _observation_superseded(self, session_id: str, offset: int) -> bool:
+        superseded = getattr(self._repository, "observation_superseded", None)
+        return bool(callable(superseded) and superseded(session_id, offset))
 
     def _status_owned(self, session_id: str) -> bool:
         """An active harness run or an unexpired live ``busy`` claim owns the

@@ -40,7 +40,7 @@ from agent_harness.orchestrator import (
     validate_fork_source,
     validate_session_resume_target,
 )
-from agent_harness.live_state import LiveStateRejected
+from agent_harness.live_state import LiveStateRejected, scan_transcript_owner, transcript_size
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
 from agent_harness.settings import ObserverSettings
 
@@ -190,8 +190,29 @@ def create_app(
         if not callable(apply_live_state):
             raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="live state unsupported")
         try:
-            before = repo.get_session(session_id).status
-            session, claim = apply_live_state(session_id, request)
+            current_session = repo.get_session(session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+        before = current_session.status
+        transcript = current_session.pi_transcript_path
+
+        # Ownership: learn the session's owner from its own transcript if the
+        # observer has not seen the owner entry in this process (e.g. after a
+        # harness restart). Bounded and rate-limited; reads only the path the
+        # harness recorded for this session.
+        if repo.live_state.should_scan_owner(session_id, repo.clock()):
+            owner = await asyncio.to_thread(scan_transcript_owner, transcript)
+            if owner is not None:
+                repo.note_live_state_owner(session_id, owner)
+
+        # Settled boundary: everything already in the transcript belongs to
+        # the turn that just ended (see agent_harness.live_state).
+        settled_offset = None
+        if request.state == "idle":
+            settled_offset = await asyncio.to_thread(transcript_size, transcript)
+
+        try:
+            session, claim = apply_live_state(session_id, request, settled_offset=settled_offset)
         except SessionNotFoundError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
         except LiveStateRejected as exc:

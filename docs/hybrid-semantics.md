@@ -194,7 +194,17 @@ transcript. It reports that via `PUT /v1/sessions/{id}/live-state`
   again, as for any external session.
 - Precedence: archived > queued/running harness run > unexpired `busy` claim >
   transcript freshness.
-- Only `backend=pi, origin=external` sessions accept claims (409 otherwise).
+- Only `backend=pi, origin=external` sessions whose own transcript names the
+  reporting source accept claims (409 otherwise). The driving process writes a
+  custom Pi entry `{"type":"custom","customType":"agent-harness.live-state-owner",
+  "data":{"source":"companion"}}`; the harness notes it while tailing, or scans
+  the session's recorded transcript (bounded, rate-limited) when it has not
+  seen it in this process. A terminal Pi session has no such entry.
+- `idle` records the transcript size when it arrives. Lines before that offset
+  were written by the finished turn; tailing them later cannot mark the session
+  running again. New lines after it can.
+- When a harness run ends while an unexpired `busy` claim exists, the session
+  stays `running` (the claim takes over again) instead of going idle.
   Per producer, an update whose `sequence` is not newer than the last accepted
   one is ignored; a new producer id (producer restarted) replaces the claim.
 - Claims are kept in memory and bounded. If the producer stops renewing (crash,

@@ -67,8 +67,12 @@ paths:
         once. Claims live in memory; an expired lease falls back to the 30 s
         transcript rule. Updates whose `sequence` is not newer than the
         producer's last accepted one are ignored (`accepted: false`).
-        Archived sessions, harness-origin sessions and non-pi backends are
-        rejected with 409. A queued/running harness run keeps owning the status.
+        Archived sessions, harness-origin sessions, non-pi backends and
+        sessions whose transcript does not name `source` as owner (custom entry
+        `agent-harness.live-state-owner`) are rejected with 409. A queued/running
+        harness run keeps owning the status; when it ends, a still-valid busy
+        claim keeps the session running. An `idle` claim marks transcript lines
+        written before it as belonging to the finished turn.
       requestBody:
         required: true
         content:

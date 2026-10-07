@@ -229,11 +229,24 @@ class InMemoryRepository:
         with self._lock:
             return self._status_owned_locked(session_id)
 
+    def observation_superseded(self, session_id: str, offset: int) -> bool:
+        """A transcript line older than the session's last settled idle."""
+        with self._lock:
+            return self.live_state.superseded(session_id, offset)
+
+    def note_live_state_owner(self, session_id: str, source: str) -> None:
+        with self._lock:
+            self.live_state.mark_owner(session_id, source)
+
     def _status_owned_locked(self, session_id: str) -> bool:
         return self._has_active_run_locked(session_id) or self.live_state.busy(session_id, self.clock())
 
     def apply_live_state(
-        self, session_id: str, request: LiveStateRequest
+        self,
+        session_id: str,
+        request: LiveStateRequest,
+        *,
+        settled_offset: int | None = None,
     ) -> tuple[Session, LiveClaim | None]:
         """Record a live claim and apply it to the session's status.
 
@@ -246,9 +259,11 @@ class InMemoryRepository:
             session = self._sessions.get(session_id)
             if session is None:
                 raise SessionNotFoundError(session_id)
-            ensure_accepts_live_state(session)
+            ensure_accepts_live_state(
+                session, source=request.source, owner=self.live_state.owner(session_id)
+            )
             now = self.clock()
-            claim = self.live_state.offer(session_id, request, now)
+            claim = self.live_state.offer(session_id, request, now, settled_offset=settled_offset)
             if claim is None:
                 return session.model_copy(deep=True), None
             status = status_for_claim(session, claim, has_active_run=self._has_active_run_locked(session_id))
@@ -339,8 +354,11 @@ class InMemoryRepository:
                 for r in self._runs.values()
             )
             if not other_active:
+                # A still-valid live busy claim (lower priority than the run)
+                # takes over again; otherwise the session is idle.
+                after = "running" if self.live_state.busy(session_id, self.clock()) else "idle"
                 self._sessions[session_id] = session.model_copy(
-                    update={"status": "idle", "updated_at": utc_now()}
+                    update={"status": after, "updated_at": utc_now()}
                 )
             return finished.model_copy(deep=True)
 

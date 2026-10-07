@@ -18,6 +18,18 @@ Claims are kept in memory only. A harness restart forgets them and the
 producer re-asserts on its next heartbeat; nothing is added to the persisted
 session rows, so a rollback to a version without this module stays safe.
 
+Ownership: a producer may only report sessions it drives. Companion's Pi
+process writes a custom transcript entry (``OWNER_ENTRY_TYPE``, data
+``{"source": "companion"}``) into each conversation it runs; the harness
+learns the owner from that entry (while tailing, or by a bounded scan of the
+session's own recorded transcript path) and accepts claims only from that
+source. A terminal Pi session has no such entry and cannot be claimed.
+
+Settled boundary: an ``idle`` claim records how far the session's transcript
+reached when it arrived. Lines before that offset were written by the turn
+that just ended; observing them later (the watcher is asynchronous) must not
+make the session look busy again. Lines after it are new activity.
+
 Ordering: each producer (one per producer process lifetime) numbers its
 updates. A claim whose sequence is not newer than the last accepted claim of
 the same producer is ignored, so duplicated or reordered requests cannot
@@ -35,10 +47,77 @@ from agent_harness.models import LiveStateRequest, Session
 # Bound on remembered claims. Each is a handful of fields; the cap only
 # matters if a misbehaving producer floods distinct session ids.
 MAX_CLAIMS = 1024
+MAX_OWNERS = 4096
+
+# Custom Pi transcript entry that names the producer allowed to report a session.
+OWNER_ENTRY_TYPE = "agent-harness.live-state-owner"
+OWNER_MARKER = f'"{OWNER_ENTRY_TYPE}"'.encode()
+# Upper bound for scanning a transcript for the owner entry (bytes).
+MAX_OWNER_SCAN_BYTES = 64 * 1024 * 1024
+# A session without a known owner is re-scanned at most this often.
+OWNER_RESCAN_SECONDS = 30
 
 
 class LiveStateRejected(Exception):
-    """The session cannot take live-state claims (wrong kind, or archived)."""
+    """The session cannot take live-state claims (wrong kind, archived, or
+    not owned by the reporting source)."""
+
+
+def owner_from_entry(line: str | bytes) -> str | None:
+    """The source named by an owner entry line, or ``None``."""
+    import json
+
+    try:
+        record = json.loads(line)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "custom":
+        return None
+    if record.get("customType") != OWNER_ENTRY_TYPE:
+        return None
+    data = record.get("data")
+    source = data.get("source") if isinstance(data, dict) else None
+    if isinstance(source, str) and 0 < len(source) <= 32:
+        return source
+    return None
+
+
+def scan_transcript_owner(path: str | None) -> str | None:
+    """Look for the owner entry in a session's own transcript.
+
+    ``path`` comes from the harness's session record (never from a request).
+    Reads at most ``MAX_OWNER_SCAN_BYTES``, line by line.
+    """
+    from pathlib import Path
+
+    if not path:
+        return None
+    try:
+        with Path(path).open("rb") as handle:
+            read = 0
+            for line in handle:
+                read += len(line)
+                if read > MAX_OWNER_SCAN_BYTES:
+                    return None
+                if OWNER_MARKER in line:
+                    owner = owner_from_entry(line)
+                    if owner is not None:
+                        return owner
+    except OSError:
+        return None
+    return None
+
+
+def transcript_size(path: str | None) -> int | None:
+    """Current size of a session's own transcript, or ``None``."""
+    import os
+
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -49,19 +128,24 @@ class LiveClaim:
     state: str
     received_at: datetime
     expires_at: datetime
+    # For ``idle``: transcript size when the turn ended (see module docs).
+    settled_offset: int | None = None
 
     def busy_at(self, now: datetime) -> bool:
         return self.state == "busy" and now < self.expires_at
 
 
-def ensure_accepts_live_state(session: Session) -> None:
+def ensure_accepts_live_state(session: Session, *, source: str, owner: str | None) -> None:
     """Only external pi sessions take claims: those are the ones a live
     producer (Companion) drives and the harness can only observe. Harness-run
-    sessions are owned by their runs; archived ones by the user."""
+    sessions are owned by their runs; archived ones by the user. And only the
+    producer named in the session's own transcript may report it."""
     if session.backend != "pi" or session.origin != "external":
         raise LiveStateRejected("live state is only accepted for external pi sessions")
     if session.status == "archived":
         raise LiveStateRejected("session is archived")
+    if owner != source:
+        raise LiveStateRejected(f"session is not owned by {source}")
 
 
 def status_for_claim(session: Session, claim: LiveClaim, *, has_active_run: bool) -> str:
@@ -78,6 +162,44 @@ class LiveStateRegistry:
 
     def __init__(self) -> None:
         self._claims: dict[str, LiveClaim] = {}
+        self._owners: dict[str, str] = {}
+        self._owner_scans: dict[str, datetime] = {}
+
+    # ---- ownership
+
+    def owner(self, session_id: str) -> str | None:
+        return self._owners.get(session_id)
+
+    def mark_owner(self, session_id: str, source: str) -> None:
+        self._owners[session_id] = source
+        self._owner_scans.pop(session_id, None)
+        while len(self._owners) > MAX_OWNERS:
+            del self._owners[next(iter(self._owners))]
+
+    def should_scan_owner(self, session_id: str, now: datetime) -> bool:
+        """Rate-limit transcript scans for sessions without a known owner."""
+        if session_id in self._owners:
+            return False
+        last = self._owner_scans.get(session_id)
+        if last is not None and now - last < timedelta(seconds=OWNER_RESCAN_SECONDS):
+            return False
+        self._owner_scans[session_id] = now
+        while len(self._owner_scans) > MAX_OWNERS:
+            del self._owner_scans[next(iter(self._owner_scans))]
+        return True
+
+    # ---- claims
+
+    def superseded(self, session_id: str, offset: int) -> bool:
+        """True for a transcript line written before the session's last
+        settled ``idle`` (see module docs)."""
+        claim = self._claims.get(session_id)
+        return (
+            claim is not None
+            and claim.state == "idle"
+            and claim.settled_offset is not None
+            and offset < claim.settled_offset
+        )
 
     def busy(self, session_id: str, now: datetime) -> bool:
         claim = self._claims.get(session_id)
@@ -86,7 +208,14 @@ class LiveStateRegistry:
     def get(self, session_id: str) -> LiveClaim | None:
         return self._claims.get(session_id)
 
-    def offer(self, session_id: str, request: LiveStateRequest, now: datetime) -> LiveClaim | None:
+    def offer(
+        self,
+        session_id: str,
+        request: LiveStateRequest,
+        now: datetime,
+        *,
+        settled_offset: int | None = None,
+    ) -> LiveClaim | None:
         """Record ``request`` if it is newer than what we have; return the new
         claim, or ``None`` when it is a stale/duplicate update."""
         current = self._claims.get(session_id)
@@ -99,6 +228,7 @@ class LiveStateRegistry:
             state=request.state,
             received_at=now,
             expires_at=now + timedelta(seconds=request.lease_seconds),
+            settled_offset=settled_offset if request.state == "idle" else None,
         )
         self._claims[session_id] = claim
         self._evict(now)

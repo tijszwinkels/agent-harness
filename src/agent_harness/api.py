@@ -16,6 +16,8 @@ from starlette.responses import StreamingResponse
 from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import DurableEventBus, InMemoryEventBus
 from agent_harness.models import (
+    LiveStateRequest,
+    LiveStateResponse,
     CreateRunRequest,
     CreateRunResponse,
     CreateSessionRequest,
@@ -38,6 +40,7 @@ from agent_harness.orchestrator import (
     validate_fork_source,
     validate_session_resume_target,
 )
+from agent_harness.live_state import LiveStateRejected, scan_owner_chunk, transcript_size
 from agent_harness.repository import InMemoryRepository, RunNotFoundError, SessionNotFoundError
 from agent_harness.settings import ObserverSettings
 
@@ -178,6 +181,67 @@ def create_app(
             )
         )
         return session
+
+    @app.put("/v1/sessions/{session_id}/live-state")
+    async def put_live_state(session_id: str, request: LiveStateRequest) -> LiveStateResponse:
+        """Live busy/idle claim for an external pi session from the process
+        that drives it (see ``agent_harness.live_state``). Metadata only."""
+        apply_live_state = getattr(repo, "apply_live_state", None)
+        if not callable(apply_live_state):
+            raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="live state unsupported")
+        try:
+            current_session = repo.get_session(session_id)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+        transcript = current_session.pi_transcript_path
+
+        # Ownership: learn the session's owner from its own transcript if the
+        # observer has not seen the owner entry in this process (e.g. after a
+        # harness restart). Bounded and rate-limited; reads only the path the
+        # harness recorded for this session.
+        live_state_owner = getattr(repo, "live_state_owner", None)
+        known_owner = live_state_owner(session_id) if callable(live_state_owner) else None
+        if known_owner is None and repo.live_state.should_scan_owner(session_id, repo.clock()):
+            owner, cursor = await asyncio.to_thread(
+                scan_owner_chunk, transcript, repo.live_state.scan_cursor(session_id)
+            )
+            repo.live_state.set_scan_cursor(session_id, cursor)
+            if owner is not None:
+                repo.note_live_state_owner(session_id, owner)
+
+        # Settled boundary: everything already in the transcript belongs to
+        # the turn that just ended (see agent_harness.live_state).
+        settled_offset = None
+        if request.state == "idle":
+            settled_offset = await asyncio.to_thread(transcript_size, transcript)
+
+        try:
+            # ``changed`` is decided under the repository lock when the claim is
+            # applied, after the awaits above, so a status written meanwhile
+            # (e.g. by an observation) is compared correctly.
+            session, claim, changed = apply_live_state(session_id, request, settled_offset=settled_offset)
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+        except LiveStateRejected as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+        if changed:
+            # Same shape as observer status flips, so SSE consumers update.
+            await events.publish(
+                Event(
+                    event="session.updated",
+                    session_id=session.id,
+                    data={"session": session.model_dump(mode="json"), "live_state": claim.state},
+                )
+            )
+        current = repo.live_state.get(session_id)
+        busy = current is not None and current.busy_at(repo.clock())
+        return LiveStateResponse(
+            accepted=claim is not None,
+            status=session.status,
+            busy=busy,
+            expires_at=current.expires_at if busy else None,
+        )
 
     @app.patch("/v1/sessions/{session_id}")
     async def patch_session(session_id: str, request: PatchSessionRequest) -> object:

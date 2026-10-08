@@ -29,6 +29,7 @@ from agent_harness.models import (
     observed_title,
     utc_now,
 )
+from agent_harness.live_state import OWNER_ENTRY_TYPE, event_offset, owner_from_entry
 from agent_harness.codex_names import CodexNameIndex
 from agent_harness.native_titles import (
     CLEARED,
@@ -997,6 +998,8 @@ class ExternalTranscriptObserver:
         if resolved_identity is None:
             # Codex partial-flush — defer this line to a later tick.
             return []
+        if resolved_identity.backend == "pi" and OWNER_ENTRY_TYPE in line:
+            self._note_live_state_owner(resolved_identity.session_id, line)
         if resolved_identity.backend == "pi":
             self._hydrate_pi_facts(transcript_path, resolved_identity.session_id)
         recovered = self._hydrate_native_titles(transcript_path, resolved_identity)
@@ -1203,7 +1206,9 @@ class ExternalTranscriptObserver:
             # The durable repository re-decides this atomically at append.
             observed_status_for = getattr(self._repository, "observed_status_for", None)
             if callable(observed_status_for) and isinstance(session_data.get("status"), str):
-                overrides["status"] = observed_status_for(event.session_id, session_data["status"])
+                overrides["status"] = observed_status_for(
+                    event.session_id, session_data["status"], event_offset(event)
+                )
             overrides["title"], overrides["title_source"] = observed_title(
                 session_data.get("title"), session_data.get("title_source"), existing
             )
@@ -1350,11 +1355,15 @@ class ExternalTranscriptObserver:
         # While a harness run is queued or running, the run lifecycle owns
         # the status in both directions: silence is not completion, and
         # activity does not override e.g. ``waiting_for_input``.
-        if self._has_active_run(session_id):
+        if self._status_owned(session_id):
             return None
         # Freshness only demotes ``running``: other states (e.g.
         # ``waiting_for_input``) are not transcript-liveness claims.
         if target_status == "idle" and session.status != "running":
+            return None
+        # Bytes the just-settled turn wrote before its ``idle`` arrived cannot
+        # make the session busy again; only lines after that boundary can.
+        if target_status == "running" and offset is not None and self._observation_superseded(session_id, offset):
             return None
 
         updated = session.model_copy(update={"status": target_status, "updated_at": self._clock()})
@@ -1424,6 +1433,28 @@ class ExternalTranscriptObserver:
         )
         await self._event_bus.publish(correction)
         self._repository.materialize_event(correction, store_event=True)
+
+    def _note_live_state_owner(self, session_id: str, line: str) -> None:
+        """Remember which producer may report this session (owner entry)."""
+        owner = owner_from_entry(line)
+        note = getattr(self._repository, "note_live_state_owner", None)
+        if owner is not None and callable(note):
+            note(session_id, owner)
+
+    def _observation_superseded(self, session_id: str, offset: int) -> bool:
+        superseded = getattr(self._repository, "observation_superseded", None)
+        return bool(callable(superseded) and superseded(session_id, offset))
+
+    def _status_owned(self, session_id: str) -> bool:
+        """An active harness run or an unexpired live ``busy`` claim owns the
+        status; transcript observation must not change it meanwhile."""
+        status_owned = getattr(self._repository, "status_owned", None)
+        if callable(status_owned):
+            try:
+                return bool(status_owned(session_id))
+            except SessionNotFoundError:
+                return False
+        return self._has_active_run(session_id)
 
     def _has_active_run(self, session_id: str) -> bool:
         """True while the session has a queued or running harness run.

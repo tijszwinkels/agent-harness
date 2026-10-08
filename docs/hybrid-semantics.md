@@ -180,6 +180,45 @@ cannot override e.g. `waiting_for_input`. Enforced at three points:
 Once the run has finished, freshness applies again: a late transcript flush
 may mark the session `running`, and the next tick returns it to `idle`.
 
+### Live claims from a driving process
+
+A process that drives an external pi session live (Companion over Pi RPC)
+knows whether a turn is in progress even while nothing is written to the
+transcript. It reports that via `PUT /v1/sessions/{id}/live-state`
+(`agent_harness/live_state.py`):
+
+- `busy` with a lease (default 45 s, producer renews every ~15 s): the session
+  is `running`, and — like an active run — transcript observations cannot
+  change its status while the lease holds.
+- `idle`: the session is set `idle` once; later transcript activity may move it
+  again, as for any external session.
+- Precedence: archived > queued/running harness run > unexpired `busy` claim >
+  transcript freshness.
+- Only `backend=pi, origin=external` sessions whose own transcript names the
+  reporting source accept claims (409 otherwise). The driving process writes a
+  custom Pi entry `{"type":"custom","customType":"agent-harness.live-state-owner",
+  "data":{"source":"companion"}}`; the harness notes it while tailing and
+  persists it (SQLite table `live_state_owners`, which older harness versions
+  ignore). Without a known owner it scans the session's recorded transcript
+  incrementally: one bounded chunk per claim (16 MiB, read in 1 MiB blocks; at
+  most every 10 s), continuing where the last scan stopped. A terminal Pi
+  session has no such entry.
+- `idle` records the transcript size when it arrives. Observations of lines
+  before that offset (written by the finished turn, tailed late) cannot change
+  the status — neither running-kicks nor metadata `session.updated` events —
+  though their non-status metadata (e.g. model) still applies. New lines after
+  it can.
+- When a harness run ends while an unexpired `busy` claim exists, the session
+  stays `running` (the claim takes over again) instead of going idle.
+  Per producer, an update whose `sequence` is not newer than the last accepted
+  one is ignored; a new producer id (producer restarted) replaces the claim.
+- Claims are kept in memory and bounded. If the producer stops renewing (crash,
+  network), the lease expires and the 30 s transcript rule applies again, so a
+  dead producer never leaves a session running. A harness restart forgets all
+  claims; the producer re-asserts on its next heartbeat (meanwhile the transcript
+  rule applies). External sessions without a producer (plain terminals) remain
+  best effort.
+
 Archiving an external session affects harness visibility only. It does not stop,
 signal, delete, or otherwise mutate the external backend process or transcript.
 

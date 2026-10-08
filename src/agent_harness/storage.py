@@ -9,6 +9,7 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from agent_harness.models import (
+    LiveStateRequest,
     CreateRunRequest,
     CreateSessionRequest,
     Event,
@@ -22,6 +23,13 @@ from agent_harness.models import (
     merge_observed_session,
     observed_status,
     utc_now,
+)
+from agent_harness.live_state import (
+    LiveClaim,
+    event_offset,
+    LiveStateRegistry,
+    ensure_accepts_live_state,
+    status_for_claim,
 )
 from agent_harness.repository import (
     RunNotFoundError,
@@ -79,6 +87,14 @@ create table if not exists events (
     created_at text not null
 );
 
+-- Live-state owners (agent_harness.live_state). A separate table, so a
+-- harness version without this feature ignores it and rollback stays safe.
+create table if not exists live_state_owners (
+    session_id text primary key,
+    source text not null,
+    updated_at text not null
+);
+
 create table if not exists observer_offsets (
     path text primary key,
     next_offset integer not null,
@@ -103,6 +119,10 @@ class SQLiteRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
         self._lock = RLock()
+        # Live claims from producers of external sessions (in memory only).
+        self.live_state = LiveStateRegistry()
+        # Injectable for tests that drive time with a fake clock.
+        self.clock = utc_now
         self._message_keys: dict[str, set[tuple[str, str]]] = {}
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("pragma foreign_keys = on")
@@ -356,6 +376,89 @@ class SQLiteRepository:
         with self._lock:
             return self._has_active_run_locked(session_id)
 
+    def status_owned(self, session_id: str) -> bool:
+        """True while something more authoritative than transcript
+        observation owns the status: a queued/running harness run, or an
+        unexpired live ``busy`` claim."""
+        with self._lock:
+            return self._status_owned_locked(session_id)
+
+    def observation_superseded(self, session_id: str, offset: int) -> bool:
+        """A transcript line older than the session's last settled idle."""
+        with self._lock:
+            return self.live_state.superseded(session_id, offset)
+
+    def note_live_state_owner(self, session_id: str, source: str) -> None:
+        # Persisted: after a restart the observer's saved offsets skip the
+        # owner entry, so it must survive in the database.
+        with self._lock, self._connection:
+            self.live_state.mark_owner(session_id, source)
+            self._connection.execute(
+                "insert into live_state_owners (session_id, source, updated_at) values (?, ?, ?) "
+                "on conflict(session_id) do update set source = excluded.source, updated_at = excluded.updated_at",
+                (session_id, source, utc_now().isoformat()),
+            )
+
+    def live_state_owner(self, session_id: str) -> str | None:
+        with self._lock:
+            return self._live_state_owner_locked(session_id)
+
+    def _live_state_owner_locked(self, session_id: str) -> str | None:
+        owner = self.live_state.owner(session_id)
+        if owner is not None:
+            return owner
+        row = self._connection.execute(
+            "select source from live_state_owners where session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        self.live_state.mark_owner(session_id, row["source"])
+        return row["source"]
+
+    def _observation_owned_locked(self, session_id: str, offset: int | None) -> bool:
+        """An observation may not change the status: something more
+        authoritative owns it, or the observed line belongs to a turn that
+        has already settled (see ``live_state``)."""
+        if self._status_owned_locked(session_id):
+            return True
+        return offset is not None and self.live_state.superseded(session_id, offset)
+
+    def _status_owned_locked(self, session_id: str) -> bool:
+        return self._has_active_run_locked(session_id) or self.live_state.busy(session_id, self.clock())
+
+    def apply_live_state(
+        self,
+        session_id: str,
+        request: LiveStateRequest,
+        *,
+        settled_offset: int | None = None,
+    ) -> tuple[Session, LiveClaim | None, bool]:
+        """Record a live claim and apply it to the session's status.
+
+        Returns the (possibly updated) session, the accepted claim (``None``
+        for a stale/duplicate update) and whether the status changed now,
+        decided under the lock at application time. Raises ``SessionNotFoundError``
+        or ``LiveStateRejected``. Claim and status change happen under one
+        lock, so observations materialized concurrently see both.
+        """
+        with self._lock, self._connection:
+            session = self._find_session_locked(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            ensure_accepts_live_state(
+                session, source=request.source, owner=self._live_state_owner_locked(session_id)
+            )
+            now = self.clock()
+            claim = self.live_state.offer(session_id, request, now, settled_offset=settled_offset)
+            if claim is None:
+                return session.model_copy(deep=True), None, False
+            status = status_for_claim(session, claim, has_active_run=self._has_active_run_locked(session_id))
+            changed = status != session.status
+            if changed:
+                session = session.model_copy(update={"status": status, "updated_at": now})
+                self._upsert_session(session)
+            return session.model_copy(deep=True), claim, changed
+
     def _has_active_run_locked(self, session_id: str) -> bool:
         row = self._connection.execute(
             """
@@ -467,8 +570,11 @@ class SQLiteRepository:
                 (session_id, run_id),
             ).fetchone()
             if other_active is None:
+                # A still-valid live busy claim (lower priority than the run)
+                # takes over again; otherwise the session is idle.
+                after = "running" if self.live_state.busy(session_id, self.clock()) else "idle"
                 self._upsert_session(
-                    session.model_copy(update={"status": "idle", "updated_at": utc_now()})
+                    session.model_copy(update={"status": after, "updated_at": utc_now()})
                 )
         return finished.model_copy(deep=True)
 
@@ -542,13 +648,14 @@ class SQLiteRepository:
             self._insert_event(published)
         return published.model_copy(deep=True)
 
-    def observed_status_for(self, session_id: str, status: str) -> str:
-        """The status an observation of ``session_id`` would be stored with."""
+    def observed_status_for(self, session_id: str, status: str, offset: int | None = None) -> str:
+        """The status an observation of ``session_id`` (from transcript
+        ``offset``, if known) would be stored with."""
         with self._lock:
             return observed_status(
                 status,
                 self._find_session_locked(session_id),
-                has_active_run=self._has_active_run_locked(session_id),
+                has_active_run=self._observation_owned_locked(session_id, offset),
             )
 
     def _reconcile_observed_event_locked(self, event: Event) -> Event:
@@ -562,7 +669,7 @@ class SQLiteRepository:
         decided = observed_status(
             status,
             self._find_session_locked(session_id),
-            has_active_run=self._has_active_run_locked(session_id),
+            has_active_run=self._observation_owned_locked(session_id, event_offset(event)),
         )
         if decided == status:
             return event
@@ -593,7 +700,7 @@ class SQLiteRepository:
                     merged = merge_observed_session(
                         incoming,
                         existing,
-                        has_active_run=self._has_active_run_locked(incoming.id),
+                        has_active_run=self._observation_owned_locked(incoming.id, event_offset(event)),
                     )
                     if merged is not None:
                         self._upsert_session(merged)

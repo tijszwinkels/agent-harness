@@ -151,24 +151,14 @@ async def test_durable_event_bus_continues_sequence_after_reopen(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_durable_lifecycle_publish_preserves_event_when_materialization_fails(
+async def test_durable_publish_rolls_back_the_row_when_materialization_fails(
     tmp_path, monkeypatch
 ) -> None:
-    """Phase 3 semantic change: ``DurableEventBus.publish`` splits the
-    append + materialize into two separate steps. ``append_event``
-    succeeds atomically; if ``materialize_event`` raises afterwards,
-    the event row is INTENTIONALLY preserved.
-
-    Rationale: the failure that motivates the split is the
-    ``SessionNotFoundError`` → buffer-for-later-flush path. The event
-    is durable; the side effect is deferred. The buffering caller
-    (observer.publish_line) replays via ``materialize_event(store_event=False)``
-    once the session appears.
-
-    A programmer-error ``RuntimeError`` in the materializer bubbles
-    up just like before, but the event row stays. This is consistent
-    with the unified design: durability and materialization are
-    decoupled at the bus seam.
+    """Append and materialization commit together (issue #46). Only a
+    missing session keeps the row and defers materialization (see the
+    buffering tests); any other materialization failure rolls the row back,
+    so a caller that retries the publish can't append the event twice.
+    (Before #46 the row stayed, and the observer's retry duplicated it.)
     """
     db_path = tmp_path / "harness.db"
     repository = open_sqlite_repository(db_path)
@@ -205,9 +195,9 @@ async def test_durable_lifecycle_publish_preserves_event_when_materialization_fa
 
     reopened = open_sqlite_repository(db_path)
     try:
-        # The event row IS present (append succeeded).
+        # No orphan event row: append and materialize rolled back together.
         events = reopened.list_events(session_id=session.id, run_id=run.id)
-        assert [event.event for event in events] == ["run.completed"]
+        assert events == []
         # The run was NOT moved to completed (the materialize was the
         # step that did that; it crashed). Reopen reconciles dangling
         # state — running → failed.

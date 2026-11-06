@@ -171,9 +171,18 @@ class DurableEventBus:
         # carrying the published event — caller buffers for later flush.
         deferred_session_id: str | None = None
         async with self._lock:
-            published = self._repository.append_event(event)
+            # One transaction when the repository offers it: a failed
+            # materialization then leaves no orphan row that a retry would
+            # append a second time.
+            atomic = getattr(self._repository, "append_and_materialize_event", None)
             try:
-                self._repository.materialize_event(published, store_event=False)
+                if callable(atomic):
+                    published, deferred = atomic(event)
+                    if deferred is not None:
+                        raise deferred
+                else:
+                    published = self._repository.append_event(event)
+                    self._repository.materialize_event(published, store_event=False)
             except SessionNotFoundError as exc:
                 # Cache the session_id for the post-lock raise. We still
                 # want to notify subscribers (they care about the

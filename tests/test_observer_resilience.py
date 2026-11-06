@@ -620,3 +620,198 @@ def test_live_leases_with_in_memory_repository() -> None:
     assert set(client.get("/v1/sessions").json()["live_leases"]) == {sid(UUID_A)}
     clock.advance(31)
     assert client.get("/v1/sessions").json()["live_leases"] == {}
+
+
+# ------------------------------------------------- review round 1 (Aster)
+
+
+@pytest.mark.asyncio
+async def test_materialization_failure_after_append_is_not_appended_twice(sqlite_harness, tmp_path, monkeypatch) -> None:
+    """Finding 1: the durable bus used to commit the event row before
+    materializing; a failed materialization left the row, and the retry
+    appended it again."""
+    repository, bus, observer, clock = sqlite_harness
+    path = transcript(tmp_path, UUID_A, user("first"))
+    await observer.tail_file(path)
+    append(path, user("second"))
+    original = repository._materialize_message_event
+    failures = iter([True])
+
+    def flaky(event, **kwargs):
+        if next(failures, False):
+            raise sqlite3.OperationalError("database is locked")
+        return original(event, **kwargs)
+
+    monkeypatch.setattr(repository, "_materialize_message_event", flaky)
+    await observer.tail_file(path)
+    assert observer.observation_snapshot()["retrying_files"] == 1
+    clock.advance(5)
+    await observer.retry_pending()
+
+    messages = [e for e in await bus.replay() if e.event == "message"]
+    ids = [e.data["message"]["id"] for e in messages]
+    assert len(ids) == len(set(ids)) == 2
+    assert message_texts(repository, sid(UUID_A)) == ["first", "second"]
+    assert repository.get_session(sid(UUID_A)).stats.messages == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_running_kick_is_retried_without_republishing(sqlite_harness, tmp_path, monkeypatch) -> None:
+    """Finding 2: the event counted as done before its running kick; a
+    failed kick advanced the cursor and left the session idle."""
+    repository, bus, observer, clock = sqlite_harness
+    path = transcript(tmp_path, UUID_A, user("first"))
+    await observer.tail_file(path)
+    clock.advance(31)
+    await observer.freshness_tick()
+    assert repository.get_session(sid(UUID_A)).status == "idle"
+
+    append(path, user("back to work"))
+    original = observer._maybe_publish_status_flip
+    failures = iter([True])
+
+    async def flaky(*args, **kwargs):
+        if next(failures, False):
+            raise sqlite3.OperationalError("database is locked")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(observer, "_maybe_publish_status_flip", flaky)
+    await observer.tail_file(path)
+    assert repository.get_session(sid(UUID_A)).status == "idle"
+    assert observer.observation_snapshot()["retrying_files"] == 1
+    clock.advance(5)
+    await observer.retry_pending()
+
+    assert repository.get_session(sid(UUID_A)).status == "running"
+    assert observer.observation_snapshot()["retrying_files"] == 0
+    assert observer.tracked_offsets()[path] == path.stat().st_size
+    assert [e.data["message"]["blocks"][0]["text"] for e in await bus.replay() if e.event == "message"] == [
+        "first", "back to work"]
+
+
+@pytest.mark.asyncio
+async def test_deferred_materialization_failure_is_kept_and_retried(sqlite_harness, monkeypatch) -> None:
+    repository, bus, observer, _ = sqlite_harness
+    from agent_harness.models import Event, Message, Project, Session, TextBlock
+
+    session_id = sid(UUID_A)
+    message = Message(role="user", blocks=[TextBlock(text="early")])
+    # Buffer an event as the observer does when the session doesn't exist yet.
+    from agent_harness.repository import MaterializationDeferred
+    try:
+        await bus.publish(Event(event="message", session_id=session_id, data={"message": message.model_dump(mode="json")}))
+    except MaterializationDeferred as deferred:
+        observer._buffer_materialization(deferred.event)  # noqa: SLF001
+    original = repository.materialize_event
+    failures = iter([True])
+
+    def flaky(event, **kwargs):
+        if next(failures, False):
+            raise sqlite3.OperationalError("database is locked")
+        return original(event, **kwargs)
+
+    monkeypatch.setattr(repository, "materialize_event", flaky)
+    repository.upsert_session(Session(id=session_id, backend="pi", origin="external", status="idle",
+                                      project=Project(path=CWD, name="work")))
+    observer._flush_pending_materialization(session_id)  # noqa: SLF001 — what session.updated triggers
+    assert observer.observation_snapshot()["retrying_files"] == 1
+    assert message_texts(repository, session_id) == []
+    await observer.retry_pending()
+    assert observer.observation_snapshot()["retrying_files"] == 0
+    assert message_texts(repository, session_id) == ["early"]
+
+
+@pytest.mark.asyncio
+async def test_stale_catch_up_cannot_clear_a_newer_failure_window(sqlite_harness, tmp_path) -> None:
+    """Finding 3: a catch-up started for one failure kept running through
+    the next failure's backoff and cleared the newer gap."""
+    repository, _, observer, clock = sqlite_harness
+    seen = transcript(tmp_path, UUID_A, user("seen"))
+    await observer.tail_file(seen)
+    clock.now = datetime.fromtimestamp(seen.stat().st_mtime, UTC)
+
+    def write_new_session() -> None:
+        transcript(tmp_path, UUID_B, OWNER, user("born between failures"))
+
+    stop = asyncio.Event()
+    watcher = ScriptedWatcher([
+        [RuntimeError("first")],
+        # Restarted, and fails again at once while its catch-up runs. That
+        # catch-up used to finish during the backoff and clear the gap ...
+        [RuntimeError("second")],
+        # ... so a session written before the next watcher was up (modelled
+        # here as no change event for it) was never caught up.
+        [write_new_session, "wait"],
+    ])
+    service = TranscriptWatchService(roots=[tmp_path], observer=observer, watcher=watcher, clock=clock,
+                                     restart_base_seconds=0.05, freshness_interval_seconds=3600)
+    task = asyncio.create_task(service.watch_forever(stop_event=stop))
+    for _ in range(300):
+        await asyncio.sleep(0.01)
+        if watcher.calls == 3 and service.health()["state"] == "healthy":
+            break
+    assert service.health()["state"] == "healthy"
+    assert message_texts(repository, sid(UUID_B)) == ["born between failures"]
+    stop.set()
+    await asyncio.wait_for(task, 5)
+
+
+def test_catch_up_scan_reports_io_errors_but_not_vanished_entries(tmp_path) -> None:
+    from agent_harness.observer import _catch_up_candidates
+
+    (tmp_path / "gone.jsonl").symlink_to(tmp_path / "missing-target")  # stat: FileNotFoundError
+    found, errors = _catch_up_candidates([tmp_path], {}, 0)
+    assert (found, errors) == ([], [])
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "x.jsonl").write_text("{}\n")
+    locked.chmod(0)
+    try:
+        _, errors = _catch_up_candidates([tmp_path], {}, 0)
+    finally:
+        locked.chmod(0o700)
+    assert errors == ["PermissionError"]
+    _, errors = _catch_up_candidates([tmp_path / "no-such-root"], {}, 0)
+    assert errors == ["FileNotFoundError"]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_catch_up_scan_stays_degraded_and_rescans(sqlite_harness, tmp_path, monkeypatch) -> None:
+    """Finding 4: a scan error used to be swallowed, skipping a grown
+    transcript while reporting complete coverage."""
+    repository, _, observer, clock = sqlite_harness
+    path = transcript(tmp_path, UUID_A, user("seen"))
+    await observer.tail_file(path)
+
+    real_stat = Path.stat
+    failing = {"left": 1}
+
+    def flaky_stat(self, *args, **kwargs):
+        if self == path and failing["left"]:
+            failing["left"] -= 1
+            raise PermissionError(13, "synthetic", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    def grow_then_fail() -> None:
+        append(path, user("missed while down"))
+        monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    stop = asyncio.Event()
+    watcher = ScriptedWatcher([[grow_then_fail, RuntimeError("watch died")], ["wait"]])
+    service = TranscriptWatchService(roots=[tmp_path], observer=observer, watcher=watcher, clock=clock,
+                                     restart_base_seconds=0.05, freshness_interval_seconds=3600)
+    task = asyncio.create_task(service.watch_forever(stop_event=stop))
+    states = set()
+    for _ in range(300):
+        await asyncio.sleep(0.01)
+        health = service.health()
+        states.add(health["state"])
+        if watcher.calls == 2 and health["state"] == "healthy":
+            break
+    assert "degraded" in states  # the incomplete scan was never certified
+    assert service.health()["state"] == "healthy"
+    assert service.health()["last_error"] == "PermissionError"
+    assert message_texts(repository, sid(UUID_A)) == ["seen", "missed while down"]
+    stop.set()
+    await asyncio.wait_for(task, 5)

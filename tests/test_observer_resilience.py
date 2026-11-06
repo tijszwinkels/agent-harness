@@ -815,3 +815,31 @@ async def test_incomplete_catch_up_scan_stays_degraded_and_rescans(sqlite_harnes
     assert message_texts(repository, sid(UUID_A)) == ["seen", "missed while down"]
     stop.set()
     await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+async def test_stop_ends_a_catch_up_that_keeps_rescanning(sqlite_harness, tmp_path) -> None:
+    """Round 2: a catch-up retrying a failing scan kept watch_forever from
+    finishing after stop_event was set."""
+    _, _, observer, clock = sqlite_harness
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    stop = asyncio.Event()
+    watcher = ScriptedWatcher([[RuntimeError("watch died")], ["wait"]])
+    service = TranscriptWatchService(roots=[tmp_path], observer=observer, watcher=watcher, clock=clock,
+                                     restart_base_seconds=0.01, freshness_interval_seconds=3600)
+    task = asyncio.create_task(service.watch_forever(stop_event=stop))
+    try:
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if watcher.calls == 2 and service.health()["state"] == "degraded":
+                break
+        assert service.health()["state"] == "degraded"
+        assert service.health()["last_error"] == "PermissionError"
+        stop.set()
+        await asyncio.wait_for(task, 1)
+        assert service.health()["state"] == "stopped"
+    finally:
+        locked.chmod(0o700)
+        task.cancel()

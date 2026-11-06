@@ -2004,9 +2004,9 @@ class TranscriptWatchService:
                     if self._observer.lines_processed > progress_mark:
                         # Demonstrated progress since the last restart.
                         self._consecutive_failures = 0
-                if catch_up is not None:
-                    await catch_up
-                # The watcher only ends when asked to stop.
+                # The watcher only ends when asked to stop: an unfinished
+                # catch-up (possibly rescanning after errors) stops too.
+                await _cancel(catch_up)
                 self._set_state("stopped")
                 return
             except asyncio.CancelledError:

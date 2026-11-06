@@ -15,8 +15,9 @@ from agent_harness.storage import open_sqlite_repository
 def test_health_and_backend_listing() -> None:
     client = TestClient(create_app())
 
-    assert client.get("/health").json() == {"status": "ok"}
-    assert client.get("/v1/health").json() == {"status": "ok"}
+    disabled = {"status": "ok", "observation": {"state": "disabled", "complete": False}}
+    assert client.get("/health").json() == disabled
+    assert client.get("/v1/health").json() == disabled
 
     response = client.get("/v1/backends")
     assert response.status_code == 200

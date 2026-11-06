@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -23,6 +24,22 @@ def utc_now() -> datetime:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
+
+
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def replace_lone_surrogates(text: str) -> str:
+    """``text`` with every unpaired UTF-16 surrogate replaced by U+FFFD.
+
+    ``json.loads`` turns an escaped lone surrogate (``"\\ud83d"``, e.g. an
+    emoji cut in half by a truncating tool) into a code point that cannot be
+    encoded as UTF-8, so serializing it fails. A high+low pair still in the
+    string becomes the character it encodes; everything else is untouched.
+    """
+    if _SURROGATE_RE.search(text) is None:
+        return text
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
 
 
 class HarnessModel(BaseModel):

@@ -29,6 +29,8 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Final
 
+from agent_harness.models import replace_lone_surrogates
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +92,7 @@ def native_name(value: object) -> NativeName | None:
     """
     if not isinstance(value, str):
         return None
-    return " ".join(value.split()) or CLEARED
+    return " ".join(replace_lone_surrogates(value).split()) or CLEARED
 
 
 def native_title_slot(

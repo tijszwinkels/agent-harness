@@ -403,6 +403,11 @@ class SQLiteRepository:
         with self._lock:
             return self._live_state_owner_locked(session_id)
 
+    def live_leases(self) -> dict[str, LiveClaim]:
+        """Sessions held busy by an unexpired live claim, read now."""
+        with self._lock:
+            return self.live_state.busy_leases(self.clock())
+
     def _live_state_owner_locked(self, session_id: str) -> str | None:
         owner = self.live_state.owner(session_id)
         if owner is not None:

@@ -403,6 +403,11 @@ class SQLiteRepository:
         with self._lock:
             return self._live_state_owner_locked(session_id)
 
+    def live_leases(self) -> dict[str, LiveClaim]:
+        """Sessions held busy by an unexpired live claim, read now."""
+        with self._lock:
+            return self.live_state.busy_leases(self.clock())
+
     def _live_state_owner_locked(self, session_id: str) -> str | None:
         owner = self.live_state.owner(session_id)
         if owner is not None:
@@ -675,47 +680,86 @@ class SQLiteRepository:
             return event
         return event.model_copy(update={"data": {**event.data, "session": {**session_data, "status": decided}}})
 
+    def append_and_materialize_event(self, event: Event) -> tuple[Event, SessionNotFoundError | None]:
+        """``append_event`` + ``materialize_event(store_event=False)`` in one
+        transaction, for ``DurableEventBus``: if materialization fails, the
+        row is rolled back too, so a retry can't append the event twice.
+
+        A missing session is not a failure here: the row is kept (committed)
+        and the ``SessionNotFoundError`` returned, so the caller can defer
+        materialization as before.
+        """
+        deferred: SessionNotFoundError | None = None
+        try:
+            with self._lock, self._connection:
+                published = self._reconcile_observed_event_locked(event)
+                published = published.with_sequence(self._next_event_sequence_locked())
+                self._insert_event(published)
+                # Keep the row but none of a partial materialization, as
+                # when the two ran in separate transactions.
+                self._connection.execute("savepoint materialize")
+                try:
+                    self._materialize_event_locked(published)
+                except SessionNotFoundError as exc:
+                    self._connection.execute("rollback to materialize")
+                    deferred = exc
+                self._connection.execute("release materialize")
+        except BaseException:
+            # A rolled-back message must not stay in the content-dedupe
+            # cache, or its retry would be dropped as a duplicate.
+            if event.session_id:
+                self._message_keys.pop(event.session_id, None)
+            raise
+        return published.model_copy(deep=True), deferred
+
     def materialize_event(self, event: Event, *, store_event: bool = True) -> None:
-        with self._lock, self._connection:
-            if store_event:
-                event = self._reconcile_observed_event_locked(event)
-                self._insert_event(event)
+        try:
+            with self._lock, self._connection:
+                if store_event:
+                    event = self._reconcile_observed_event_locked(event)
+                    self._insert_event(event)
+                self._materialize_event_locked(event)
+        except BaseException:
+            if event.session_id:
+                self._message_keys.pop(event.session_id, None)
+            raise
 
-            if event.event == "session.updated":
-                session_data = event.data.get("session")
-                if isinstance(session_data, dict):
-                    incoming = Session.model_validate(session_data)
-                    existing = self._find_session_locked(incoming.id)
-                    # Preservation rules live in
-                    # ``merge_observed_session`` so this path and the
-                    # in-memory one can't drift: an observation
-                    # refreshes the conversation's shape (backend /
-                    # model / project / status) and nothing else — the
-                    # user's title/effort/bypass_permissions, the
-                    # accumulated stats and the original created_at all
-                    # survive. It returns None for the origin-downgrade
-                    # case (external observation of a harness-owned
-                    # session), which once caused the bridge to adopt a
-                    # channel away from its live session.
-                    merged = merge_observed_session(
-                        incoming,
-                        existing,
-                        has_active_run=self._observation_owned_locked(incoming.id, event_offset(event)),
-                    )
-                    if merged is not None:
-                        self._upsert_session(merged)
-                return
+    def _materialize_event_locked(self, event: Event) -> None:
+        if event.event == "session.updated":
+            session_data = event.data.get("session")
+            if isinstance(session_data, dict):
+                incoming = Session.model_validate(session_data)
+                existing = self._find_session_locked(incoming.id)
+                # Preservation rules live in
+                # ``merge_observed_session`` so this path and the
+                # in-memory one can't drift: an observation
+                # refreshes the conversation's shape (backend /
+                # model / project / status) and nothing else — the
+                # user's title/effort/bypass_permissions, the
+                # accumulated stats and the original created_at all
+                # survive. It returns None for the origin-downgrade
+                # case (external observation of a harness-owned
+                # session), which once caused the bridge to adopt a
+                # channel away from its live session.
+                merged = merge_observed_session(
+                    incoming,
+                    existing,
+                    has_active_run=self._observation_owned_locked(incoming.id, event_offset(event)),
+                )
+                if merged is not None:
+                    self._upsert_session(merged)
+            return
 
-            if event.event in RUN_LIFECYCLE_EVENTS:
-                self._materialize_run_lifecycle_event(event)
-                return
+        if event.event in RUN_LIFECYCLE_EVENTS:
+            self._materialize_run_lifecycle_event(event)
+            return
 
-            if event.event == "message":
-                self._materialize_message_event(event)
-                return
+        if event.event == "message":
+            self._materialize_message_event(event)
+            return
 
-            if event.event == "run.usage":
-                self._materialize_run_usage_event(event)
+        if event.event == "run.usage":
+            self._materialize_run_usage_event(event)
 
     def _materialize_message_event(self, event: Event, *, dedupe_by_content: bool = True) -> None:
         message_data = event.data.get("message")

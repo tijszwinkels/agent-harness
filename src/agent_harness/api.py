@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Protocol
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
@@ -110,12 +110,12 @@ def create_app(
         )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health(response: Response) -> dict[str, object]:
+        return _health(app, settings, response)
 
     @app.get("/v1/health")
-    async def versioned_health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def versioned_health(response: Response) -> dict[str, object]:
+        return _health(app, settings, response)
 
     @app.get("/v1/backends")
     async def list_backends() -> dict[str, object]:
@@ -147,7 +147,13 @@ def create_app(
 
     @app.get("/v1/sessions")
     async def list_sessions() -> dict[str, object]:
-        return {"data": repo.list_sessions()}
+        # Coverage and leases ride along with the list, so a client counting
+        # activity reads all three from one response. ``data`` is unchanged.
+        return {
+            "data": repo.list_sessions(),
+            "observation": _observation_status(app, settings),
+            "live_leases": _live_leases(repo),
+        }
 
     @app.get("/v1/sessions/{session_id}")
     async def get_session(session_id: str) -> object:
@@ -622,6 +628,60 @@ def _event_bus_for_repository(repository: InMemoryRepository) -> InMemoryEventBu
     if callable(append_event) and callable(list_events):
         return DurableEventBus(repository)
     return InMemoryEventBus()
+
+
+def _observation_status(app: FastAPI, settings: ObserverSettings) -> dict[str, object]:
+    """Transcript observation state, content-free (see
+    ``TranscriptWatchService.health``). ``complete`` is true only when
+    configured observation is running normally."""
+    if not settings.enabled:
+        return {"state": "disabled", "complete": False}
+    service = getattr(app.state, "transcript_watch_service", None)
+    task = getattr(app.state, "transcript_watch_task", None)
+    health = getattr(service, "health", None)
+    if callable(health):
+        observation = dict(health())
+    else:
+        # Not started yet, or a custom watch service that can't tell.
+        observation = {"state": "starting" if service is None else "unknown", "complete": False}
+    if task is not None and task.done() and observation.get("state") not in ("failed", "stopped"):
+        # The watch task ended without saying why: it is not watching.
+        observation.update(state="failed", complete=False)
+    return observation
+
+
+def _health(app: FastAPI, settings: ObserverSettings, response: Response) -> dict[str, object]:
+    """Liveness plus observation. HTTP 503 only when configured observation
+    has stopped working; the API itself (sessions, runs) stays available,
+    and nothing restarts on it. A quiet watcher is healthy."""
+    observation = _observation_status(app, settings)
+    state = observation.get("state")
+    if state in ("failed", "stopped"):
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        overall = "failed"
+    elif state in ("healthy", "disabled"):
+        overall = "ok"
+    else:
+        overall = "degraded"
+    return {"status": overall, "observation": observation}
+
+
+def _live_leases(repository: object) -> dict[str, object]:
+    """Unexpired busy leases (``PUT .../live-state``), by session id. A
+    session listed here is working whatever its ``updated_at`` says: lease
+    renewals don't touch the session row."""
+    live_leases = getattr(repository, "live_leases", None)
+    if not callable(live_leases):
+        return {}
+    return {
+        session_id: {
+            "state": claim.state,
+            "source": claim.source,
+            "renewed_at": claim.received_at.isoformat(),
+            "expires_at": claim.expires_at.isoformat(),
+        }
+        for session_id, claim in live_leases().items()
+    }
 
 
 def _create_watch_service(

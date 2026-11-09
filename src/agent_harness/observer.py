@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from json import JSONDecodeError
@@ -27,6 +29,7 @@ from agent_harness.models import (
     ToolUseBlock,
     Usage,
     observed_title,
+    replace_lone_surrogates,
     utc_now,
 )
 from agent_harness.live_state import OWNER_ENTRY_TYPE, event_offset, owner_from_entry
@@ -283,6 +286,9 @@ class ObserverState:
         offsets.add(offset)
         return True
 
+    def forget_seen(self, path: Path, offset: int) -> None:
+        self.seen_offsets.get(path, set()).discard(offset)
+
     def next_offset(self, path: Path) -> int:
         return self.next_offsets.get(path, 0)
 
@@ -300,6 +306,44 @@ class ObserverState:
 
 
 DEFAULT_IDLE_AFTER_SECONDS = 30.0
+
+# Retryable tail failures back off per file: 5 s, 10 s, ... up to 2 minutes.
+_RETRY_BASE_SECONDS = 5.0
+_RETRY_MAX_SECONDS = 120.0
+# Rejected-record warnings: at most this many per window, then a count.
+_REJECT_LOG_LIMIT = 5
+_REJECT_LOG_WINDOW = timedelta(minutes=1)
+
+
+def _is_bad_record(exc: BaseException) -> bool:
+    """True for a failure caused by the record's own data, which a retry
+    would reproduce: unencodable text (``UnicodeEncodeError``, pydantic's
+    serialization error), values a model refuses (``ValidationError``),
+    shapes the parsers can't handle (``TypeError``) and numbers too large to
+    store (``OverflowError``). Storage (``sqlite3.Error``), I/O
+    (``OSError``) and cancellation are not, so they are retried instead."""
+    return isinstance(exc, (ValueError, TypeError, ArithmeticError))
+
+
+@dataclass(slots=True)
+class _FileRetry:
+    attempts: int
+    due_at: datetime
+
+
+_NOT_PUBLISHED: Any = object()
+
+
+@dataclass(slots=True)
+class _InflightLine:
+    offset: int
+    events: list[Event]
+    # Events before this index are done (published and followed up).
+    next_index: int = 0
+    # The event at ``next_index`` once published, until its follow-up is done.
+    published: Any = _NOT_PUBLISHED
+
+
 # Codex rollout expectation knobs (two dimensions, two purposes):
 #
 # - ``DEFAULT_EXPECTATION_TTL_SECONDS`` (60s) — how long a registered
@@ -343,6 +387,21 @@ class ExternalTranscriptObserver:
             )
         self._state = state
         self._pending_materialization: dict[str, list[Event]] = {}
+        # Failure containment (see ``tail_file``): files waiting to be
+        # retried after a retryable failure, the parsed events of a line
+        # that failed part-way, and content-free counters for health.
+        self._tail_lock = asyncio.Lock()
+        self._retries: dict[Path, _FileRetry] = {}
+        # Sessions whose deferred materialization failed (see
+        # ``_flush_pending_materialization``).
+        self._flush_retries: set[str] = set()
+        self._inflight: dict[Path, _InflightLine] = {}
+        self._rejected_records = 0
+        self._lines_processed = 0
+        self._last_error: str | None = None
+        self._reject_log_window: datetime | None = None
+        self._reject_log_count = 0
+        self._reject_log_suppressed = 0
         self._idle_after = timedelta(seconds=idle_after_seconds)
         self._clock = clock or utc_now
         # Pre-bindings populated by the orchestrator's spawn path (via
@@ -929,19 +988,50 @@ class ExternalTranscriptObserver:
         return _SessionMetaPeek(cwd=cwd, timestamp=ts)
 
     async def tail_file(self, path: str | Path) -> list[Event]:
+        """Publish the complete records appended to ``path`` since its cursor.
+
+        Never raises for a record or storage problem (cancellation still
+        propagates), so one file can't stop the watcher; see
+        ``_tail_file_locked`` for how failures are contained. Calls are
+        serialized: the watcher and the retry tick share the cursors.
+        """
         transcript_path = Path(path)
+        async with self._tail_lock:
+            if not self._retry_due(transcript_path):
+                # Backing off after a retryable failure; the retry tick
+                # (``retry_pending``) comes back for it, so a busy writer
+                # can't turn the failure into a hot loop.
+                return []
+            published: list[Event] = []
+            try:
+                await self._tail_file_locked(transcript_path, published)
+            except Exception as exc:
+                self._schedule_retry(transcript_path, exc)
+            else:
+                self._retries.pop(transcript_path, None)
+            return published
+
+    async def _tail_file_locked(self, transcript_path: Path, published: list[Event]) -> None:
+        """Tail one file, appending published events to ``published``.
+
+        The cursor moves past a record only once it is fully published, or
+        rejected as a deterministic bad record (``_is_bad_record``: its data
+        can never be stored, so retrying cannot help). Any other failure —
+        storage, I/O, an unexpected error — propagates with the cursor still
+        on that record, to be retried; already-published events of a
+        multi-event record are not published again (``_inflight``).
+        """
         try:
             identity = self._resolve_identity(transcript_path)
         except ValueError:
             logger.warning("Unsupported transcript path: %s", transcript_path)
-            return []
+            return
         # Codex partial-flush case: session_meta hasn't been newline-
         # terminated yet, so we can't confidently route events. Skip
         # this tick; watchfiles will fire again once the writer flushes.
         if identity is None:
-            return []
+            return
 
-        published: list[Event] = []
         # specs/2026-05-21-codex-resume.md: once a codex rollout has
         # been bound to a harness session (``is_rebound`` after
         # ``_resolve_codex_identity`` consumed an expectation), persist
@@ -955,19 +1045,25 @@ class ExternalTranscriptObserver:
         if resume_event is not None:
             published.append(resume_event)
         try:
-            with transcript_path.open("rb") as transcript:
-                transcript.seek(self._state.next_offset(transcript_path))
-                while line := transcript.readline():
-                    # Lines without a trailing newline are partial flushes by
-                    # the writer — leave the offset put so the next tail_file
-                    # invocation re-reads from the start of the partial line
-                    # once the rest (and the newline) arrives. Without this,
-                    # the offset would advance past half a JSON object and
-                    # the assistant turn would be lost.
-                    if not line.endswith(b"\n"):
-                        break
-                    start_offset = transcript.tell() - len(line)
-                    end_offset = transcript.tell()
+            transcript = transcript_path.open("rb")
+        except FileNotFoundError:
+            # Deleted or renamed away: nothing left to read or retry.
+            logger.debug("Transcript file disappeared: %s", transcript_path)
+            return
+        with transcript:
+            transcript.seek(self._state.next_offset(transcript_path))
+            while line := transcript.readline():
+                # Lines without a trailing newline are partial flushes by
+                # the writer — leave the offset put so the next tail_file
+                # invocation re-reads from the start of the partial line
+                # once the rest (and the newline) arrives. Without this,
+                # the offset would advance past half a JSON object and
+                # the assistant turn would be lost.
+                if not line.endswith(b"\n"):
+                    break
+                start_offset = transcript.tell() - len(line)
+                end_offset = transcript.tell()
+                try:
                     published.extend(
                         await self.publish_line(
                             transcript_path,
@@ -976,10 +1072,12 @@ class ExternalTranscriptObserver:
                             identity=identity,
                         )
                     )
-                    self._state.set_next_offset(transcript_path, end_offset)
-        except OSError:
-            logger.exception("Failed to read transcript file: %s", transcript_path)
-        return published
+                except Exception as exc:
+                    if not _is_bad_record(exc):
+                        raise
+                    self._reject_record(identity, start_offset, exc)
+                self._state.set_next_offset(transcript_path, end_offset)
+                self._lines_processed += 1
 
     async def publish_line(
         self,
@@ -993,7 +1091,29 @@ class ExternalTranscriptObserver:
         if not self._state.mark_seen(transcript_path, offset):
             logger.debug("Skipping duplicate transcript offset: path=%s offset=%s", transcript_path, offset)
             return []
+        try:
+            published = await self._publish_line(
+                transcript_path, line, offset=offset, identity=identity
+            )
+        except BaseException as exc:
+            if not _is_bad_record(exc):
+                # Not done with this line: a retry must read it again
+                # (``_inflight`` keeps what it already published).
+                self._state.forget_seen(transcript_path, offset)
+            else:
+                self._inflight.pop(transcript_path, None)
+            raise
+        self._inflight.pop(transcript_path, None)
+        return published
 
+    async def _publish_line(
+        self,
+        transcript_path: Path,
+        line: str,
+        *,
+        offset: int,
+        identity: TranscriptIdentity | None,
+    ) -> list[Event]:
         resolved_identity = identity or self._resolve_identity(transcript_path)
         if resolved_identity is None:
             # Codex partial-flush — defer this line to a later tick.
@@ -1009,12 +1129,33 @@ class ExternalTranscriptObserver:
         pending_name = self._native_name(transcript_path, resolved_identity)
         existed = pending_name is None or self._known_to_exist(resolved_identity.session_id)
         published: list[Event] = []
-        for event in parse_transcript_line(
-            line,
-            identity=resolved_identity,
-            offset=offset,
-            pi_registry=self._pi_registry,
-        ):
+        # A retry of a line that failed part-way resumes after the events it
+        # already published, from the same parse: parsing again is not
+        # idempotent (pi facts accumulate), so it could yield other events.
+        inflight = self._inflight.get(transcript_path)
+        if inflight is not None and inflight.offset == offset:
+            events, first = inflight.events, inflight.next_index
+        else:
+            events = parse_transcript_line(
+                line,
+                identity=resolved_identity,
+                offset=offset,
+                pi_registry=self._pi_registry,
+            )
+            first = 0
+            inflight = _InflightLine(offset=offset, events=events)
+            self._inflight[transcript_path] = inflight
+        for index in range(first, len(events)):
+            event = events[index]
+            if inflight.published is not _NOT_PUBLISHED:
+                # Published before the failure; only its follow-up (the
+                # running kick below) is still to do.
+                published_event = inflight.published
+                inflight.published = _NOT_PUBLISHED
+                await self._after_line_event(
+                    published_event, resolved_identity, offset, inflight, index, published
+                )
+                continue
             if event.event in ("run.usage", "run.end_turn"):
                 # Parsers emit run.usage / run.end_turn with
                 # ``run_id=None`` (no repository access from the pure
@@ -1022,28 +1163,20 @@ class ExternalTranscriptObserver:
                 # and drop the event if no active run exists.
                 resolved = self._resolve_active_run_id(event)
                 if resolved is None:
+                    inflight.next_index = index + 1
                     continue
                 event = resolved
             elif resolved_identity.backend == "pi" and not self._keep_pi_event(
                 event, path=transcript_path
             ):
+                inflight.next_index = index + 1
                 continue
             published_event = await self._publish_via_bus(event)
-            if published_event is None:
-                continue
-            published.append(published_event)
-            if published_event.session_id:
-                self._last_event_at[published_event.session_id] = self._clock()
-                # Fresh transcript event on a session that was idled
-                # by a previous freshness tick → flip back to running.
-                kick = await self._maybe_publish_status_flip(
-                    published_event.session_id,
-                    target_status="running",
-                    identity=resolved_identity,
-                    offset=offset,
-                )
-                if kick is not None:
-                    published.append(kick)
+            if published_event is not None:
+                published.append(published_event)
+            await self._after_line_event(
+                published_event, resolved_identity, offset, inflight, index, published
+            )
         # Deliberately outside the loop above: a name is metadata, so it
         # neither refreshes ``_last_event_at`` nor flips the session to
         # running.
@@ -1064,6 +1197,116 @@ class ExternalTranscriptObserver:
             if renamed is not None:
                 published.append(renamed)
         return published
+
+    async def _after_line_event(
+        self,
+        published_event: Event | None,
+        identity: TranscriptIdentity,
+        offset: int,
+        inflight: "_InflightLine",
+        index: int,
+        published: list[Event],
+    ) -> None:
+        """Follow-up of one published line event. The event counts as done
+        only afterwards; if this fails, a retry redoes just this part."""
+        if published_event is not None and published_event.session_id:
+            inflight.published = published_event
+            self._last_event_at[published_event.session_id] = self._clock()
+            # Fresh transcript event on a session that was idled
+            # by a previous freshness tick → flip back to running.
+            kick = await self._maybe_publish_status_flip(
+                published_event.session_id,
+                target_status="running",
+                identity=identity,
+                offset=offset,
+            )
+            if kick is not None:
+                published.append(kick)
+        inflight.published = _NOT_PUBLISHED
+        inflight.next_index = index + 1
+
+    # ---- failure containment
+
+    def _reject_record(self, identity: TranscriptIdentity, offset: int, exc: BaseException) -> None:
+        """Count and report a record skipped as deterministically bad.
+
+        Metadata only — never the record or the exception text, which can
+        quote transcript content — and rate-limited, so a file full of bad
+        records can't flood the log.
+        """
+        self._rejected_records += 1
+        now = self._clock()
+        if self._reject_log_window is None or now - self._reject_log_window >= _REJECT_LOG_WINDOW:
+            if self._reject_log_suppressed:
+                logger.warning(
+                    "Suppressed %d more rejected transcript record warning(s)",
+                    self._reject_log_suppressed,
+                )
+            self._reject_log_window = now
+            self._reject_log_count = 0
+            self._reject_log_suppressed = 0
+        if self._reject_log_count >= _REJECT_LOG_LIMIT:
+            self._reject_log_suppressed += 1
+            return
+        self._reject_log_count += 1
+        logger.warning(
+            "Rejected transcript record: backend=%s path=%s offset=%d error=%s",
+            identity.backend,
+            identity.path,
+            offset,
+            type(exc).__name__,
+        )
+
+    def _retry_due(self, path: Path) -> bool:
+        retry = self._retries.get(path)
+        return retry is None or self._clock() >= retry.due_at
+
+    def _schedule_retry(self, path: Path, exc: BaseException) -> None:
+        retry = self._retries.get(path)
+        attempts = 1 if retry is None else retry.attempts + 1
+        delay = min(_RETRY_BASE_SECONDS * 2 ** (attempts - 1), _RETRY_MAX_SECONDS)
+        self._retries[path] = _FileRetry(
+            attempts=attempts, due_at=self._clock() + timedelta(seconds=delay)
+        )
+        self._last_error = type(exc).__name__
+        # The exception text is not logged: it can quote transcript content.
+        logger.warning(
+            "Transcript tail failed; retrying in %.0fs (attempt %d): path=%s error=%s",
+            delay,
+            attempts,
+            path,
+            type(exc).__name__,
+            exc_info=attempts == 1 and logger.isEnabledFor(logging.DEBUG),
+        )
+
+    async def retry_pending(self) -> list[Event]:
+        """Tail again every file whose retry is due. Called periodically by
+        :class:`TranscriptWatchService`; a file that keeps failing backs off
+        further each time and stays reported (``observation_snapshot``)."""
+        published: list[Event] = []
+        for path in [path for path in self._retries if self._retry_due(path)]:
+            published.extend(await self.tail_file(path))
+        for session_id in list(self._flush_retries):
+            self._flush_pending_materialization(session_id)
+        return published
+
+    def observation_snapshot(self) -> dict[str, Any]:
+        """Content-free counters for health reporting."""
+        return {
+            "retrying_files": len(self._retries) + len(self._flush_retries),
+            "rejected_records": self._rejected_records,
+            "last_error": self._last_error,
+        }
+
+    def tracked_offsets(self) -> dict[Path, int]:
+        """Saved cursors, keyed by the path spelling the watcher reports."""
+        return dict(self._state.next_offsets)
+
+    @property
+    def lines_processed(self) -> int:
+        """Records consumed (published or rejected) since startup; lets the
+        watch service tell real progress from a loop that keeps failing."""
+        return self._lines_processed
 
     def _hydrate_native_titles(self, path: Path, identity: TranscriptIdentity) -> bool:
         """Rebuild a transcript's title slots from its consumed prefix.
@@ -1616,8 +1859,9 @@ class ExternalTranscriptObserver:
             return
 
         pending = self._pending_materialization.pop(session_id, [])
+        self._flush_retries.discard(session_id)
         still_pending: list[Event] = []
-        for event in pending:
+        for position, event in enumerate(pending):
             # Buffered events have already been inserted via the bus
             # (the durable path) or are about to be inserted via the
             # ``store_event=True`` materialize (the in-memory bus path).
@@ -1628,12 +1872,39 @@ class ExternalTranscriptObserver:
                 self._repository.materialize_event(event, store_event=store_event)
             except SessionNotFoundError:
                 still_pending.append(event)
+            except Exception as exc:
+                # The triggering event is already published, so don't fail
+                # it: keep the rest buffered and let ``retry_pending`` flush.
+                still_pending.extend(pending[position:])
+                self._flush_retries.add(session_id)
+                self._last_error = type(exc).__name__
+                logger.warning(
+                    "Deferred materialization failed; will retry: session=%s error=%s",
+                    session_id,
+                    type(exc).__name__,
+                )
+                break
 
         if still_pending:
             self._pending_materialization[session_id] = still_pending
 
 
 Watcher = Callable[..., AsyncIterator[Iterable[tuple[object, str]]]]
+
+
+# Observation states reported by ``TranscriptWatchService.health``. Only
+# ``healthy`` means complete coverage; a quiet watcher is still healthy.
+WATCH_STATES = ("starting", "catching_up", "healthy", "degraded", "failed", "stopped")
+
+# Watch-loop recovery: after a failure the watcher is restarted after 1 s,
+# 2 s, 4 s; a further consecutive failure leaves it ``failed`` until the
+# operator restarts the service. Real progress resets the count.
+DEFAULT_MAX_WATCH_RESTARTS = 3
+DEFAULT_RESTART_BASE_SECONDS = 1.0
+DEFAULT_RESTART_MAX_SECONDS = 30.0
+# Files without a cursor modified this long before the failure are caught
+# up too: the watcher may have dropped their events shortly before it died.
+_CATCH_UP_MARGIN = timedelta(minutes=1)
 
 
 class TranscriptWatchService:
@@ -1644,6 +1915,10 @@ class TranscriptWatchService:
         observer: ExternalTranscriptObserver,
         watcher: Watcher | None = None,
         freshness_interval_seconds: float = 10.0,
+        max_restarts: int = DEFAULT_MAX_WATCH_RESTARTS,
+        restart_base_seconds: float = DEFAULT_RESTART_BASE_SECONDS,
+        restart_max_seconds: float = DEFAULT_RESTART_MAX_SECONDS,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._roots = tuple(Path(root) for root in roots)
         self._observer = observer
@@ -1654,15 +1929,51 @@ class TranscriptWatchService:
         else:
             raise RuntimeError("watchfiles is required for live transcript watching")
         self._freshness_interval_seconds = freshness_interval_seconds
+        self._max_restarts = max_restarts
+        self._restart_base_seconds = restart_base_seconds
+        self._restart_max_seconds = restart_max_seconds
+        self._clock = clock or utc_now
+        self._state = "starting"
+        self._state_since = self._clock()
+        self._consecutive_failures = 0
+        self._restarts = 0
+        self._last_error: str | None = None
+        # Start of a window whose file events may have been missed.
+        self._missed_since: datetime | None = None
+        # Watcher failures so far; a catch-up belongs to one of them.
+        self._failures = 0
+
+    def health(self) -> dict[str, Any]:
+        """Bounded, content-free observation status.
+
+        ``complete`` is true only while the watcher runs normally and no
+        file is waiting for a retry. Rejected bad records are counted but
+        don't make coverage incomplete: everything around them was read.
+        """
+        observed = self._observer.observation_snapshot()
+        state = self._state
+        if state == "healthy" and observed["retrying_files"]:
+            state = "degraded"
+        return {
+            "state": state,
+            "complete": state == "healthy",
+            "since": self._state_since.isoformat(),
+            "restarts": self._restarts,
+            "consecutive_failures": self._consecutive_failures,
+            "retrying_files": observed["retrying_files"],
+            "rejected_records": observed["rejected_records"],
+            "last_error": self._last_error or observed["last_error"],
+        }
+
+    def _set_state(self, state: str) -> None:
+        if state != self._state:
+            self._state = state
+            self._state_since = self._clock()
 
     async def watch_forever(self, *, stop_event: object | None = None) -> None:
         freshness_task = asyncio.create_task(self._freshness_loop())
         try:
-            async for changes in self._watcher(*self._roots, stop_event=stop_event):
-                for _change, changed_path in changes:
-                    path = Path(changed_path)
-                    if path.suffix == ".jsonl":
-                        await self._observer.tail_file(path)
+            await self._watch_with_recovery(stop_event)
         finally:
             freshness_task.cancel()
             try:
@@ -1670,18 +1981,197 @@ class TranscriptWatchService:
             except asyncio.CancelledError:
                 pass
 
-    async def _freshness_loop(self) -> None:
-        # Walks the observer's last-event map and flips silent sessions to
-        # idle. Errors are logged and swallowed so a transient repository
-        # blip can't take down the whole watch service.
+    async def _watch_with_recovery(self, stop_event: object | None) -> None:
+        while True:
+            progress_mark = self._observer.lines_processed
+            catch_up: asyncio.Task[None] | None = None
+            try:
+                if self._missed_since is not None:
+                    # Started as a task so the watcher registers its watches
+                    # first (synchronously, when iteration begins): a file
+                    # written during the catch-up is then not missed either.
+                    self._set_state("catching_up")
+                    catch_up = asyncio.create_task(
+                        self._catch_up(since=self._missed_since, generation=self._failures)
+                    )
+                else:
+                    self._set_state("healthy")
+                async for changes in self._watcher(*self._roots, stop_event=stop_event):
+                    for _change, changed_path in changes:
+                        path = Path(changed_path)
+                        if path.suffix == ".jsonl":
+                            await self._observer.tail_file(path)
+                    if self._observer.lines_processed > progress_mark:
+                        # Demonstrated progress since the last restart.
+                        self._consecutive_failures = 0
+                # The watcher only ends when asked to stop: an unfinished
+                # catch-up (possibly rescanning after errors) stops too.
+                await _cancel(catch_up)
+                self._set_state("stopped")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Stop this attempt's catch-up first: it must not finish
+                # during the backoff and declare the new gap covered.
+                await _cancel(catch_up)
+                self._failures += 1  # invalidates any catch-up still running
+                if self._observer.lines_processed > progress_mark:
+                    self._consecutive_failures = 0
+                self._consecutive_failures += 1
+                self._last_error = type(exc).__name__
+                if self._missed_since is None:
+                    self._missed_since = self._clock() - _CATCH_UP_MARGIN
+                if self._consecutive_failures > self._max_restarts:
+                    self._set_state("failed")
+                    logger.error(
+                        "Transcript watcher failed %d times in a row; observation "
+                        "stopped until the service is restarted",
+                        self._consecutive_failures,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                    return
+                delay = min(
+                    self._restart_base_seconds * 2 ** (self._consecutive_failures - 1),
+                    self._restart_max_seconds,
+                )
+                self._set_state("degraded")
+                logger.warning(
+                    "Transcript watcher failed (%s); restarting in %.1fs (attempt %d of %d)",
+                    type(exc).__name__,
+                    delay,
+                    self._consecutive_failures,
+                    self._max_restarts,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                if await _stopped_within(stop_event, delay):
+                    self._set_state("stopped")
+                    return
+                self._restarts += 1
+            finally:
+                await _cancel(catch_up)
+
+    async def _catch_up(self, *, since: datetime, generation: int) -> None:
+        """Tail what the watcher may have missed, from the saved cursors.
+
+        Files the observer tracks are read from their cursor if they grew;
+        untracked files only if modified since ``since`` (new during the
+        gap). Older untracked history is not replayed, matching what a
+        normal start does. Coverage is complete again only after a scan
+        that saw every directory and file: a scan that hit an I/O error
+        (other than an entry vanishing) is repeated with backoff, while the
+        state stays degraded. ``generation`` ties this run to one watcher
+        failure; a later failure makes it stale, so it can't clear a newer
+        gap.
+        """
+        delay = self._restart_base_seconds
         while True:
             try:
-                await asyncio.sleep(self._freshness_interval_seconds)
+                candidates, errors = await asyncio.to_thread(
+                    _catch_up_candidates,
+                    self._roots,
+                    self._observer.tracked_offsets(),
+                    since.timestamp(),
+                )
+                for path in candidates:
+                    await self._observer.tail_file(path)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors = [type(exc).__name__]
+                logger.warning("Transcript catch-up failed", exc_info=True)
+            if generation != self._failures:
+                return
+            if not errors:
+                break
+            self._last_error = errors[0]
+            self._set_state("degraded")
+            logger.warning(
+                "Transcript catch-up scan incomplete (%d error(s), first %s); rescanning in %.0fs",
+                len(errors),
+                errors[0],
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _RETRY_MAX_SECONDS)
+        self._missed_since = None
+        if self._state in ("catching_up", "degraded"):
+            self._set_state("healthy")
+
+    async def _freshness_loop(self) -> None:
+        # Walks the observer's last-event map and flips silent sessions to
+        # idle, and retries files whose tail failed. Errors are logged and
+        # swallowed so a transient repository blip can't take down the
+        # whole watch service.
+        while True:
+            await asyncio.sleep(self._freshness_interval_seconds)
+            try:
                 await self._observer.freshness_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Observer freshness tick failed")
+            try:
+                await self._observer.retry_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Observer retry tick failed")
+
+
+async def _stopped_within(stop_event: object | None, seconds: float) -> bool:
+    """Sleep ``seconds``; True if ``stop_event`` (an ``asyncio.Event``) was
+    set meanwhile."""
+    wait = getattr(stop_event, "wait", None)
+    if not callable(wait):
+        await asyncio.sleep(seconds)
+        return False
+    try:
+        await asyncio.wait_for(wait(), timeout=seconds)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _cancel(task: asyncio.Task[None] | None) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+def _catch_up_candidates(
+    roots: Iterable[Path], offsets: Mapping[Path, int], since: float
+) -> tuple[list[Path], list[str]]:
+    """Files to tail after a watcher gap, oldest first, and the names of
+    the I/O errors that kept the scan from being complete. An entry that
+    disappeared while scanning is not an error: there is nothing to read."""
+    found: list[tuple[float, Path]] = []
+    errors: list[str] = []
+
+    for root in roots:
+        def on_error(error: OSError, root: Path = root) -> None:
+            if isinstance(error, FileNotFoundError) and Path(error.filename or "") != root:
+                return
+            errors.append(type(error).__name__)
+
+        for directory, _dirs, files in os.walk(root, onerror=on_error):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = Path(directory) / name
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    errors.append(type(error).__name__)
+                    continue
+                offset = offsets.get(path)
+                if (stat.st_size > offset) if offset is not None else (stat.st_mtime >= since):
+                    found.append((stat.st_mtime, path))
+    # Oldest first, like the order the writes happened in.
+    return [path for _mtime, path in sorted(found)], errors
 
 
 def claude_project_dir_name(cwd: str | Path) -> str:
@@ -2482,7 +2972,7 @@ def _message_event(
 
     message = Message(
         role=role,
-        blocks=blocks,
+        blocks=[_unicode_safe_block(block) for block in blocks],
         model=model,
     )
     data: dict[str, Any] = {
@@ -2560,6 +3050,34 @@ def _run_end_turn_event(
             "backend": backend,
         },
     )
+
+
+def _unicode_safe_block(block: MessageBlock) -> MessageBlock:
+    """``block`` with lone surrogates in its content replaced (see
+    ``replace_lone_surrogates``). Only conversation content is rewritten —
+    text, thinking, tool input values and tool output. Identifiers (tool
+    ids, names) are left alone: a record whose routing data cannot be
+    encoded is rejected as a whole by ``tail_file`` instead."""
+    if isinstance(block, (TextBlock, ThinkingBlock)):
+        text = replace_lone_surrogates(block.text)
+        return block if text is block.text else block.model_copy(update={"text": text})
+    if isinstance(block, ToolResultBlock):
+        content = replace_lone_surrogates(block.content)
+        return block if content is block.content else block.model_copy(update={"content": content})
+    if isinstance(block, ToolUseBlock):
+        return block.model_copy(update={"input": _unicode_safe_values(block.input)})
+    return block
+
+
+def _unicode_safe_values(value: Any) -> Any:
+    # JSON values only (tool input comes from ``json.loads``). Keys are kept.
+    if isinstance(value, str):
+        return replace_lone_surrogates(value)
+    if isinstance(value, Mapping):
+        return {key: _unicode_safe_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_unicode_safe_values(item) for item in value]
+    return value
 
 
 def blocks_from_claude_message(message: Mapping[str, Any]) -> list[MessageBlock]:

@@ -15,6 +15,28 @@ tags:
   - name: Events
   - name: Backends
 paths:
+  /v1/health:
+    get:
+      operationId: health
+      summary: Liveness and transcript-observation state (also at `/health`).
+      description: |
+        200 while the API runs and observation is healthy (`ok`), disabled
+        (`ok`) or recovering (`degraded`). 503 (`failed`) when configured
+        observation has stopped; sessions and runs stay available and
+        nothing restarts automatically. A quiet watcher is healthy.
+      responses:
+        "200":
+          description: Running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: Configured transcript observation has failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
   /v1/sessions:
     post:
       tags: [Sessions]
@@ -53,6 +75,16 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Session"
+                  observation:
+                    $ref: "#/components/schemas/ObservationStatus"
+                  live_leases:
+                    type: object
+                    description: |
+                      Unexpired busy leases (`PUT /v1/sessions/{id}/live-state`),
+                      by session id. A listed session is working however old
+                      its `updated_at`: lease renewals don't update the row.
+                    additionalProperties:
+                      $ref: "#/components/schemas/LiveLease"
 
   /v1/sessions/{id}/live-state:
     parameters:
@@ -412,6 +444,61 @@ components:
                 data: {"sequence":42,"run_id":"run_abc123","session_id":"ses_abc123"}
 
   schemas:
+    Health:
+      type: object
+      required: [status, observation]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, failed]
+        observation:
+          $ref: "#/components/schemas/ObservationStatus"
+    ObservationStatus:
+      type: object
+      description: |
+        Content-free transcript-observation state. Only `complete: true`
+        means every configured transcript is being read; counts derived
+        from the session list are otherwise a lower bound.
+      required: [state, complete]
+      properties:
+        state:
+          type: string
+          enum: [disabled, starting, catching_up, healthy, degraded, failed, stopped, unknown]
+        complete:
+          type: boolean
+        since:
+          type: string
+          format: date-time
+        restarts:
+          type: integer
+          description: Watcher restarts after failures since startup.
+        consecutive_failures:
+          type: integer
+        retrying_files:
+          type: integer
+          description: Transcripts waiting to be retried after a storage or I/O failure.
+        rejected_records:
+          type: integer
+          description: Records skipped since startup because their data can never be stored.
+        last_error:
+          type: string
+          nullable: true
+          description: Exception class name only.
+    LiveLease:
+      type: object
+      required: [state, source, renewed_at, expires_at]
+      properties:
+        state:
+          type: string
+          enum: [busy]
+        source:
+          type: string
+        renewed_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
     Session:
       type: object
       required: [id, backend, project, title, created_at, updated_at, status, origin, stats]

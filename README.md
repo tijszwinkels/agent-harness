@@ -73,11 +73,11 @@ All application endpoints are under `/v1` (health is also exposed unversioned).
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health`, `/v1/health` | Liveness. |
+| GET | `/health`, `/v1/health` | Liveness plus transcript-observation state; 503 when configured observation has failed. |
 | GET | `/v1/backends` | List available backends. |
 | GET | `/v1/backends/{name}/models` | Backend model catalog (may be empty). |
 | POST | `/v1/sessions` | Create a session. |
-| GET | `/v1/sessions` | List sessions. |
+| GET | `/v1/sessions` | List sessions (`data`), with observation coverage (`observation`) and unexpired busy leases (`live_leases`). |
 | GET | `/v1/sessions/{id}` | Fetch a session. |
 | PATCH | `/v1/sessions/{id}` | Update a session (e.g. title). |
 | DELETE | `/v1/sessions/{id}` | Archive a session. |
@@ -148,6 +148,17 @@ sessions and run arbitrary commands as the service user. Therefore:
 
 The observer watches each backend's transcript files with `watchfiles` and
 replays their records through the same event bus as harness-owned runs.
+
+Observation degrades without stopping. Unpaired UTF-16 surrogates in
+conversation text (for example, half an emoji cut off by a tool) become U+FFFD.
+A record whose data still can't be stored is skipped. The skip is counted and
+logged as metadata only, at a rate-limited pace. A storage or I/O failure is
+never skipped: that transcript waits at its cursor and is retried with backoff.
+If the watcher itself fails, it restarts up to 3 times with backoff, then
+catches up missed writes from the saved cursors. After a 4th consecutive
+failure without progress it stays `failed` until the service is restarted.
+`/health` and the `observation` field of `GET /v1/sessions` report this state,
+so a session count is never presented as complete when observation is not.
 
 > **The observer only sees the machine it runs on.** It is a filesystem
 > watcher over local paths (`~/.claude/projects`, `~/.codex/sessions`,

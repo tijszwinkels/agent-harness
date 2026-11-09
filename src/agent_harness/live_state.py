@@ -270,6 +270,10 @@ class LiveStateRegistry:
     def get(self, session_id: str) -> LiveClaim | None:
         return self._claims.get(session_id)
 
+    def busy_leases(self, now: datetime) -> dict[str, LiveClaim]:
+        """Unexpired ``busy`` claims by session id."""
+        return {session_id: claim for session_id, claim in self._claims.items() if claim.busy_at(now)}
+
     def offer(
         self,
         session_id: str,

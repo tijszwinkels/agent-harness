@@ -2811,7 +2811,7 @@ def _parse_pi_record(
                     context_source="pi.message.usage",
                     # pi writes each message once: its usage stays
                     # unkeyed and additive, as before.
-                    accounting=None,
+                    accounting=UsageAccounting(key=None, additive=True),
                     offset=offset,
                 )
             )
@@ -3012,7 +3012,7 @@ def _run_usage_event(
     context_window: int | None,
     context_used: int | None,
     context_source: ContextSource,
-    accounting: UsageAccounting | None,
+    accounting: UsageAccounting,
     offset: int | None,
 ) -> Event:
     """Build a ``run.usage`` event with ``run_id=None``.
@@ -3032,16 +3032,16 @@ def _run_usage_event(
     value on Session.stats — only writes that observe a fresh value
     move the snapshot.
 
-    ``accounting`` (claude, codex) carries the native report's identity
-    so a repeated report counts once; ``context_source`` names where
+    ``accounting`` carries the native report's identity (claude, codex)
+    so a repeated report counts once, or marks pi's once-per-message
+    reports as additive; ``context_source`` names where
     ``context_used`` came from (``SessionStats.context_used_source``).
     """
     data: dict[str, Any] = {
         **_source_data(identity, offset=offset),
         "usage": usage.model_dump(mode="json"),
     }
-    if accounting is not None:
-        data["accounting"] = accounting.to_data()
+    data["accounting"] = accounting.to_data()
     if context_window is not None:
         data["context_window"] = context_window
     if context_used is not None:

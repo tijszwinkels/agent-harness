@@ -46,16 +46,33 @@ entry, per field, in the same transaction as the event row.
   report (same cumulative total, zeroed `last_token_usage`), add nothing.
   `cache_write_input_tokens` is not mapped: its relation to `input_tokens` is
   undocumented and it has only been observed as 0.
-- **Pi**: unchanged. Events are unkeyed and additive (pi writes each message
-  once). Pi is the only backend that reports `cost_usd`.
+- **Pi**: counting unchanged. Events carry
+  `accounting: {"version": 2, "key": null, "additive": true}` and are added
+  as before, because pi writes each message once. Unlike claude and codex,
+  a pi line replayed after a crash can still count twice (pre-existing
+  behaviour). Pi is the only backend that reports `cost_usd`.
+- **Events without `accounting`** (stored by an older harness version) are
+  added as before but were not de-duplicated. Non-zero usage from such an
+  event sets `tokens_version` to `null`. It never promotes a session.
 - **No identity** (claude record without `message.id`, codex `token_count`
   without `total_token_usage`): the usage is not counted, and
   `stats.skipped_usage_records` is incremented if it was non-zero. These
   shapes were not observed in practice.
 - **Replay** (cursor reset, retried line, restart): the ledger is persisted,
-  so re-reading a transcript adds nothing. A replayed report whose key is
-  already in the ledger and is not the newest key does not change
-  `context_used`, so an older snapshot cannot overwrite a newer one.
+  so re-reading a transcript adds nothing.
+- **Snapshot freshness** (`context_used` and `context_window`) follows
+  transcript order, not accounting keys. Accounting keys identify billable
+  usage: a codex compaction report shares its predecessor's key but is a
+  newer observation. Both repositories keep the offset of the newest applied
+  observation per (session, transcript path); SQLite stores it in
+  `usage_positions`, in the event's transaction. A snapshot applies only if
+  its line is at a later offset of that transcript. A replay of an older
+  line therefore cannot roll either value back. Exceptions:
+  - A report whose key is new, at an earlier offset, is fresh, because the
+    transcript was rewritten.
+  - Different transcript files of one session are ordered independently.
+  - An event without a position falls back to keys: it is stale only when
+    its key is known and is not the latest one.
 
 ### Current context
 
@@ -65,8 +82,8 @@ entry, per field, in the same transaction as the event row.
   `last_token_usage` whose `total_tokens` is the compacted size, so the value
   may decrease. Missing or zero values leave the previous snapshot unchanged;
   nothing is derived from the window or the cumulative total.
-- **Claude**: `input + cache_creation + cache_read` of the latest main-chain
-  assistant record (unchanged).
+- **Claude**: `input + cache_creation + cache_read` of the newest main-chain
+  assistant record in transcript order (unchanged).
 - **Pi**: `input + cacheRead + cacheWrite` (unchanged).
 
 ## Consumer contract
@@ -118,7 +135,8 @@ A legacy session loads as `"tokens_version": null, "skipped_usage_records": 0,
 - A legacy session keeps `null` when new usage arrives, because its earlier
   totals stay mixed in. The one exception is a legacy session with nothing
   accumulated yet (all token fields and cost zero): it moves to `2` on its
-  first usage, since nothing earlier can be wrong.
+  first verified usage (keyed or pi-additive), since nothing earlier can be
+  wrong.
 - `context_used` is a snapshot. The next corrected observation replaces the
   value and sets `context_used_source`.
 - `Run.usage` has no marker. Runs that finished before this version carry
@@ -142,7 +160,8 @@ update sessions set payload = json_remove(payload,
   '$.stats.context_used_source');
 ```
 
-The `usage_ledger` table is separate and older versions ignore it.
+The `usage_ledger` and `usage_positions` tables are separate, and older
+versions ignore them.
 
 ## Not in scope
 

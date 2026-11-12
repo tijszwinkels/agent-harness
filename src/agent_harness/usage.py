@@ -311,19 +311,32 @@ def _subtract_usage(left: Usage, right: Usage) -> Usage:
 
 @dataclass(frozen=True)
 class UsageAccounting:
-    """The ``accounting`` object of a ``run.usage`` event. ``key`` is the
-    native report's identity; ``None`` means it had none."""
+    """The ``accounting`` object of a ``run.usage`` event.
+
+    - ``key``: the native report's identity; repeats of a key count once.
+    - ``key=None, additive=False``: the report had no identity and is not
+      counted (``skipped_usage_records``).
+    - ``key=None, additive=True``: the backend writes each report once
+      (pi), so it is added as is.
+
+    An event WITHOUT an ``accounting`` object follows older, unverified
+    rules (events stored by an earlier harness version).
+    """
 
     key: str | None
+    additive: bool = False
     version: int = TOKEN_ACCOUNTING_VERSION
 
     def to_data(self) -> dict[str, Any]:
-        return {"version": self.version, "key": self.key}
+        data: dict[str, Any] = {"version": self.version, "key": self.key}
+        if self.additive:
+            data["additive"] = True
+        return data
 
 
 def usage_accounting_from(data: object) -> UsageAccounting | None:
-    """The event's accounting, or ``None`` for an unkeyed (additive)
-    event: pi usage, and events stored by older harness versions."""
+    """The event's accounting, or ``None`` for an event without (or with
+    an unrecognised) accounting object — legacy, unverified usage."""
     if not isinstance(data, Mapping):
         return None
     raw = data.get("accounting")
@@ -333,7 +346,8 @@ def usage_accounting_from(data: object) -> UsageAccounting | None:
     if isinstance(version, bool) or version != TOKEN_ACCOUNTING_VERSION:
         return None
     key = raw.get("key")
-    return UsageAccounting(key=key if isinstance(key, str) and key else None)
+    key = key if isinstance(key, str) and key else None
+    return UsageAccounting(key=key, additive=key is None and raw.get("additive") is True)
 
 
 _CONTEXT_SOURCES: frozenset[str] = frozenset(ContextSource.__args__)  # type: ignore[attr-defined]
@@ -346,15 +360,31 @@ def context_source_from(data: object) -> ContextSource | None:
     return raw if isinstance(raw, str) and raw in _CONTEXT_SOURCES else None  # type: ignore[return-value]
 
 
+def observation_position_from(data: object) -> tuple[str, int] | None:
+    """``(transcript_path, offset)`` the event was read from, if known."""
+    if not isinstance(data, Mapping):
+        return None
+    path = data.get("transcript_path")
+    offset = data.get("offset")
+    if not isinstance(path, str) or not path:
+        return None
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return None
+    return path, offset
+
+
 @dataclass(frozen=True)
 class UsageApplication:
     """What one ``run.usage`` event changes. ``run_delta`` is added to
     ``Run.usage``; ``stats`` replaces ``Session.stats``; ``ledger`` is the
-    ``(key, usage)`` row to store (``None``: no ledger change)."""
+    ``(key, usage)`` row to store and ``position`` the
+    ``(transcript_path, offset)`` of the newest applied observation to
+    store (``None``: no change)."""
 
     run_delta: Usage
     stats: SessionStats
     ledger: tuple[str, Usage] | None
+    position: tuple[str, int] | None
 
 
 def plan_usage_application(
@@ -364,6 +394,7 @@ def plan_usage_application(
     incoming: Usage,
     previous: Usage | None,
     latest_key: str | None,
+    stored_offset: int | None,
     context_window: int | None,
     context_used: int | None,
 ) -> UsageApplication:
@@ -372,34 +403,46 @@ def plan_usage_application(
 
     ``previous`` is the ledger entry for the event's key (``None`` when
     the key is new or the event is unkeyed); ``latest_key`` is the key
-    most recently added to this session's ledger.
+    most recently added to this session's ledger; ``stored_offset`` is
+    the offset of the newest observation already applied from the
+    event's transcript (``None``: none yet, or the event has no
+    position).
 
     Tokens:
-    - Unkeyed events (pi; older stored events) add ``incoming`` as before.
     - Keyed events add only the growth over the largest usage already
       recorded for that key, per field: a repeat adds nothing, a
       partial-then-final claude message adds the final value once, and
       distinct messages with identical numbers each count.
+    - Additive events (pi) add ``incoming``.
     - An event whose accounting has no key adds nothing; non-zero usage
       is counted in ``skipped_usage_records`` instead.
+    - An event without accounting (stored by an older version) is added
+      as before, but non-zero usage makes ``tokens_version`` ``None``:
+      it was not de-duplicated.
 
-    Context: a snapshot is applied unless the event's key is already in
-    the ledger and is not the latest one — that is a replay of an older
-    report, which must not roll the snapshot back.
+    Snapshots (``context_used``, ``context_window``) follow transcript
+    order, not accounting keys: they apply only if the event was read at
+    a later offset of its transcript than the newest applied observation.
+    A replay of an older line (cursor reset, retry) therefore cannot roll
+    them back — including after a compaction report that shares its
+    predecessor's key. A NEW key at an earlier offset is fresh: the
+    transcript was rewritten. Events without a position fall back to
+    keys: stale only when the key is known and is not the latest.
 
-    ``tokens_version``: never changed, except that a legacy session
-    (``None``) with nothing accumulated yet starts on the current rules —
-    there is nothing earlier that could be wrong.
+    ``tokens_version``: a legacy session (``None``) with nothing
+    accumulated starts on the current rules when it receives verified
+    usage — nothing earlier can be wrong; otherwise it is never raised.
     """
     accounting = usage_accounting_from(data)
     skipped = 0
     ledger: tuple[str, Usage] | None = None
-    fresh = True
+    unverified = False
     if accounting is None:
         delta = incoming
+        unverified = not usage_is_zero(incoming)
     elif accounting.key is None:
-        delta = Usage()
-        if not usage_is_zero(incoming):
+        delta = incoming if accounting.additive else Usage()
+        if not accounting.additive and not usage_is_zero(incoming):
             skipped = 1
     elif previous is None:
         delta = incoming
@@ -409,7 +452,17 @@ def plan_usage_application(
         delta = _subtract_usage(merged, previous)
         if merged != previous:
             ledger = (accounting.key, merged)
-        fresh = accounting.key == latest_key
+
+    position = observation_position_from(data)
+    known_key = accounting is not None and accounting.key is not None and previous is not None
+    if position is None:
+        fresh = not known_key or accounting.key == latest_key  # type: ignore[union-attr]
+    elif stored_offset is None or position[1] > stored_offset:
+        fresh = True
+    else:
+        # Same or earlier offset: a replay, unless it is a report never
+        # seen before (the transcript was rewritten).
+        fresh = accounting is not None and accounting.key is not None and not known_key
 
     tokens = dict(stats.tokens or {})
     nothing_accumulated = not any(
@@ -422,22 +475,26 @@ def plan_usage_application(
         "tokens": tokens,
         "cost_usd": stats.cost_usd + delta.cost_usd,
     }
-    if stats.tokens_version is None and nothing_accumulated:
+    if unverified:
+        update["tokens_version"] = None
+    elif stats.tokens_version is None and nothing_accumulated and accounting is not None:
         update["tokens_version"] = TOKEN_ACCOUNTING_VERSION
     if skipped:
         update["skipped_usage_records"] = stats.skipped_usage_records + skipped
-    if context_window is not None:
-        update["context_window"] = context_window
-    if context_used is not None and fresh:
+    if fresh:
         # SNAPSHOT semantics: overwrite, never sum. A None value means
         # "no fresh observation" (event omitted the field); leave the
         # prior snapshot — and its source — in place.
-        update["context_used"] = context_used
-        update["context_used_source"] = context_source_from(data)
+        if context_window is not None:
+            update["context_window"] = context_window
+        if context_used is not None:
+            update["context_used"] = context_used
+            update["context_used_source"] = context_source_from(data)
     return UsageApplication(
         run_delta=delta,
         stats=stats.model_copy(update=update),
         ledger=ledger,
+        position=position if fresh and position is not None else None,
     )
 
 

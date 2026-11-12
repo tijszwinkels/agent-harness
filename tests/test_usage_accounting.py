@@ -146,7 +146,9 @@ def start_run(repository, session_id: str) -> str:
     return run.id
 
 
-def usage_events(backend: str, session_id: str, lines: list[str]) -> list[Event]:
+def usage_events(backend: str, session_id: str, lines: list[str], *, start: int = 0) -> list[Event]:
+    """Parse ``lines`` as if read from the transcript starting at byte
+    ``start``, so a replay of the same list carries the original offsets."""
     identity = TranscriptIdentity(
         backend=backend,  # type: ignore[arg-type]
         path=Path("/synthetic/transcript.jsonl"),
@@ -154,7 +156,7 @@ def usage_events(backend: str, session_id: str, lines: list[str]) -> list[Event]
         is_rebound=True,
     )
     events: list[Event] = []
-    offset = 0
+    offset = start
     for line in lines:
         events.extend(
             event
@@ -178,8 +180,12 @@ def apply(repository, events: list[Event], run_id: str) -> None:
             repository.materialize_event(stamped)
 
 
-def feed(repository, backend: str, session_id: str, run_id: str, lines: list[str]) -> None:
-    apply(repository, usage_events(backend, session_id, lines), run_id)
+def feed(repository, backend: str, session_id: str, run_id: str, lines: list[str], *, start: int = 0) -> None:
+    apply(repository, usage_events(backend, session_id, lines, start=start), run_id)
+
+
+def offset_after(lines: list[str]) -> int:
+    return sum(len(line) + 1 for line in lines)
 
 
 def tokens(repository, session_id: str) -> dict:
@@ -243,9 +249,9 @@ def test_claude_distinct_messages_with_identical_usage_both_count(repository) ->
 
 
 def test_claude_interleaved_messages_and_late_final_update(repository) -> None:
-    """A final update to an older message (e.g. after a sidechain record in
-    between) still adds only its growth, and does not roll the context
-    snapshot back to the older message."""
+    """A final update to an older message, written after another message,
+    still adds only its growth. The context follows transcript order: the
+    newest line read is the newest observation."""
     session, run_id = make_session(repository)
     lines = [
         claude_record("msg_A", output_tokens=5, cache_read=1000),
@@ -255,7 +261,7 @@ def test_claude_interleaved_messages_and_late_final_update(repository) -> None:
     feed(repository, "claude-code", session.id, run_id, lines)
     stats = repository.get_session(session.id).stats
     assert stats.tokens == {"input": 6, "output": 57, "cache_read": 3000, "cache_creation": 1000}
-    assert stats.context_used == 3 + 2000 + 500
+    assert stats.context_used == 3 + 1000 + 500
 
 
 def test_claude_missing_message_id_is_skipped_not_counted(repository) -> None:
@@ -331,7 +337,7 @@ def test_claude_ledger_survives_sqlite_restart(tmp_path) -> None:
         # The restart reconciles the dangling run; a new run continues.
         run_id = start_run(repo, session.id)
         rest = [claude_record("msg_A", output_tokens=375), first_blocks[1]]
-        feed(repo, "claude-code", session.id, run_id, rest)
+        feed(repo, "claude-code", session.id, run_id, rest, start=offset_after(first_blocks[:1]))
         feed(repo, "claude-code", session.id, run_id, [first_blocks[0], *rest])
         stats = repo.get_session(session.id).stats
         assert stats.tokens == {"input": 6, "output": 379, "cache_read": 40000, "cache_creation": 1000}
@@ -465,6 +471,90 @@ def test_codex_info_null_emits_nothing() -> None:
     assert usage_events("codex", "ses_x", [line]) == []
 
 
+def _compaction_lines() -> list[str]:
+    call = codex_usage(200_000, 190_000, 1_000, 300)
+    compacted = {
+        "input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 16_369,
+    }
+    return [codex_token_count(call, call), codex_token_count(compacted, call)]
+
+
+def test_codex_replay_of_pre_compaction_report_keeps_compacted_context(repository) -> None:
+    """Review round 1, finding 1: the compaction report shares the previous
+    call's accounting key, so key order cannot tell them apart. Replaying
+    only the pre-compaction line (original offset) must not restore the
+    pre-compaction context."""
+    session, run_id = make_session(repository, "codex")
+    lines = _compaction_lines()
+    feed(repository, "codex", session.id, run_id, lines)
+    feed(repository, "codex", session.id, run_id, lines[:1])
+    stats = repository.get_session(session.id).stats
+    assert stats.context_used == 16_369
+    assert stats.tokens["output"] == 1_000
+
+
+def test_codex_compaction_replay_after_sqlite_reopen(tmp_path) -> None:
+    db = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db)
+    session, run_id = make_session(repo, "codex")
+    lines = _compaction_lines()
+    feed(repo, "codex", session.id, run_id, lines)
+    repo.close()
+    repo = open_sqlite_repository(db)
+    try:
+        run_id = start_run(repo, session.id)
+        feed(repo, "codex", session.id, run_id, lines[:1])
+        feed(repo, "codex", session.id, run_id, lines)
+        stats = repo.get_session(session.id).stats
+        assert stats.context_used == 16_369
+        assert stats.tokens["output"] == 1_000
+    finally:
+        repo.close()
+
+
+def test_codex_stale_replay_does_not_roll_window_back(repository) -> None:
+    """Review round 1, finding 3: the window is a snapshot too."""
+    session, run_id = make_session(repository, "codex")
+    first = codex_usage(10_000, 0, 100)
+    second = codex_usage(30_000, 9_000, 200)
+    lines = [
+        codex_token_count(first, first, window=128_000),
+        codex_token_count(second, add_usage(first, second), window=258_400),
+    ]
+    feed(repository, "codex", session.id, run_id, lines)
+    feed(repository, "codex", session.id, run_id, lines[:1])
+    stats = repository.get_session(session.id).stats
+    assert (stats.context_used, stats.context_window) == (30_200, 258_400)
+
+    # A genuinely newer window-only report still applies.
+    window_only = codex_token_count(None, add_usage(first, second), window=400_000)
+    feed(repository, "codex", session.id, run_id, [window_only], start=offset_after(lines))
+    stats = repository.get_session(session.id).stats
+    assert (stats.context_used, stats.context_window) == (30_200, 400_000)
+
+
+def test_rewritten_transcript_with_new_report_is_fresh(repository) -> None:
+    """A report never seen before at an earlier offset means the transcript
+    was rewritten; it is a new observation, not a replay."""
+    session, run_id = make_session(repository)
+    feed(repository, "claude-code", session.id, run_id, [claude_record("msg_A", cache_read=9000)], start=5000)
+    feed(repository, "claude-code", session.id, run_id, [claude_record("msg_B", cache_read=100)])
+    assert repository.get_session(session.id).stats.context_used == 3 + 100 + 500
+
+
+def test_event_without_position_falls_back_to_key_order(repository) -> None:
+    session, run_id = make_session(repository)
+    events = usage_events("claude-code", session.id, [claude_record("msg_A", cache_read=1000), claude_record("msg_B", cache_read=9000)])
+    unpositioned = [
+        event.model_copy(update={"data": {k: v for k, v in event.data.items() if k != "offset"}})
+        for event in events
+    ]
+    apply(repository, unpositioned, run_id)
+    apply(repository, unpositioned[:1], run_id)
+    assert repository.get_session(session.id).stats.context_used == 3 + 9000 + 500
+
+
 # --- Pi: unchanged ---------------------------------------------------------------
 
 
@@ -486,7 +576,7 @@ def test_pi_usage_stays_additive_with_cost_and_source(repository) -> None:
         }
     )
     events = usage_events("pi", session.id, [line])
-    assert events and "accounting" not in events[0].data
+    assert events and events[0].data["accounting"] == {"version": 2, "key": None, "additive": True}
     apply(repository, events, run_id)
     apply(repository, events, run_id)  # pi is per record, as before
     stats = repository.get_session(session.id).stats
@@ -597,6 +687,58 @@ def test_unversioned_stored_event_has_no_context_source(repository) -> None:
     stats = repository.get_session(session.id).stats
     assert stats.context_used == 3_000_000
     assert stats.context_used_source is None
+
+
+def _old_format_event(session_id: str, usage: dict) -> Event:
+    return Event(
+        event="run.usage",
+        session_id=session_id,
+        data={"backend": "claude-code", "transcript_path": "/synthetic/old.jsonl", "usage": usage},
+    )
+
+
+def test_old_format_usage_never_certifies_totals(repository) -> None:
+    """Review round 1, finding 2: events without accounting were not
+    de-duplicated; they must not promote an empty legacy session, and they
+    demote a version-2 session."""
+    legacy = _legacy_session("claude-code", tokens={}, context_used=None)
+    repository.upsert_session(legacy)
+    legacy_run = start_run(repository, legacy.id)
+    old = _old_format_event(legacy.id, {"input": 3, "output": 10})
+    apply(repository, [old, old], legacy_run)
+    stats = repository.get_session(legacy.id).stats
+    assert stats.tokens["output"] == 20  # additive, as before
+    assert stats.tokens_version is None
+
+    session, run_id = make_session(repository)
+    apply(repository, [_old_format_event(session.id, {"input": 3, "output": 10})], run_id)
+    assert repository.get_session(session.id).stats.tokens_version is None
+
+
+def test_old_format_zero_usage_keeps_version(repository) -> None:
+    session, run_id = make_session(repository)
+    apply(repository, [_old_format_event(session.id, {})], run_id)
+    assert repository.get_session(session.id).stats.tokens_version == 2
+
+
+def test_pi_additive_usage_promotes_empty_legacy_session(repository) -> None:
+    legacy = _legacy_session("pi", tokens={}, context_used=None)
+    repository.upsert_session(legacy)
+    run_id = start_run(repository, legacy.id)
+    line = json.dumps(
+        {
+            "type": "message",
+            "id": "a1b2c3d4",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0},
+                "stopReason": "stop",
+            },
+        }
+    )
+    feed(repository, "pi", legacy.id, run_id, [line])
+    assert repository.get_session(legacy.id).stats.tokens_version == 2
 
 
 def test_sqlite_schema_has_usage_ledger(tmp_path) -> None:

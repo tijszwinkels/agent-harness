@@ -106,6 +106,15 @@ create table if not exists usage_ledger (
     unique (session_id, usage_key)
 );
 
+-- Offset of the newest usage observation applied per session and
+-- transcript, so a replayed line cannot roll a context snapshot back.
+create table if not exists usage_positions (
+    session_id text not null,
+    transcript_path text not null,
+    offset integer not null,
+    primary key (session_id, transcript_path)
+);
+
 create table if not exists observer_offsets (
     path text primary key,
     next_offset integer not null,
@@ -954,12 +963,14 @@ class SQLiteRepository:
         # ``Session.stats.tokens``; keyed reports go through the
         # ``usage_ledger`` so a repeat counts once. Codex ``token_count``
         # events additionally carry ``context_window`` →
-        # ``Session.stats.context_window`` in the same pass. Runs inside
-        # the event's transaction, so the ledger, run and session commit
-        # (or roll back) together with the event row.
+        # ``Session.stats.context_window`` in the same pass; snapshots
+        # only move forward in transcript order (``usage_positions``).
+        # Runs inside the event's transaction, so the ledger, positions,
+        # run and session commit (or roll back) with the event row.
         from collections.abc import Mapping as _Mapping
         from agent_harness.usage import (
             add_usage,
+            observation_position_from,
             plan_usage_application,
             usage_accounting_from,
         )
@@ -990,6 +1001,14 @@ class SQLiteRepository:
         if session is None:
             raise SessionNotFoundError(event.session_id)
         accounting = usage_accounting_from(event.data)
+        position = observation_position_from(event.data)
+        stored_offset: int | None = None
+        if position is not None:
+            position_row = self._connection.execute(
+                "select offset from usage_positions where session_id = ? and transcript_path = ?",
+                (event.session_id, position[0]),
+            ).fetchone()
+            stored_offset = int(position_row["offset"]) if position_row is not None else None
         previous: Usage | None = None
         latest_key: str | None = None
         if accounting is not None and accounting.key is not None:
@@ -1010,9 +1029,19 @@ class SQLiteRepository:
             incoming=incoming,
             previous=previous,
             latest_key=latest_key,
+            stored_offset=stored_offset,
             context_window=context_window,
             context_used=context_used,
         )
+        if plan.position is not None:
+            self._connection.execute(
+                """
+                insert into usage_positions(session_id, transcript_path, offset)
+                values (?, ?, ?)
+                on conflict(session_id, transcript_path) do update set offset = excluded.offset
+                """,
+                (event.session_id, *plan.position),
+            )
         if plan.ledger is not None:
             key, recorded = plan.ledger
             # Upsert in place: an updated key keeps its row_id, so it

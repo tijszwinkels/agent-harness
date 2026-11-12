@@ -74,6 +74,9 @@ class InMemoryRepository:
         # key -> largest usage counted. Dict order is insertion order, so
         # the last key is the most recently added report.
         self._usage_ledger: dict[str, dict[str, Usage]] = {}
+        # (session_id, transcript_path) -> offset of the newest applied
+        # usage observation (snapshots only move forward).
+        self._usage_positions: dict[tuple[str, str], int] = {}
 
     def create_session(self, request: CreateSessionRequest) -> Session:
         session = Session(
@@ -445,6 +448,7 @@ class InMemoryRepository:
         # (option (b) of the Phase 3 spec's open question).
         from agent_harness.usage import (
             add_usage,
+            observation_position_from,
             plan_usage_application,
             usage_accounting_from,
         )
@@ -471,6 +475,12 @@ class InMemoryRepository:
             if run is None or run.session_id != event.session_id:
                 return
             accounting = usage_accounting_from(event.data)
+            position = observation_position_from(event.data)
+            stored_offset = (
+                self._usage_positions.get((event.session_id, position[0]))
+                if position is not None
+                else None
+            )
             ledger = self._usage_ledger.get(event.session_id, {})
             previous = None
             latest_key = None
@@ -483,10 +493,14 @@ class InMemoryRepository:
                 incoming=incoming,
                 previous=previous,
                 latest_key=latest_key,
+                stored_offset=stored_offset,
                 context_window=context_window,
                 context_used=context_used,
             )
             # All checks passed: mutate ledger, run and session together.
+            if plan.position is not None:
+                path, offset = plan.position
+                self._usage_positions[(event.session_id, path)] = offset
             if plan.ledger is not None:
                 key, recorded = plan.ledger
                 # Assigning an existing key keeps its position, so an

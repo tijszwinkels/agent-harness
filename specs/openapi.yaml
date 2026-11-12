@@ -941,11 +941,31 @@ components:
           minimum: 0
         tokens:
           type: object
-          description: Sum of input, output, cache_read, and cache_creation token usage across runs in the session.
+          description: |
+            Sum of input, output, cache_read, and cache_creation token usage across runs in the session.
+            The four fields are disjoint (`input` excludes cached input for every backend) and only cover
+            usage observed while a harness run was active. Trust these totals only when `tokens_version`
+            is non-null; see specs/2026-11-12-usage-accounting.md.
           additionalProperties: true
         cost_usd:
           type: number
           minimum: 0
+          description: Estimated USD cost. Only pi reports cost; 0 for other backends means "not reported", not free.
+        tokens_version:
+          type: [integer, "null"]
+          minimum: 1
+          description: |
+            Accounting rules `tokens` and `cost_usd` were accumulated under. 2 = all of them under the
+            corrected rules (claude once per logical message, codex once per cumulative-total change with
+            non-cached `input`). Null = legacy totals from an older harness that may be inflated; do not
+            present them as accurate. Never relabelled for sessions that had accumulated legacy usage.
+        skipped_usage_records:
+          type: integer
+          minimum: 0
+          description: |
+            Non-zero usage reports that were not counted because they lacked a stable identity to
+            de-duplicate on (claude record without `message.id`, codex token_count without
+            `total_token_usage`). Greater than 0 means `tokens` is a lower bound.
         context_window:
           type: [integer, "null"]
           minimum: 1
@@ -955,9 +975,18 @@ components:
           minimum: 0
           description: |
             Per-session SNAPSHOT of currently-loaded context tokens (overwrite-not-sum), distinct from
-            cumulative `tokens`. Sourced from codex `info.total_token_usage.total_tokens` and claude
-            `message.usage.input + cache_creation + cache_read` (output excluded). Null until first observation;
-            decreases (after context compaction) are valid.
+            cumulative `tokens`. Sourced from codex `info.last_token_usage.total_tokens`, claude
+            `message.usage.input + cache_creation + cache_read` (output excluded; sidechain records
+            ignored) and pi `usage.input + cacheRead + cacheWrite`. Null until first observation;
+            decreases (after context compaction) are valid. Only meaningful when `context_used_source`
+            is non-null.
+        context_used_source:
+          type: [string, "null"]
+          enum: [claude.message.usage, codex.last_token_usage, pi.message.usage, null]
+          description: |
+            Native source of `context_used`. Null = legacy/unknown provenance: older harness versions
+            stored codex's cumulative `total_token_usage` as `context_used`, so a value without a source
+            must not be shown as the current context. Set by the next corrected snapshot.
 
     Usage:
       type: object

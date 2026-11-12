@@ -2188,7 +2188,10 @@ async def test_observer_publishes_run_usage_from_codex_token_count(tmp_path) -> 
     rollout.write_text(
         '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
         '{"type":"event_msg","payload":{"type":"token_count","info":{'
-        '"last_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":50},'
+        '"last_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":50,'
+        '"reasoning_output_tokens":0,"total_tokens":420},'
+        '"total_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":50,'
+        '"reasoning_output_tokens":0,"total_tokens":420},'
         '"model_context_window":258400}}}\n',
         encoding="utf-8",
     )
@@ -2203,9 +2206,15 @@ async def test_observer_publishes_run_usage_from_codex_token_count(tmp_path) -> 
     assert usage_events, [e.event for e in published]
     assert usage_events[0].run_id == run.id
     payload = usage_events[0].data.get("usage")
-    assert payload["input"] == 120
+    # Codex's input_tokens INCLUDES cached_input_tokens; Usage.input is
+    # the non-cached part so the four fields don't count cache twice.
+    assert payload["input"] == 70
     assert payload["output"] == 300
     assert payload["cache_read"] == 50
+    assert usage_events[0].data["accounting"] == {
+        "version": 2,
+        "key": "codex:total:120:50:0:300:0:420",
+    }
     # Phase 3 open-question resolution: context_window rides on the
     # ``run.usage`` event so the materializer updates Session.stats
     # in the same pass — no separate session.stats_update event type.
@@ -2336,10 +2345,9 @@ async def test_observer_emits_context_used_for_claude_assistant_record(tmp_path)
 
 @pytest.mark.asyncio
 async def test_observer_emits_context_used_for_codex_token_count(tmp_path) -> None:
-    """Codex's ``info.total_token_usage.total_tokens`` is the cumulative
-    snapshot since session start (not the per-turn delta — that's
-    ``last_token_usage``). The observer must surface it on the
-    ``run.usage`` event."""
+    """Codex's current context is ``info.last_token_usage.total_tokens``
+    (codex's own "context left" source). ``total_token_usage`` is the
+    cumulative session total and must not be reported as context."""
     from agent_harness.models import CreateRunRequest, CreateSessionRequest
 
     repository = InMemoryRepository()
@@ -2362,8 +2370,10 @@ async def test_observer_emits_context_used_for_codex_token_count(tmp_path) -> No
     rollout.write_text(
         '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
         '{"type":"event_msg","payload":{"type":"token_count","info":{'
-        '"last_token_usage":{"input_tokens":120,"output_tokens":300,"cached_input_tokens":50},'
-        '"total_token_usage":{"total_tokens":42000},'
+        '"last_token_usage":{"input_tokens":41700,"output_tokens":300,"cached_input_tokens":41000,'
+        '"reasoning_output_tokens":100,"total_tokens":42000},'
+        '"total_token_usage":{"input_tokens":2990000,"output_tokens":10000,"cached_input_tokens":2900000,'
+        '"reasoning_output_tokens":4000,"total_tokens":3000000},'
         '"model_context_window":258400}}}\n',
         encoding="utf-8",
     )
@@ -2376,6 +2386,11 @@ async def test_observer_emits_context_used_for_codex_token_count(tmp_path) -> No
     usage_events = [e for e in published if e.event == "run.usage"]
     assert usage_events, [e.event for e in published]
     assert usage_events[0].data.get("context_used") == 42000
+    assert usage_events[0].data.get("context_source") == "codex.last_token_usage"
+    after = repository.get_session(session.id)
+    # Old behaviour reported the cumulative 3,000,000 — beyond the window.
+    assert after.stats.context_used == 42000 <= after.stats.context_window
+    assert after.stats.context_used_source == "codex.last_token_usage"
 
 
 @pytest.mark.asyncio
@@ -2436,7 +2451,7 @@ async def test_observer_emits_context_used_per_assistant_record_claude(tmp_path)
 async def test_observer_emits_context_used_per_token_count_codex(tmp_path) -> None:
     """Codex parallel: two ``token_count`` events produce two
     ``run.usage`` events, each carrying its own ``context_used``
-    snapshot from ``info.total_token_usage.total_tokens``."""
+    snapshot from ``info.last_token_usage.total_tokens``."""
     from agent_harness.models import CreateRunRequest, CreateSessionRequest
 
     repository = InMemoryRepository()
@@ -2459,12 +2474,12 @@ async def test_observer_emits_context_used_per_token_count_codex(tmp_path) -> No
     rollout.write_text(
         '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
         '{"type":"event_msg","payload":{"type":"token_count","info":{'
-        '"last_token_usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0},'
-        '"total_token_usage":{"total_tokens":10000},'
+        '"last_token_usage":{"input_tokens":9950,"output_tokens":50,"cached_input_tokens":0,"total_tokens":10000},'
+        '"total_token_usage":{"input_tokens":9950,"output_tokens":50,"cached_input_tokens":0,"total_tokens":10000},'
         '"model_context_window":258400}}}\n'
         '{"type":"event_msg","payload":{"type":"token_count","info":{'
-        '"last_token_usage":{"input_tokens":80,"output_tokens":30,"cached_input_tokens":0},'
-        '"total_token_usage":{"total_tokens":25000},'
+        '"last_token_usage":{"input_tokens":24970,"output_tokens":30,"cached_input_tokens":9000,"total_tokens":25000},'
+        '"total_token_usage":{"input_tokens":34920,"output_tokens":80,"cached_input_tokens":9000,"total_tokens":35000},'
         '"model_context_window":258400}}}\n',
         encoding="utf-8",
     )
@@ -2521,11 +2536,12 @@ async def test_observer_cumulative_vs_snapshot_end_to_end_claude(tmp_path) -> No
         lines = [
             (
                 '{"type":"assistant","cwd":"/repo","sessionId":"' + claude_uuid + '",'
-                '"message":{"role":"assistant","model":"claude-opus","content":[{"type":"text","text":"turn"}],'
+                f'"message":{{"id":"msg_turn{index}","role":"assistant","model":"claude-opus",'
+                '"content":[{"type":"text","text":"turn"}],'
                 f'"usage":{{"input_tokens":{inp},"output_tokens":5,'
                 f'"cache_read_input_tokens":{cr},"cache_creation_input_tokens":0}}}}}}'
             )
-            for inp, cr in per_turn
+            for index, (inp, cr) in enumerate(per_turn)
         ]
         rollout.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2549,10 +2565,11 @@ async def test_observer_cumulative_vs_snapshot_end_to_end_claude(tmp_path) -> No
 
 @pytest.mark.asyncio
 async def test_observer_emits_decreasing_context_used_after_compaction_codex(tmp_path) -> None:
-    """After codex compacts, ``total_token_usage.total_tokens``
-    legitimately decreases. The observer must propagate the smaller
-    value (no monotonic-only filtering); the materializer applies it
-    (locked in by storage tests)."""
+    """After codex compacts it reports the same cumulative total with a
+    zeroed ``last_token_usage`` whose ``total_tokens`` is the compacted
+    context estimate (native shape observed in codex 0.159 rollouts).
+    The context snapshot must drop to it (no monotonic-only filtering),
+    while the cumulative token totals do not change."""
     from agent_harness.models import CreateRunRequest, CreateSessionRequest
 
     repository = InMemoryRepository()
@@ -2575,12 +2592,17 @@ async def test_observer_emits_decreasing_context_used_after_compaction_codex(tmp
     rollout.write_text(
         '{"type":"turn_context","payload":{"cwd":"/repo","model":"gpt-5.4"}}\n'
         '{"type":"event_msg","payload":{"type":"token_count","info":{'
-        '"last_token_usage":{"input_tokens":1,"output_tokens":1,"cached_input_tokens":0},'
-        '"total_token_usage":{"total_tokens":180000},'
+        '"last_token_usage":{"input_tokens":179000,"output_tokens":1000,"cached_input_tokens":170000,'
+        '"cache_write_input_tokens":0,"reasoning_output_tokens":400,"total_tokens":180000},'
+        '"total_token_usage":{"input_tokens":4000000,"output_tokens":20000,"cached_input_tokens":3800000,'
+        '"cache_write_input_tokens":0,"reasoning_output_tokens":9000,"total_tokens":4020000},'
         '"model_context_window":258400}}}\n'
+        '{"type":"compacted","payload":{"message":"","replacement_history":[]}}\n'
         '{"type":"event_msg","payload":{"type":"token_count","info":{'
-        '"last_token_usage":{"input_tokens":1,"output_tokens":1,"cached_input_tokens":0},'
-        '"total_token_usage":{"total_tokens":12000},'
+        '"last_token_usage":{"input_tokens":0,"output_tokens":0,"cached_input_tokens":0,'
+        '"cache_write_input_tokens":0,"reasoning_output_tokens":0,"total_tokens":12000},'
+        '"total_token_usage":{"input_tokens":4000000,"output_tokens":20000,"cached_input_tokens":3800000,'
+        '"cache_write_input_tokens":0,"reasoning_output_tokens":9000,"total_tokens":4020000},'
         '"model_context_window":258400}}}\n',
         encoding="utf-8",
     )
@@ -2596,6 +2618,13 @@ async def test_observer_emits_decreasing_context_used_after_compaction_codex(tmp
         if e.event == "run.usage"
     ]
     assert snapshots == [180000, 12000]
+    after = repository.get_session(session.id)
+    assert after.stats.context_used == 12000
+    # The post-compaction report shares the previous call's cumulative
+    # key and carries no new usage: totals count the call once.
+    assert after.stats.tokens == {
+        "input": 9000, "output": 1000, "cache_read": 170000, "cache_creation": 0,
+    }
 
 
 @pytest.mark.asyncio

@@ -70,6 +70,10 @@ class InMemoryRepository:
         self._sessions: dict[str, Session] = {}
         self._runs: dict[str, Run] = {}
         self._messages: dict[str, list[Message]] = {}
+        # Per-session usage ledger (see ``usage.plan_usage_application``):
+        # key -> largest usage counted. Dict order is insertion order, so
+        # the last key is the most recently added report.
+        self._usage_ledger: dict[str, dict[str, Usage]] = {}
 
     def create_session(self, request: CreateSessionRequest) -> Session:
         session = Session(
@@ -434,18 +438,23 @@ class InMemoryRepository:
     def _materialize_run_usage_event(self, event: Event) -> None:
         # Phase 3: apply per-turn ``Usage`` from the rollout to the
         # named ``Run`` (additive — usage sums across turns) and roll
-        # the aggregate up into ``Session.stats.tokens``. Codex
+        # the aggregate up into ``Session.stats.tokens``; keyed reports
+        # go through the usage ledger so a repeat counts once. Codex
         # ``token_count`` events additionally carry ``context_window``
         # so ``Session.stats.context_window`` updates in the same pass
         # (option (b) of the Phase 3 spec's open question).
-        from agent_harness.usage import add_usage
+        from agent_harness.usage import (
+            add_usage,
+            plan_usage_application,
+            usage_accounting_from,
+        )
 
         if event.session_id is None or event.run_id is None:
             return
         usage_data = event.data.get("usage")
         if not isinstance(usage_data, Mapping):
             return
-        delta = Usage.model_validate(usage_data)
+        incoming = Usage.model_validate(usage_data)
         context_window = _context_window_from(event.data)
         context_used = _context_used_from(event.data)
         with self._lock:
@@ -461,27 +470,34 @@ class InMemoryRepository:
             run = self._runs.get(event.run_id)
             if run is None or run.session_id != event.session_id:
                 return
-            self._runs[event.run_id] = run.model_copy(
-                update={"usage": add_usage(run.usage, delta)}
+            accounting = usage_accounting_from(event.data)
+            ledger = self._usage_ledger.get(event.session_id, {})
+            previous = None
+            latest_key = None
+            if accounting is not None and accounting.key is not None:
+                previous = ledger.get(accounting.key)
+                latest_key = next(reversed(ledger), None)
+            plan = plan_usage_application(
+                session.stats,
+                event.data,
+                incoming=incoming,
+                previous=previous,
+                latest_key=latest_key,
+                context_window=context_window,
+                context_used=context_used,
             )
-            tokens = dict(session.stats.tokens or {})
-            for key in ("input", "output", "cache_read", "cache_creation"):
-                tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)
-            new_cost = session.stats.cost_usd + delta.cost_usd
-            stats_update: dict[str, object] = {
-                "tokens": tokens,
-                "cost_usd": new_cost,
-            }
-            if context_window is not None:
-                stats_update["context_window"] = context_window
-            if context_used is not None:
-                # SNAPSHOT semantics: overwrite, never sum. A None
-                # value means "no fresh observation" (omitted from
-                # event); leave the prior snapshot untouched.
-                stats_update["context_used"] = context_used
+            # All checks passed: mutate ledger, run and session together.
+            if plan.ledger is not None:
+                key, recorded = plan.ledger
+                # Assigning an existing key keeps its position, so an
+                # updated report does not become the latest again.
+                self._usage_ledger.setdefault(event.session_id, {})[key] = recorded
+            self._runs[event.run_id] = run.model_copy(
+                update={"usage": add_usage(run.usage, plan.run_delta)}
+            )
             self._sessions[event.session_id] = session.model_copy(
                 update={
-                    "stats": session.stats.model_copy(update=stats_update),
+                    "stats": plan.stats,
                     "updated_at": utc_now(),
                 }
             )

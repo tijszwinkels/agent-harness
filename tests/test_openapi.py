@@ -148,6 +148,28 @@ def test_openapi_documents_session_stats_context_used() -> None:
     assert "context_used" not in session_stats.get("required", [])
 
 
+def test_openapi_documents_session_stats_usage_provenance() -> None:
+    """Drift guard for the consumer contract in
+    specs/2026-11-12-usage-accounting.md: optional provenance fields that
+    let consumers tell corrected usage from legacy values."""
+    spec = _openapi_spec()
+    session_stats = spec["components"]["schemas"]["SessionStats"]
+    props = session_stats["properties"]
+    required = session_stats.get("required", [])
+    assert props["tokens_version"]["type"] == ["integer", "null"]
+    assert props["skipped_usage_records"]["type"] == "integer"
+    assert props["context_used_source"]["type"] == ["string", "null"]
+    assert set(props["context_used_source"]["enum"]) == {
+        "claude.message.usage",
+        "codex.last_token_usage",
+        "pi.message.usage",
+        None,
+    }
+    for field in ("tokens_version", "skipped_usage_records", "context_used_source"):
+        assert field not in required
+    assert "last_token_usage" in props["context_used"]["description"]
+
+
 def test_openapi_documents_fork_route_and_forked_from() -> None:
     """Drift guard: the fork route contract mm-bridge depends on —
     POST /v1/sessions/{id}/forks with 201/404/409, ForkSessionRequest /

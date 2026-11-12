@@ -11,6 +11,12 @@ BackendName = Literal["claude-code", "codex", "pi"]
 Origin = Literal["harness", "external"]
 SessionStatus = Literal["idle", "running", "waiting_for_input", "archived"]
 TitleSource = Literal["native"]
+# Native source of ``SessionStats.context_used`` (see that field).
+ContextSource = Literal["claude.message.usage", "codex.last_token_usage", "pi.message.usage"]
+# ``SessionStats.tokens_version`` written for totals accumulated under the
+# current accounting rules (claude: once per logical message; codex: once
+# per cumulative-total change, ``input`` excluding cached input).
+TOKEN_ACCOUNTING_VERSION = 2
 RunStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
 RUN_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "interrupted"})
 StopReason = Literal["end_turn", "tool_use", "max_tokens", "interrupted"]
@@ -66,6 +72,23 @@ class SessionStats(HarnessModel):
         description="Sum of input, output, cache_read, and cache_creation token usage across runs in the session.",
     )
     cost_usd: float = Field(default=0, ge=0)
+    # Accounting rules ``tokens`` and ``cost_usd`` were accumulated under.
+    # ``2`` (``TOKEN_ACCOUNTING_VERSION``): every value was counted
+    # under the corrected rules — claude usage once per logical message,
+    # codex usage once per cumulative-total change with ``input`` excluding
+    # cached input, pi per record as before. ``None``: legacy totals from
+    # before this field existed, which may be inflated (claude repeated
+    # content-block usage, codex cached input counted twice) and must not
+    # be trusted. Rows saved before this field existed load as ``None``;
+    # ``Session``'s default stats start at ``2``. A legacy session is only
+    # promoted when it has nothing accumulated yet — see
+    # ``usage.plan_usage_application``.
+    tokens_version: int | None = Field(default=None, ge=1)
+    # Usage records (with non-zero usage) that were NOT added to
+    # ``tokens`` because they had no stable identity to de-duplicate on
+    # (e.g. a claude assistant record without ``message.id``). Non-zero
+    # means ``tokens`` is a lower bound.
+    skipped_usage_records: int = Field(default=0, ge=0)
     # Codex-only: latest ``model_context_window`` observed in a
     # ``token_count`` payload. ``None`` until first observed (e.g.
     # claude sessions never set it). The observer updates this each
@@ -75,11 +98,23 @@ class SessionStats(HarnessModel):
     # (overwrite-not-sum). Distinct from cumulative ``tokens``:
     # for long claude tool-use loops, ``cache_read`` can exceed 10M
     # while the actual loaded context is bounded by ``context_window``.
-    # Sourced from codex ``info.total_token_usage.total_tokens`` and
+    # Sourced from codex ``info.last_token_usage.total_tokens`` and
     # claude ``message.usage.input + cache_creation + cache_read``.
     # ``None`` until the first observation lands; decreases (after
     # context compaction) are valid.
     context_used: int | None = Field(default=None, ge=0)
+    # Native source of ``context_used`` (``ContextSource``).
+    # ``None`` means legacy/unknown provenance: older harness versions
+    # stored codex's CUMULATIVE ``total_token_usage`` here, so a value
+    # without a source must not be shown as current context.
+    context_used_source: ContextSource | None = None
+
+
+def new_session_stats() -> SessionStats:
+    """Stats for a session created by this harness version: nothing
+    accumulated yet, so its totals follow the current accounting rules
+    from the start."""
+    return SessionStats(tokens_version=TOKEN_ACCOUNTING_VERSION)
 
 
 class TextBlock(HarnessModel):
@@ -204,7 +239,7 @@ class Session(HarnessModel):
     updated_at: datetime = Field(default_factory=utc_now)
     status: SessionStatus = "idle"
     origin: Origin = "harness"
-    stats: SessionStats = Field(default_factory=SessionStats)
+    stats: SessionStats = Field(default_factory=new_session_stats)
     # When True, builders pass the backend's permission-bypass flag
     # (`--dangerously-skip-permissions` for claude-code,
     # `--dangerously-bypass-approvals-and-sandbox` for codex).

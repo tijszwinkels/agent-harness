@@ -82,7 +82,8 @@ def test_parse_codex_token_count_returns_usage_and_context_window() -> None:
             }
         }
     )
-    assert usage == Usage(input=120, output=300, cache_read=50, cache_creation=0, cost_usd=0.0)
+    # input_tokens includes the 50 cached tokens; Usage.input is uncached.
+    assert usage == Usage(input=70, output=300, cache_read=50, cache_creation=0, cost_usd=0.0)
     assert context_window == 258400
 
 
@@ -125,10 +126,28 @@ def test_parse_codex_token_count_returns_none_for_non_mapping_payload() -> None:
 
 
 def test_parse_codex_usage_maps_cached_input_to_cache_read() -> None:
+    # Codex's input_tokens INCLUDES cached_input_tokens (codex's own
+    # non_cached_input() subtracts them). The old mapping put all 100
+    # into ``input`` AND 30 into ``cache_read``: summing the fields
+    # counted the cached tokens twice.
     usage = parse_codex_usage(
         {"input_tokens": 100, "output_tokens": 200, "cached_input_tokens": 30}
     )
-    assert usage == Usage(input=100, output=200, cache_read=30, cache_creation=0, cost_usd=0.0)
+    assert usage == Usage(input=70, output=200, cache_read=30, cache_creation=0, cost_usd=0.0)
+
+
+def test_parse_codex_usage_clamps_cached_above_input() -> None:
+    # Malformed: cached > input must not produce a negative input.
+    usage = parse_codex_usage({"input_tokens": 10, "cached_input_tokens": 30})
+    assert usage == Usage(input=0, output=0, cache_read=10)
+
+
+def test_parse_codex_usage_ignores_cache_write_input_tokens() -> None:
+    # Undocumented relation to input_tokens; only ever observed as 0.
+    usage = parse_codex_usage(
+        {"input_tokens": 100, "cached_input_tokens": 30, "cache_write_input_tokens": 5}
+    )
+    assert usage == Usage(input=70, output=0, cache_read=30, cache_creation=0)
 
 
 def test_parse_codex_usage_returns_none_for_non_mapping() -> None:
@@ -143,16 +162,38 @@ def test_parse_codex_usage_returns_none_for_non_mapping() -> None:
 # are valid (context compaction).
 
 
-def test_parse_codex_context_snapshot_returns_total_tokens() -> None:
+def test_parse_codex_context_snapshot_returns_last_total_tokens() -> None:
+    # The current context is last_token_usage.total_tokens; the
+    # cumulative total_token_usage (here larger than the window) is not.
     snapshot = parse_codex_context_snapshot(
         {
             "info": {
-                "total_token_usage": {"total_tokens": 12345},
-                "last_token_usage": {"input_tokens": 50},
+                "total_token_usage": {"total_tokens": 9_000_000},
+                "last_token_usage": {"input_tokens": 12000, "output_tokens": 345, "total_tokens": 12345},
+                "model_context_window": 258400,
             }
         }
     )
     assert snapshot == 12345
+
+
+def test_parse_codex_context_snapshot_after_compaction() -> None:
+    # Native post-compaction shape: zeroed last usage except total_tokens.
+    snapshot = parse_codex_context_snapshot(
+        {
+            "info": {
+                "total_token_usage": {"input_tokens": 500, "output_tokens": 20, "total_tokens": 520},
+                "last_token_usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 16369,
+                },
+            }
+        }
+    )
+    assert snapshot == 16369
 
 
 def test_parse_codex_context_snapshot_returns_none_when_info_is_null() -> None:
@@ -165,7 +206,18 @@ def test_parse_codex_context_snapshot_returns_none_when_info_missing() -> None:
     assert parse_codex_context_snapshot({}) is None
 
 
-def test_parse_codex_context_snapshot_returns_none_when_total_usage_missing() -> None:
+def test_parse_codex_context_snapshot_returns_none_when_last_usage_missing() -> None:
+    # Only the cumulative total is present: context is unknown, and the
+    # cumulative value must not stand in for it.
+    assert (
+        parse_codex_context_snapshot(
+            {"info": {"total_token_usage": {"total_tokens": 12345}}}
+        )
+        is None
+    )
+
+
+def test_parse_codex_context_snapshot_returns_none_when_last_total_tokens_missing() -> None:
     assert (
         parse_codex_context_snapshot(
             {"info": {"last_token_usage": {"input_tokens": 50}}}
@@ -180,7 +232,7 @@ def test_parse_codex_context_snapshot_returns_none_when_total_tokens_is_zero() -
     # earlier observation with 0.
     assert (
         parse_codex_context_snapshot(
-            {"info": {"total_token_usage": {"total_tokens": 0}}}
+            {"info": {"last_token_usage": {"total_tokens": 0}}}
         )
         is None
     )
@@ -195,7 +247,7 @@ def test_parse_codex_context_snapshot_ignores_garbage_total_tokens() -> None:
     # Defensive: a non-numeric value mustn't crash the observer.
     assert (
         parse_codex_context_snapshot(
-            {"info": {"total_token_usage": {"total_tokens": "abc"}}}
+            {"info": {"last_token_usage": {"total_tokens": "abc"}}}
         )
         is None
     )

@@ -40,7 +40,7 @@ from agent_harness.repository import (
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TModel = TypeVar("TModel", bound=BaseModel)
 RUN_LIFECYCLE_EVENTS = {"run.started", "run.completed", "run.failed", "run.interrupted"}
 RUN_TERMINAL_EVENTS = RUN_LIFECYCLE_EVENTS - {"run.started"}
@@ -95,6 +95,17 @@ create table if not exists live_state_owners (
     updated_at text not null
 );
 
+-- Per-session ledger of the largest usage counted per native usage report
+-- (agent_harness.usage.plan_usage_application), so a repeated or replayed
+-- report is counted once. A separate table: older versions ignore it.
+create table if not exists usage_ledger (
+    row_id integer primary key autoincrement,
+    session_id text not null,
+    usage_key text not null,
+    usage text not null,
+    unique (session_id, usage_key)
+);
+
 create table if not exists observer_offsets (
     path text primary key,
     next_offset integer not null,
@@ -106,6 +117,7 @@ create index if not exists idx_sessions_codex_resume_id
     where json_extract(payload, '$.backend') = 'codex'
       and json_extract(payload, '$.origin') = 'harness';
 create index if not exists idx_runs_session_id on runs(session_id);
+create index if not exists idx_usage_ledger_session_id on usage_ledger(session_id);
 create index if not exists idx_messages_message_id on messages(message_id);
 create index if not exists idx_messages_session_id on messages(session_id);
 create index if not exists idx_messages_run_id on messages(run_id);
@@ -937,20 +949,27 @@ class SQLiteRepository:
         return int(row[0])
 
     def _materialize_run_usage_event(self, event: Event) -> None:
-        # Phase 3: additive per-turn usage from the rollout. Applies
-        # the ``Usage`` to the named run AND rolls the same delta into
-        # ``Session.stats.tokens``. Codex ``token_count`` events
-        # additionally carry ``context_window`` → updates
-        # ``Session.stats.context_window`` in the same pass.
+        # Phase 3: per-turn usage from the rollout. Applies the counted
+        # delta to the named run AND rolls it into
+        # ``Session.stats.tokens``; keyed reports go through the
+        # ``usage_ledger`` so a repeat counts once. Codex ``token_count``
+        # events additionally carry ``context_window`` →
+        # ``Session.stats.context_window`` in the same pass. Runs inside
+        # the event's transaction, so the ledger, run and session commit
+        # (or roll back) together with the event row.
         from collections.abc import Mapping as _Mapping
-        from agent_harness.usage import add_usage
+        from agent_harness.usage import (
+            add_usage,
+            plan_usage_application,
+            usage_accounting_from,
+        )
 
         if event.session_id is None or event.run_id is None:
             return
         usage_data = event.data.get("usage")
         if not isinstance(usage_data, _Mapping):
             return
-        delta = Usage.model_validate(usage_data)
+        incoming = Usage.model_validate(usage_data)
         context_window = _context_window_from(event.data)
         context_used = _context_used_from(event.data)
 
@@ -966,29 +985,51 @@ class SQLiteRepository:
             )
             return
         run = _model_from_row(row, "payload", Run)
-        self._upsert_run(run.model_copy(update={"usage": add_usage(run.usage, delta)}))
 
         session = self._find_session_locked(event.session_id)
         if session is None:
             raise SessionNotFoundError(event.session_id)
-        tokens = dict(session.stats.tokens or {})
-        for key in ("input", "output", "cache_read", "cache_creation"):
-            tokens[key] = int(tokens.get(key, 0)) + getattr(delta, key)
-        stats_update: dict[str, object] = {
-            "tokens": tokens,
-            "cost_usd": session.stats.cost_usd + delta.cost_usd,
-        }
-        if context_window is not None:
-            stats_update["context_window"] = context_window
-        if context_used is not None:
-            # SNAPSHOT semantics: overwrite, never sum. A None value
-            # means "no fresh observation" (event omitted the field);
-            # leave the prior snapshot in place.
-            stats_update["context_used"] = context_used
+        accounting = usage_accounting_from(event.data)
+        previous: Usage | None = None
+        latest_key: str | None = None
+        if accounting is not None and accounting.key is not None:
+            ledger_row = self._connection.execute(
+                "select usage from usage_ledger where session_id = ? and usage_key = ?",
+                (event.session_id, accounting.key),
+            ).fetchone()
+            if ledger_row is not None:
+                previous = Usage.model_validate_json(ledger_row["usage"])
+            latest_row = self._connection.execute(
+                "select usage_key from usage_ledger where session_id = ? order by row_id desc limit 1",
+                (event.session_id,),
+            ).fetchone()
+            latest_key = latest_row["usage_key"] if latest_row is not None else None
+        plan = plan_usage_application(
+            session.stats,
+            event.data,
+            incoming=incoming,
+            previous=previous,
+            latest_key=latest_key,
+            context_window=context_window,
+            context_used=context_used,
+        )
+        if plan.ledger is not None:
+            key, recorded = plan.ledger
+            # Upsert in place: an updated key keeps its row_id, so it
+            # does not become the "latest" report again.
+            self._connection.execute(
+                """
+                insert into usage_ledger(session_id, usage_key, usage)
+                values (?, ?, ?)
+                on conflict(session_id, usage_key) do update set usage = excluded.usage
+                """,
+                (event.session_id, key, recorded.model_dump_json()),
+            )
+        self._upsert_run(run.model_copy(update={"usage": add_usage(run.usage, plan.run_delta)}))
         self._upsert_session(
             session.model_copy(
                 update={
-                    "stats": session.stats.model_copy(update=stats_update),
+                    "stats": plan.stats,
                     "updated_at": utc_now(),
                 }
             )

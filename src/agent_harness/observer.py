@@ -27,6 +27,7 @@ from agent_harness.models import (
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    ContextSource,
     Usage,
     observed_title,
     replace_lone_surrogates,
@@ -54,6 +55,9 @@ from agent_harness.repository import (
     SessionNotFoundError,
 )
 from agent_harness.usage import (
+    UsageAccounting,
+    claude_usage_key,
+    codex_usage_key,
     parse_claude_context_snapshot,
     parse_claude_usage,
     parse_codex_context_snapshot,
@@ -2483,14 +2487,24 @@ def _parse_claude_record(
                 # 0 for an all-zero usage block — skip emission in
                 # that case so the materializer doesn't overwrite an
                 # earlier real snapshot with a meaningless zero.
+                # A sidechain (subagent) record's usage is real
+                # consumption, but its context is the subagent's, not
+                # this conversation's.
                 snapshot = parse_claude_context_snapshot(raw_usage)
-                context_used = snapshot if snapshot else None
+                context_used = (
+                    snapshot if snapshot and record.get("isSidechain") is not True else None
+                )
+                # Every content-block record of one API response repeats
+                # its usage: ``message.id`` makes the materializer count
+                # it once (see ``usage.plan_usage_application``).
                 events.append(
                     _run_usage_event(
                         identity=identity,
                         usage=usage,
                         context_window=None,
                         context_used=context_used,
+                        context_source="claude.message.usage",
+                        accounting=UsageAccounting(key=claude_usage_key(message)),
                         offset=offset,
                     )
                 )
@@ -2544,19 +2558,23 @@ def _parse_codex_record(
     # ``(None, None)`` for that case and we skip emission.
     if record_type == "event_msg" and payload_type == "token_count":
         usage, context_window = parse_codex_token_count(payload)
-        # Snapshot from total_token_usage rides on the same run.usage
+        # Snapshot from last_token_usage rides on the same run.usage
         # event (option A; matches the existing context_window
         # pattern). Returns None when info is missing/null/zero — the
         # _run_usage_event omission then preserves any earlier
         # snapshot on the session.
         context_used = parse_codex_context_snapshot(payload)
         if usage is not None or context_window is not None or context_used is not None:
+            # The cumulative total identifies the call, so a repeated
+            # token_count adds nothing (see ``codex_usage_key``).
             events.append(
                 _run_usage_event(
                     identity=identity,
                     usage=usage or Usage(),
                     context_window=context_window,
                     context_used=context_used,
+                    context_source="codex.last_token_usage",
+                    accounting=UsageAccounting(key=codex_usage_key(payload)),
                     offset=offset,
                 )
             )
@@ -2790,6 +2808,10 @@ def _parse_pi_record(
                     usage=usage,
                     context_window=None,
                     context_used=snapshot if snapshot else None,
+                    context_source="pi.message.usage",
+                    # pi writes each message once: its usage stays
+                    # unkeyed and additive, as before.
+                    accounting=None,
                     offset=offset,
                 )
             )
@@ -2989,6 +3011,8 @@ def _run_usage_event(
     usage: Usage,
     context_window: int | None,
     context_used: int | None,
+    context_source: ContextSource,
+    accounting: UsageAccounting | None,
     offset: int | None,
 ) -> Event:
     """Build a ``run.usage`` event with ``run_id=None``.
@@ -3007,15 +3031,22 @@ def _run_usage_event(
     Omitting an optional field from event.data preserves any prior
     value on Session.stats — only writes that observe a fresh value
     move the snapshot.
+
+    ``accounting`` (claude, codex) carries the native report's identity
+    so a repeated report counts once; ``context_source`` names where
+    ``context_used`` came from (``SessionStats.context_used_source``).
     """
     data: dict[str, Any] = {
         **_source_data(identity, offset=offset),
         "usage": usage.model_dump(mode="json"),
     }
+    if accounting is not None:
+        data["accounting"] = accounting.to_data()
     if context_window is not None:
         data["context_window"] = context_window
     if context_used is not None:
         data["context_used"] = context_used
+        data["context_source"] = context_source
     return Event(
         event="run.usage",
         session_id=identity.session_id,

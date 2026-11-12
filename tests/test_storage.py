@@ -875,7 +875,7 @@ def test_materialize_event_preserves_existing_session_stats_on_external_upsert(t
     Verify: an external session with non-zero stats receives a fresh
     session.updated and KEEPS its accumulated stats.
     """
-    from agent_harness.models import Event, Project, Session, SessionStats
+    from agent_harness.models import Event, Project, Session, SessionStats, new_session_stats
 
     repository = open_sqlite_repository(tmp_path / "harness.db")
     try:
@@ -906,7 +906,7 @@ def test_materialize_event_preserves_existing_session_stats_on_external_upsert(t
             project=Project(path="/repo", name="repo"),
             origin="external",
         )
-        assert fresh.stats == SessionStats()  # zeroed by default
+        assert fresh.stats == new_session_stats()  # zeroed by default
 
         repository.materialize_event(
             Event(

@@ -1,5 +1,9 @@
 # Live context size — `Session.stats.context_used`
 
+> **Superseded for codex (2026-11-12, #48):** `total_token_usage` is the
+> cumulative session total, not the current context. Codex's source is now
+> `info.last_token_usage.total_tokens`; see `2026-11-12-usage-accounting.md`.
+
 Filed: 2026-05-19 — Heron's task `ApWJVWXvVKIIMnH6CP6u8HUyU2gLvyYGnwRlgrWAUwcP.0acee33a-a6ea-42de-8509-1f038be7eecd`
 Worktree: `worktrees/feat/context-used`
 Branch: `feat/context-used`

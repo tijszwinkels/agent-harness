@@ -534,13 +534,107 @@ def test_codex_stale_replay_does_not_roll_window_back(repository) -> None:
     assert (stats.context_used, stats.context_window) == (30_200, 400_000)
 
 
-def test_rewritten_transcript_with_new_report_is_fresh(repository) -> None:
-    """A report never seen before at an earlier offset means the transcript
-    was rewritten; it is a new observation, not a replay."""
+def _prefix_replay_lines() -> list[str]:
+    """A (read while no harness run was active, so never counted), B, and
+    B's compaction report C — all one unchanged, append-only transcript."""
+    a = codex_usage(50_000, 40_000, 500)
+    b = codex_usage(200_000, 190_000, 1_000)
+    total_b = add_usage(a, b)
+    compacted = {
+        "input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 16_369,
+    }
+    return [codex_token_count(a, a), codex_token_count(b, total_b), codex_token_count(compacted, total_b)]
+
+
+def test_replayed_prefix_with_uncounted_report_keeps_compacted_context(repository) -> None:
+    """Review round 2: a report missing from the ledger is not evidence of
+    a rewrite. Replaying the prefix A,B at its original offsets must not
+    undo the compaction."""
+    session, run_id = make_session(repository, "codex")
+    lines = _prefix_replay_lines()
+    feed(repository, "codex", session.id, run_id, lines[1:], start=offset_after(lines[:1]))
+    assert repository.get_session(session.id).stats.context_used == 16_369
+    feed(repository, "codex", session.id, run_id, lines[:2])
+    stats = repository.get_session(session.id).stats
+    assert stats.context_used == 16_369
+    assert stats.context_window == 258400
+
+
+def test_replayed_prefix_after_sqlite_reopen(tmp_path) -> None:
+    db = tmp_path / "harness.db"
+    repo = open_sqlite_repository(db)
+    session, run_id = make_session(repo, "codex")
+    lines = _prefix_replay_lines()
+    feed(repo, "codex", session.id, run_id, lines[1:], start=offset_after(lines[:1]))
+    repo.close()
+    repo = open_sqlite_repository(db)
+    try:
+        run_id = start_run(repo, session.id)
+        feed(repo, "codex", session.id, run_id, lines[:2])
+        assert repo.get_session(session.id).stats.context_used == 16_369
+    finally:
+        repo.close()
+
+
+@pytest.mark.asyncio
+async def test_prefix_replay_through_observer_keeps_compacted_context(tmp_path) -> None:
+    """Same scenario through the real path: A is published with no active
+    run (dropped), B and C during a run, then a fresh observer re-reads
+    the prefix A,B from offset 0 after a cursor reset."""
+    repository = open_sqlite_repository(tmp_path / "harness.db")
+    try:
+        session = repository.create_session(
+            CreateSessionRequest(backend="codex", model="gpt-x", project=Project(path="/repo", name="repo"))
+        )
+        rollout = (
+            tmp_path / ".codex" / "sessions" / "2026" / "11" / "12"
+            / "rollout-2026-11-12T10-00-00-019e0500-0000-0000-0000-000000000000.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        lines = _prefix_replay_lines()
+        rollout.write_text(lines[0] + "\n", encoding="utf-8")
+        observer = ExternalTranscriptObserver(DurableEventBus(repository), repository=repository)
+        observer.bind_rollout(rollout, session.id)
+        await observer.tail_file(rollout)
+        assert repository.get_session(session.id).stats.tokens == {}
+
+        start_run(repository, session.id)
+        rollout.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        await observer.tail_file(rollout)
+        assert repository.get_session(session.id).stats.context_used == 16_369
+
+        # Cursor reset: the persisted observer offset goes back to 0, and
+        # a fresh observer re-reads the (unchanged) prefix A,B.
+        repository.set_observer_offset(str(rollout), 0)
+        rollout.write_text("".join(line + "\n" for line in lines[:2]), encoding="utf-8")
+        replay = ExternalTranscriptObserver(DurableEventBus(repository), repository=repository)
+        replay.bind_rollout(rollout, session.id)
+        await replay.tail_file(rollout)
+        stats = repository.get_session(session.id).stats
+        assert stats.context_used == 16_369
+        # B is not counted again. A, never counted before (no run was
+        # active), is now read during a run and counted once (500 + 1000).
+        assert stats.tokens["output"] == 1_500
+        repository.set_observer_offset(str(rollout), 0)
+        again = ExternalTranscriptObserver(DurableEventBus(repository), repository=repository)
+        again.bind_rollout(rollout, session.id)
+        await again.tail_file(rollout)
+        assert repository.get_session(session.id).stats.tokens["output"] == 1_500
+    finally:
+        repository.close()
+
+
+def test_earlier_offset_is_stale_even_for_an_unseen_report(repository) -> None:
+    """Conservative policy: snapshots only move forward per transcript, so a
+    rewritten-in-place transcript does not move them until it grows past
+    the stored offset. Tokens are still counted."""
     session, run_id = make_session(repository)
     feed(repository, "claude-code", session.id, run_id, [claude_record("msg_A", cache_read=9000)], start=5000)
     feed(repository, "claude-code", session.id, run_id, [claude_record("msg_B", cache_read=100)])
-    assert repository.get_session(session.id).stats.context_used == 3 + 100 + 500
+    stats = repository.get_session(session.id).stats
+    assert stats.context_used == 3 + 9000 + 500
+    assert stats.tokens["cache_read"] == 9100
 
 
 def test_event_without_position_falls_back_to_key_order(repository) -> None:

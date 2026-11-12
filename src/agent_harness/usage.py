@@ -425,9 +425,10 @@ def plan_usage_application(
     a later offset of its transcript than the newest applied observation.
     A replay of an older line (cursor reset, retry) therefore cannot roll
     them back — including after a compaction report that shares its
-    predecessor's key. A NEW key at an earlier offset is fresh: the
-    transcript was rewritten. Events without a position fall back to
-    keys: stale only when the key is known and is not the latest.
+    predecessor's key. Conservatively, a transcript rewritten in place
+    does not move the snapshots until it grows past the stored offset.
+    Events without a position fall back to keys: stale only when the key
+    is known and is not the latest.
 
     ``tokens_version``: a legacy session (``None``) with nothing
     accumulated starts on the current rules when it receives verified
@@ -457,12 +458,11 @@ def plan_usage_application(
     known_key = accounting is not None and accounting.key is not None and previous is not None
     if position is None:
         fresh = not known_key or accounting.key == latest_key  # type: ignore[union-attr]
-    elif stored_offset is None or position[1] > stored_offset:
-        fresh = True
     else:
-        # Same or earlier offset: a replay, unless it is a report never
-        # seen before (the transcript was rewritten).
-        fresh = accounting is not None and accounting.key is not None and not known_key
+        # Strictly monotonic per transcript: the same or an earlier offset
+        # is a replay. A key missing from the ledger proves nothing — usage
+        # read while no harness run was active is never recorded.
+        fresh = stored_offset is None or position[1] > stored_offset
 
     tokens = dict(stats.tokens or {})
     nothing_accumulated = not any(

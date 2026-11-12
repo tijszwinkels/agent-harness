@@ -59,7 +59,10 @@ entry, per field, in the same transaction as the event row.
   `stats.skipped_usage_records` is incremented if it was non-zero. These
   shapes were not observed in practice.
 - **Replay** (cursor reset, retried line, restart): the ledger is persisted,
-  so re-reading a transcript adds nothing.
+  so re-reading a transcript adds nothing that was already counted. A report
+  first read while no harness run was active was never counted. If a cursor
+  reset re-reads it during a run, it is counted once and attributed to that
+  run; this attribution behaviour already existed.
 - **Snapshot freshness** (`context_used` and `context_window`) follows
   transcript order, not accounting keys. Accounting keys identify billable
   usage: a codex compaction report shares its predecessor's key but is a
@@ -67,9 +70,14 @@ entry, per field, in the same transaction as the event row.
   observation per (session, transcript path); SQLite stores it in
   `usage_positions`, in the event's transaction. A snapshot applies only if
   its line is at a later offset of that transcript. A replay of an older
-  line therefore cannot roll either value back. Exceptions:
-  - A report whose key is new, at an earlier offset, is fresh, because the
-    transcript was rewritten.
+  line therefore cannot roll either value back. The stored offset only
+  moves forward. A report missing from the ledger is not taken as evidence
+  of a rewrite: usage read while no harness run is active is never recorded
+  there. Notes:
+  - Conservative limitation: if a transcript were rewritten or truncated in
+    place at the same path, its snapshots would not update until it grew
+    past the stored offset. Claude Code and Codex append to their
+    transcripts. Token counting is not affected.
   - Different transcript files of one session are ordered independently.
   - An event without a position falls back to keys: it is stale only when
     its key is known and is not the latest one.

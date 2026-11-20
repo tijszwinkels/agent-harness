@@ -6,6 +6,7 @@ from threading import RLock
 from agent_harness.models import (
     LiveStateRequest,
     CreateRunRequest,
+    MAIL_OVERHEAD_BYTES,
     MailMessage,
     CreateSessionRequest,
     Event,
@@ -579,7 +580,7 @@ class InMemoryRepository:
             for mail in self._mail.values():
                 if mail.to != session_id or mail.state != "pending":
                     continue
-                size = len(mail.body.encode())
+                size = len(mail.body.encode()) + MAIL_OVERHEAD_BYTES
                 if claimed and max_bytes is not None and used + size > max_bytes:
                     break
                 mail.state = "delivered"

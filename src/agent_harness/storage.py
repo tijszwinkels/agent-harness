@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from agent_harness.models import (
     LiveStateRequest,
     CreateRunRequest,
+    MAIL_OVERHEAD_BYTES,
     MailMessage,
     CreateSessionRequest,
     Event,
@@ -873,7 +874,7 @@ class SQLiteRepository:
             used = 0
             for row in rows:
                 mail = _model_from_row(row, "payload", MailMessage)
-                size = len(mail.body.encode())
+                size = len(mail.body.encode()) + MAIL_OVERHEAD_BYTES
                 if claimed and max_bytes is not None and used + size > max_bytes:
                     break
                 mail = mail.model_copy(update={"state": "delivered", "delivered_at": now})

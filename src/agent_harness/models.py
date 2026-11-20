@@ -517,6 +517,12 @@ def delivery_mode_for(session: Session) -> DeliveryMode:
     return "resume" if session.origin == "harness" else "inbox"
 
 
+# Bytes charged per message, beyond its body, when a batch is budgeted: its
+# rendered "--- message <id> from <sender> ---" header and separators. Ids
+# are 37 bytes and senders at most 128 (``_ADDRESS_RE``), so 256 is ample.
+MAIL_OVERHEAD_BYTES = 256
+
+
 class MailMessage(HarnessModel):
     id: str = Field(default_factory=lambda: new_id("mail"))
     to: str = Field(min_length=1)

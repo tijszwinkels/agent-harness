@@ -193,7 +193,7 @@ async def test_send_to_busy_worker_waits_and_is_delivered_after_the_run() -> Non
         b = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "msg B", "sender": "ses_y"})).json()
         assert a["status"] == b["status"] == "waiting"
         status = (await client.get("/v1/mailbox/status")).json()
-        assert status == {"pending": 2, "active_runs": 1, "executes_runs": True}
+        assert status == {"pending": 2, "active_runs": 1, "executes_runs": True, "loopback_only": False}
         await _settle()
         assert len(h.spawned) == 1  # nothing started while busy
 
@@ -475,6 +475,132 @@ async def test_codex_mail_waits_until_its_resume_id_is_bound() -> None:
     assert "follow-up" in h.spawned[1].text and "again" in h.spawned[1].text
 
 
+@pytest.mark.asyncio
+async def test_storage_failure_before_submission_returns_mail_to_pending(monkeypatch) -> None:
+    h = Harness()
+    async with _client(h.app) as client:
+        worker = await _new_session(client, "pi")
+        await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "brief"})
+        await _settle()
+        waiting = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "reply"})).json()
+        assert waiting["status"] == "waiting"
+
+        real_create_run = h.repo.create_run
+        calls = {"n": 0}
+
+        def flaky_create_run(session_id, request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("disk I/O error")
+            return real_create_run(session_id, request)
+
+        monkeypatch.setattr(h.repo, "create_run", flaky_create_run)
+        h.spawned[0].finish()
+        await _settle()
+        assert len(h.spawned) == 1  # the delivery run could not be created
+        assert [m.state for m in h.repo.list_mail(worker)] == ["delivered", "pending"]
+
+        # The next trigger delivers it, exactly once.
+        again = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "nudge"})).json()
+        assert again["status"] == "delivered"
+        await _settle()
+        assert len(h.spawned) == 2 and "reply" in h.spawned[1].text and "nudge" in h.spawned[1].text
+
+
+@pytest.mark.asyncio
+async def test_send_reports_delivered_even_if_the_run_link_write_fails(monkeypatch) -> None:
+    h = Harness()
+
+    def broken_attach(ids, run_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(h.repo, "attach_mail_run", broken_attach)
+    async with _client(h.app) as client:
+        worker = await _new_session(client, "pi")
+        sent = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "x"})).json()
+        assert sent["status"] == "delivered" and sent["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_late_codex_binding_alone_delivers_the_waiting_reply() -> None:
+    from agent_harness.models import Event
+    from agent_harness.orchestrator import CodexCommandBuilder
+
+    h = Harness(builders={"codex": CodexCommandBuilder()})
+    async with h.app.router.lifespan_context(h.app), _client(h.app) as client:
+        worker = await _new_session(client, "codex")
+        await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "brief"})
+        await _settle()
+        h.spawned[0].finish()
+        await _settle()
+        sent = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "the reply"})).json()
+        assert sent["status"] == "waiting"
+
+        # What the observer does when it binds the rollout late.
+        bound = h.repo.get_session(worker).model_copy(
+            update={"codex_resume_id": "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000"}
+        )
+        h.repo.upsert_session(bound)
+        await h.bus.publish(Event(event="session.updated", session_id=worker,
+                                  data={"session": bound.model_dump(mode="json")}))
+        for _ in range(100):
+            if len(h.spawned) == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert len(h.spawned) == 2
+        argv = h.spawned[1].command.argv
+        assert argv[:3] == ("codex", "exec", "resume") and "the reply" in h.spawned[1].text
+
+
+@pytest.mark.asyncio
+async def test_rendered_batch_with_many_small_messages_fits_one_argument() -> None:
+    h = Harness()
+    async with _client(h.app) as client:
+        worker = await _new_session(client, "pi")
+        await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "brief"})
+        await _settle()
+        sender = "ses_" + "f" * 32
+        for _ in range(400):
+            await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "y" * 240, "sender": sender})
+        for i in range(10):
+            h.spawned[-1].finish()
+            await _settle()
+            if (await client.get("/v1/mailbox/status")).json()["pending"] == 0:
+                break
+        turns = h.spawned[1:]
+        assert len(turns) >= 2
+        assert all(len(p.text.encode()) < 128 * 1024 for p in turns)
+        assert sum(p.text.count("--- message ") for p in turns) == 400
+
+
+def test_launcher_refuses_reuse_of_a_harness_that_is_not_loopback_only(monkeypatch) -> None:
+    def fake_request(url, method="GET", body=None, *, timeout=15.0):
+        if url.endswith("/v1/backends"):
+            return {"data": []}
+        return {"pending": 0, "active_runs": 0, "executes_runs": True, "loopback_only": False}
+
+    monkeypatch.setattr(worker_cli, "_request", fake_request)
+    with pytest.raises(worker_cli.HarnessError, match="not bound to loopback"):
+        worker_cli._probe("http://127.0.0.1:1")
+
+
+def test_launcher_does_not_start_a_second_harness_when_the_port_is_slow(tmp_path, capsys) -> None:
+    # A listener that accepts but never answers looks like a busy harness,
+    # not an empty port: up must refuse instead of starting another one.
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(8)
+    port = silent.getsockname()[1]
+    try:
+        from agent_harness.cli import main
+
+        assert main(["up", "--port", str(port), "--state-dir", str(tmp_path)]) == 1
+        assert "could not verify" in capsys.readouterr().err
+        assert not (tmp_path / f"launcher-{port}.json").exists()
+    finally:
+        silent.close()
+
+
 # --- address helpers ------------------------------------------------------------
 
 
@@ -705,3 +831,23 @@ def test_launcher_refuses_to_reuse_a_harness_that_cannot_deliver(tmp_path, capsy
 def test_launcher_down_without_up_stops_nothing(tmp_path, capsys) -> None:
     out = _cli(capsys, "down", "--port", str(_free_port()), "--state-dir", str(tmp_path), "--task", "x")
     assert out["stopped"] is False
+
+
+def test_launcher_tightens_modes_of_its_own_default_state(tmp_path, capsys, monkeypatch) -> None:
+    import os
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    port = _free_port()
+    state = tmp_path / "agent-harness"
+    state.mkdir(mode=0o755)
+    os.chmod(state, 0o755)
+    for name in (f"harness-{port}.db", f"harness-{port}.log"):
+        (state / name).write_bytes(b"")
+        os.chmod(state / name, 0o644)
+    up = _cli(capsys, "up", "--port", str(port), "--serve-arg=--no-observer")
+    try:
+        assert _mode(state) == 0o700
+        for name in (f"harness-{port}.db", f"harness-{port}.log", f"launcher-{port}.json"):
+            assert _mode(state / name) == 0o600, name
+    finally:
+        _cli(capsys, "down", "--port", str(port), "--task", up["task"], "--timeout", "10")

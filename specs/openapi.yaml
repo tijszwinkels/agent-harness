@@ -433,7 +433,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [pending, active_runs, executes_runs]
+                required: [pending, active_runs, executes_runs, loopback_only]
                 properties:
                   pending:
                     type: integer
@@ -441,6 +441,9 @@ paths:
                     type: integer
                   executes_runs:
                     type: boolean
+                  loopback_only:
+                    type: boolean
+                    description: The server was started bound to a loopback address only.
 
   /v1/sessions/{id}/events:
     parameters:

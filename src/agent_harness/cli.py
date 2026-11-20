@@ -172,7 +172,11 @@ def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings
         # which cannot carry per-invocation CORS config.
         return "agent_harness.api:app"
 
-    kwargs = {"observer_settings": observer_settings, "self_url": _self_url(args.host, args.port)}
+    kwargs = {
+        "observer_settings": observer_settings,
+        "self_url": _self_url(args.host, args.port),
+        "loopback_only": args.host in _LOOPBACK_HOSTS,
+    }
     if args.cors_origin:
         kwargs["cors_origins"] = args.cors_origin
     repository = open_sqlite_repository(args.database) if args.database else None

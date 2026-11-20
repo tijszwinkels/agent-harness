@@ -18,6 +18,7 @@ this launcher started.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -207,16 +208,36 @@ def _probe(url: str, *, timeout: float = 3.0) -> dict[str, Any] | None:
     try:
         _request(f"{url}/v1/backends", timeout=timeout)
     except HarnessError as exc:
+        if _connection_refused(exc):
+            return None
         if "HTTP" in str(exc):
             raise HarnessError(f"{url} answers but is not an agent-harness: {exc}") from exc
-        return None
+        # A timeout or other ambiguous failure may be a slow live harness:
+        # starting a second one on its database would disturb its runs.
+        raise HarnessError(f"could not verify whether a harness runs at {url}: {exc}") from exc
     try:
         status = _request(f"{url}/v1/mailbox/status", timeout=timeout)
     except HarnessError as exc:
         raise HarnessError(f"the harness at {url} has no worker messaging (older version?): {exc}") from exc
     if not status.get("executes_runs"):
         raise HarnessError(f"the harness at {url} does not execute runs (serve without --execute-runs)")
+    if not status.get("loopback_only"):
+        raise HarnessError(
+            f"the harness at {url} is not bound to loopback only; refusing to route work to "
+            "an unauthenticated service that may be reachable from the network"
+        )
     return status
+
+
+def _connection_refused(exc: BaseException) -> bool:
+    while exc is not None:
+        if isinstance(exc, ConnectionRefusedError):
+            return True
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ConnectionRefusedError):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _is_harness(url: str) -> bool:
@@ -251,14 +272,26 @@ def cmd_up(args: argparse.Namespace) -> dict[str, Any]:
     task = args.task or secrets.token_hex(6)
     state_dir = _state_dir(args)
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # One launcher at a time per port: two cold starts must not both start a
-    # harness on the same database.
-    lock_fd = _private_file(state_dir / f"launcher-{args.port}.lock", append=True)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    if not args.state_dir:
+        # Launcher-owned default: private even if an older version made it 0755.
+        os.chmod(state_dir, 0o700)
+    with _lifecycle_lock(args):
         if _probe(url) is not None:
             return {"url": url, "started": False, "pid": None, "task": task, "env": {ENV_URL: url}}
         return _start_harness(args, url, task, state_dir)
+
+
+@contextlib.contextmanager
+def _lifecycle_lock(args: argparse.Namespace):
+    """One launcher lifecycle step at a time per port (up and down), so two
+    cold starts cannot both start a harness on one database and a closing
+    launcher cannot erase a newer launcher's receipt."""
+    state_dir = _state_dir(args)
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = _private_file(state_dir / f"launcher-{args.port}.lock", append=True)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
     finally:
         os.close(lock_fd)
 
@@ -267,6 +300,8 @@ def _start_harness(args: argparse.Namespace, url: str, task: str, state_dir: Pat
     database = args.database or str(state_dir / f"harness-{args.port}.db")
     if not Path(database).exists():
         os.close(_private_file(Path(database), append=True))
+    elif args.database is None:
+        os.chmod(database, 0o600)  # launcher-owned default; operator paths are left alone
     log_path = state_dir / f"harness-{args.port}.log"
     argv = [
         sys.executable, "-m", "agent_harness.cli", "serve",
@@ -277,6 +312,7 @@ def _start_harness(args: argparse.Namespace, url: str, task: str, state_dir: Pat
         "--execute-runs", "--database", database,
     ]
     log_fd = _private_file(log_path, append=True)
+    os.fchmod(log_fd, 0o600)
     try:
         proc = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, start_new_session=True,
@@ -296,6 +332,7 @@ def _start_harness(args: argparse.Namespace, url: str, task: str, state_dir: Pat
     state = {"url": url, "pid": proc.pid, "start_time": _process_start_time(proc.pid),
              "port": args.port, "task": task, "database": database, "log": str(log_path)}
     fd = _private_file(_state_file(args))
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as handle:
         handle.write(json.dumps(state))
     return {"url": url, "started": True, "pid": proc.pid, "task": task, "database": database,
@@ -321,6 +358,11 @@ def _wait_drained(url: str, timeout: float) -> dict[str, Any] | None:
 
 
 def cmd_down(args: argparse.Namespace) -> dict[str, Any]:
+    with _lifecycle_lock(args):
+        return _down_locked(args)
+
+
+def _down_locked(args: argparse.Namespace) -> dict[str, Any]:
     state_file = _state_file(args)
     url = f"http://{LOOPBACK}:{args.port}"
     try:

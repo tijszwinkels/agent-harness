@@ -118,7 +118,7 @@ def test_serve_command_configures_observer_roots(monkeypatch, tmp_path) -> None:
     assert main(["serve", "--observe-root", str(root)]) == 0
 
     assert calls == [
-        ("create_app", {"observer_settings": calls[0][1]["observer_settings"], "self_url": "http://127.0.0.1:8000"}),
+        ("create_app", {"observer_settings": calls[0][1]["observer_settings"], "self_url": "http://127.0.0.1:8000", "loopback_only": True}),
         ("run", (app,), {"host": "127.0.0.1", "port": 8000, "reload": False, "log_level": "info"}),
     ]
     assert calls[0][1]["observer_settings"].roots == (root,)

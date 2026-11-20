@@ -57,6 +57,9 @@ logger = logging.getLogger(__name__)
 
 # Pending mail is batched into ONE CLI argument; Linux caps a single argv
 # string at 128 KiB (MAX_ARG_STRLEN). Larger batches are split over turns.
+# The repository charges each message MAIL_OVERHEAD_BYTES for its rendered
+# header on top of its body; the rest of the margin covers the turn's own
+# header and reply hint (see ``messaging.format_delivery_turn``).
 MAIL_BATCH_MAX_BYTES = 96 * 1024
 
 OBSERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -91,6 +94,7 @@ def create_app(
     command_builders: Mapping[str, BackendCommandBuilder] | None = None,
     cors_origins: Sequence[str] | None = None,
     self_url: str | None = None,
+    loopback_only: bool = False,
 ) -> FastAPI:
     """``self_url`` is the base URL this harness is reachable at; it is
     handed to every launched run as ``AGENT_HARNESS_URL`` so a worker can
@@ -114,7 +118,7 @@ def create_app(
             watch_service_factory=watch_service_factory,
             task_factory=task_factory,
             run_manager=run_manager,
-            on_started=lambda: _deliver_all_pending(),
+            on_started=lambda: _on_started(),
         ),
     )
 
@@ -491,10 +495,10 @@ def create_app(
 
         return ForkSessionResponse(session=child, run=run)
 
-    async def _deliver_pending(session_id: str) -> str | None:
-        """Hand all pending mail for an idle turn-based session to ONE new run.
+    async def _deliver_pending(session_id: str) -> tuple[str, list[str]] | None:
+        """Hand pending mail for an idle turn-based session to ONE new run.
 
-        Returns the run id when a run was created. Messages stay ``pending``
+        Returns ``(run_id, delivered mail ids)`` when a run was submitted. Messages stay ``pending``
         while the session is busy (a queued or running run) — the trigger at
         that run's end delivers them — and when this harness does not execute
         runs at all.
@@ -533,13 +537,20 @@ def create_app(
                     session_id,
                     CreateRunRequest(message=format_delivery_turn(session, claimed)),
                 )
-            except HTTPException as exc:
-                # Nothing was launched; put the mail back for the next trigger.
-                repo.release_mail(ids)
+            except Exception as exc:
+                # ``_create_and_launch_run`` raises only before it submits
+                # the run (submission is its last step), so nothing was
+                # launched: put the mail back for the next trigger. If the
+                # release itself fails, the mail stays claimed (lost, never
+                # duplicated).
                 logger.warning(
-                    "Mail delivery could not start a run: session=%s status=%s detail=%s",
-                    session_id, exc.status_code, exc.detail,
+                    "Mail delivery could not start a run: session=%s error=%s",
+                    session_id, getattr(exc, "detail", exc),
                 )
+                try:
+                    repo.release_mail(ids)
+                except Exception:
+                    logger.exception("Could not release mail for session %s", session_id)
                 return None
             try:
                 repo.attach_mail_run(ids, launched.run_id)
@@ -550,7 +561,41 @@ def create_app(
             logger.info(
                 "Delivered %d message(s) to session=%s run=%s", len(ids), session_id, launched.run_id,
             )
-            return launched.run_id
+            return launched.run_id, ids
+
+    async def _watch_codex_bindings() -> None:
+        """Deliver mail that waited for a codex resume id once it is bound.
+
+        The observer binds the id from the first run's rollout, possibly
+        after that run ended; it announces it with ``session.updated``.
+        """
+        after = await events.max_sequence()
+        async for event in events.subscribe(after=after):
+            if event is None or event.event != "session.updated" or not event.session_id:
+                continue
+            session_data = event.data.get("session")
+            if not isinstance(session_data, dict) or not session_data.get("codex_resume_id"):
+                continue
+            if not repo.list_mail(event.session_id, {"pending"}):
+                continue
+            # The in-memory bus materializes after publishing; give the
+            # repository a moment to carry the id.
+            for _ in range(10):
+                try:
+                    if repo.get_session(event.session_id).codex_resume_id:
+                        break
+                except SessionNotFoundError:
+                    break
+                await asyncio.sleep(0.1)
+            try:
+                await _deliver_pending(event.session_id)
+            except Exception:
+                logger.exception("Mail delivery after codex binding failed: %s", event.session_id)
+
+    async def _on_started() -> None:
+        if run_manager is not None:
+            app.state.mail_binding_task = asyncio.create_task(_watch_codex_bindings())
+        await _deliver_all_pending()
 
     async def _deliver_all_pending() -> None:
         # Startup sweep: mail stored before a restart, or while the harness
@@ -597,12 +642,12 @@ def create_app(
         if mode == "inbox":
             return SendMailResponse(message=mail, status="stored")
 
-        run_id = await _deliver_pending(session_id)
+        delivered = await _deliver_pending(session_id)
         current = next(
             (m for m in repo.list_mail(session_id) if m.id == mail.id), mail
         )
-        if run_id is not None and current.run_id == run_id:
-            return SendMailResponse(message=current, status="delivered", run_id=run_id)
+        if delivered is not None and mail.id in delivered[1]:
+            return SendMailResponse(message=current, status="delivered", run_id=delivered[0])
         return SendMailResponse(message=current, status="waiting")
 
     @app.get("/v1/mailbox/status")
@@ -623,6 +668,9 @@ def create_app(
             "pending": pending,
             "active_runs": counter() if callable(counter) else 0,
             "executes_runs": run_manager is not None,
+            # The launcher reuses only a harness reachable from this machine
+            # alone (``serve`` reports its bind; unknown counts as not).
+            "loopback_only": loopback_only,
         }
 
     @app.get("/v1/sessions/{session_id}/mailbox")
@@ -799,6 +847,11 @@ def _lifespan(
         try:
             yield
         finally:
+            mail_task = getattr(app.state, "mail_binding_task", None)
+            if mail_task is not None:
+                mail_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await mail_task
             if observer_task is not None:
                 await _stop_observer_task(observer_task, stop_event)
 

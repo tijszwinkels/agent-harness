@@ -74,8 +74,10 @@ The harness decides from what it knows, not from process sniffing:
   pending mail as one user turn (oldest first, each with its sender and a
   reply hint). If the session is busy, the mail waits; when that run ends the
   harness delivers it. Each message is claimed by exactly one run (at most
-  once). A batch is capped at 96 KiB so it fits one CLI argument; the rest is
-  delivered in the following turn.
+  once). A batch is capped at 96 KiB, counting each message's rendered header,
+  so it fits one CLI argument; the rest is delivered in the following turn.
+  If storage fails before the delivery run exists, the batch returns to
+  pending for the next trigger.
 * **Interactive (`origin = external`)** — sessions the harness only observes
   from their transcript files, typically a person typing in the agent's own
   TUI. The harness never starts a turn there. Mail is stored as `unread` and
@@ -95,7 +97,8 @@ Codex workers resume by the thread id the transcript observer binds from their
 first run, so the harness must observe the Codex sessions root (the default
 `serve` does; with `--no-observer` add `--observe-root <CODEX_HOME>/sessions`).
 Until that id is bound, mail for a Codex worker that already ran stays
-pending instead of starting a new conversation.
+pending instead of starting a new conversation; it is delivered as soon as the
+observer announces the id.
 
 Known limits:
 
@@ -129,9 +132,14 @@ agent-harness down --port 8000 --task <task printed by up>
   (`--state-dir`).
   Forwarded `--serve-arg` options cannot override the loopback bind, port or
   database. Reuse requires a harness that executes runs and has worker
-  messaging; anything else on the port is an error. Concurrent `up` calls for
-  one port are serialized with a lock file. The state directory is created
-  0700; state, log and default database files are created 0600.
+  messaging and was started bound to loopback only (`/v1/mailbox/status`
+  reports `loopback_only`); anything else on the port is an error. A new
+  harness is started only when the port refuses connections: a timeout or
+  other unclear answer is reported, never treated as a free port. `up` and
+  `down` for one port take the same lock file. The default state directory
+  is kept 0700 and the launcher's own state, log and default database files
+  0600, including files left by an earlier version; an operator-supplied
+  `--state-dir` or `--database` keeps its permissions.
 * `up` prints a `task` id (random unless `--task` is given). `down --task ID`
   stops the harness **only if `up` with that task started it**. The pid is
   checked against its recorded kernel start time before every signal; without

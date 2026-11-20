@@ -327,27 +327,152 @@ async def test_pending_mail_survives_restart_and_is_delivered_once(tmp_path) -> 
     repo3.close()
 
 
-def test_sqlite_inbox_and_orphaned_claims_round_trip(tmp_path) -> None:
+def test_sqlite_claims_are_never_released_by_a_restart(tmp_path) -> None:
     repo = open_sqlite_repository(tmp_path / "h.db")
     tui = _external_session(repo)
     repo.add_mail(MailMessage(to=tui.id, body="hi", state="unread", delivery="inbox"))
     harness_session = Session(backend="pi", project=Project(**PROJECT))
     repo.upsert_session(harness_session)
     repo.add_mail(MailMessage(to=harness_session.id, body="work"))
-    claimed = repo.claim_pending_mail(harness_session.id)
+    assert len(repo.claim_pending_mail(harness_session.id)) == 1
     assert repo.claim_pending_mail(harness_session.id) == []
     repo.close()
 
     repo = open_sqlite_repository(tmp_path / "h.db")
     assert [m.body for m in repo.list_mail(tui.id, {"unread"})] == ["hi"]
-    repo.release_orphaned_mail_claims()  # claimed, never attached to a run
-    assert repo.sessions_with_pending_mail() == [harness_session.id]
-    again = repo.claim_pending_mail(harness_session.id)
-    repo.attach_mail_run([m.id for m in again], "run_1")
-    repo.release_orphaned_mail_claims()
+    # Claimed without a run link (e.g. the link write failed): still claimed.
     assert repo.sessions_with_pending_mail() == []
-    assert [m.id for m in again] == [m.id for m in claimed]
+    assert repo.claim_pending_mail(harness_session.id) == []
     repo.close()
+
+
+def test_two_connections_cannot_both_claim_the_same_mail(tmp_path) -> None:
+    # Both connections read the pending row before either writes, as two
+    # harness processes on one database could; only one claim may win.
+    db = tmp_path / "h.db"
+    first, second = open_sqlite_repository(db), open_sqlite_repository(db)
+    session = Session(backend="pi", project=Project(**PROJECT))
+    first.upsert_session(session)
+    first.add_mail(MailMessage(to=session.id, body="once"))
+    barrier = threading.Barrier(2, timeout=5)
+
+    class _BarrierConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *params):
+            if sql.lstrip().startswith("update mailbox"):
+                barrier.wait()
+            return self._inner.execute(sql, *params)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __enter__(self):
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    for repo in (first, second):
+        repo._connection = _BarrierConnection(repo._connection)
+    results: dict[str, list] = {}
+
+    def claim(name, repo):
+        results[name] = repo.claim_pending_mail(session.id)
+
+    threads = [threading.Thread(target=claim, args=(n, r)) for n, r in (("a", first), ("b", second))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert sorted(len(v) for v in results.values()) == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_failed_run_link_write_never_causes_a_second_delivery(tmp_path, monkeypatch) -> None:
+    db = tmp_path / "h.db"
+    repo1 = open_sqlite_repository(db)
+
+    def broken_attach(ids, run_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(repo1, "attach_mail_run", broken_attach)
+    first = Harness(repo1)
+    async with first.app.router.lifespan_context(first.app), _client(first.app) as client:
+        worker = await _new_session(client)
+        sent = await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "only once"})
+        assert sent.status_code == 202
+        await _settle()
+        assert len(first.spawned) == 1
+        first.spawned[0].finish()
+        await _settle()
+    repo1.close()
+
+    repo2 = open_sqlite_repository(db)
+    second = Harness(repo2)
+    async with second.app.router.lifespan_context(second.app):
+        await _settle()
+        assert second.spawned == []
+    repo2.close()
+
+
+@pytest.mark.asyncio
+async def test_large_batches_are_split_to_fit_one_cli_argument() -> None:
+    h = Harness()
+    async with _client(h.app) as client:
+        worker = await _new_session(client)
+        await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "brief"})
+        await _settle()
+        for i in range(4):
+            body = str(i) * 30_000
+            resp = await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": body})
+            assert resp.json()["status"] == "waiting"
+        h.spawned[0].finish()
+        await _settle()
+        assert len(h.spawned) == 2
+        assert len(h.spawned[1].text.encode()) < 128 * 1024
+        assert "3 messages" in h.spawned[1].text
+        h.spawned[1].finish()
+        await _settle()
+        assert len(h.spawned) == 3 and "3" * 30_000 in h.spawned[2].text
+
+
+@pytest.mark.asyncio
+async def test_bodies_that_cannot_be_a_cli_argument_are_refused() -> None:
+    h = Harness()
+    async with _client(h.app) as client:
+        worker = await _new_session(client)
+        nul = await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "a\x00b"})
+        big = await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "x" * 30_001})
+        assert nul.status_code == big.status_code == 422
+        assert h.repo.list_mail(worker) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_mail_waits_until_its_resume_id_is_bound() -> None:
+    from agent_harness.orchestrator import CodexCommandBuilder
+
+    h = Harness(builders={"codex": CodexCommandBuilder()})
+    async with _client(h.app) as client:
+        worker = await _new_session(client, "codex")
+        await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "brief"})
+        await _settle()
+        h.spawned[0].finish()
+        await _settle()
+        # No observer bound the codex thread: a fresh ``codex exec`` would
+        # lose the conversation, so the follow-up waits.
+        sent = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "follow-up"})).json()
+        assert sent["status"] == "waiting" and len(h.spawned) == 1
+
+        session = h.repo.get_session(worker)
+        h.repo.upsert_session(session.model_copy(update={"codex_resume_id": "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000"}))
+        resent = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "again"})).json()
+        assert resent["status"] == "delivered"
+        await _settle()
+    argv = h.spawned[1].command.argv
+    assert argv[:3] == ("codex", "exec", "resume") and "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000" in argv
+    assert "follow-up" in h.spawned[1].text and "again" in h.spawned[1].text
 
 
 # --- address helpers ------------------------------------------------------------
@@ -469,26 +594,67 @@ def test_cli_inbox_for_interactive_session(live_harness, capsys, monkeypatch) ->
     assert "404" in capsys.readouterr().err
 
 
+def test_cli_spawn_inherits_permission_bypass_from_its_spawner(live_harness, capsys, monkeypatch) -> None:
+    h = live_harness
+    monkeypatch.setenv("AGENT_HARNESS_URL", h.url)
+    monkeypatch.delenv("AGENT_HARNESS_SESSION", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    # No known spawner: restricted unless asked.
+    assert _cli(capsys, "worker", "spawn", "--backend", "pi", "x")["bypass_permissions"] is False
+    open_parent = _cli(capsys, "worker", "spawn", "--backend", "pi", "--bypass-permissions", "x")
+    assert open_parent["bypass_permissions"] is True
+
+    monkeypatch.setenv("AGENT_HARNESS_SESSION", open_parent["address"])
+    child = _cli(capsys, "worker", "spawn", "--backend", "codex", "x")
+    assert child["bypass_permissions"] is True
+    assert _cli(capsys, "worker", "spawn", "--backend", "codex", "--no-bypass-permissions", "x")["bypass_permissions"] is False
+
+    restricted = _cli(capsys, "worker", "spawn", "--backend", "pi", "--no-bypass-permissions", "x")
+    monkeypatch.setenv("AGENT_HARNESS_SESSION", restricted["address"])
+    assert _cli(capsys, "worker", "spawn", "--backend", "codex", "x")["bypass_permissions"] is False
+
+
 # --- launcher -------------------------------------------------------------------
+
+
+
+
+def _cmdline(pid: int) -> list[str]:
+    return [w.decode() for w in open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if w]
+
+
+def _mode(path) -> int:
+    import os
+    import stat
+
+    return stat.S_IMODE(os.stat(path).st_mode)
 
 
 def test_launcher_starts_reuses_and_stops_only_what_it_started(tmp_path, capsys) -> None:
     port = _free_port()
-    state = str(tmp_path / "state")
-    base = ["--port", str(port), "--state-dir", state]
-    up = _cli(capsys, "up", *base, "--task", "t1", "--serve-arg=--no-observer")
+    state = tmp_path / "state"
+    base = ["--port", str(port), "--state-dir", str(state)]
+    # A forwarded --host must not override the launcher's loopback bind.
+    up = _cli(capsys, "up", *base, "--serve-arg=--no-observer", "--serve-arg=--host", "--serve-arg=0.0.0.0")
     try:
         assert up["started"] is True and up["url"] == f"http://127.0.0.1:{port}"
+        assert up["task"]  # generated ownership receipt
+        argv = _cmdline(up["pid"])
+        hosts = [argv[i + 1] for i, w in enumerate(argv) if w == "--host"]
+        assert hosts[-1] == "127.0.0.1"
         assert worker_cli._is_harness(up["url"])
+        for name in (f"launcher-{port}.json", f"harness-{port}.log", f"harness-{port}.db"):
+            assert _mode(state / name) == 0o600, name
 
-        # A second launcher reuses it and does not own it.
-        again = _cli(capsys, "up", *base, "--task", "t2")
-        assert again["started"] is False
-        down_other = _cli(capsys, "down", *base, "--task", "t2")
+        # A second launcher using the defaults reuses it, gets its own task
+        # id, and its down does not stop the first launcher's harness.
+        again = _cli(capsys, "up", *base)
+        assert again["started"] is False and again["task"] != up["task"]
+        down_other = _cli(capsys, "down", *base, "--task", again["task"])
         assert down_other["stopped"] is False
         assert worker_cli._is_harness(up["url"])
 
-        down = _cli(capsys, "down", *base, "--task", "t1", "--timeout", "10")
+        down = _cli(capsys, "down", *base, "--task", up["task"], "--timeout", "10")
         assert down["stopped"] is True and down["drained"]["pending"] == 0
         assert not worker_cli._is_harness(up["url"])
     finally:
@@ -496,6 +662,46 @@ def test_launcher_starts_reuses_and_stops_only_what_it_started(tmp_path, capsys)
             subprocess.run(["kill", str(up["pid"])], check=False)
 
 
+def test_launcher_never_signals_a_recycled_pid(tmp_path, capsys) -> None:
+    # A stale record whose pid now belongs to another process (different
+    # start time) must not be signalled.
+    sleeper = subprocess.Popen(["sleep", "30"])
+    try:
+        port = _free_port()
+        (tmp_path / f"launcher-{port}.json").write_text(json.dumps(
+            {"pid": sleeper.pid, "start_time": "1", "task": "t", "port": port}
+        ))
+        out = _cli(capsys, "down", "--port", str(port), "--state-dir", str(tmp_path), "--task", "t")
+        assert out["stopped"] is False
+        assert sleeper.poll() is None
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def test_launcher_refuses_to_reuse_a_harness_that_cannot_deliver(tmp_path, capsys) -> None:
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agent_harness.cli", "serve", "--port", str(port), "--no-observer"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        url = f"http://127.0.0.1:{port}"
+        for _ in range(200):
+            try:
+                worker_cli._request(f"{url}/v1/backends", timeout=0.5)
+                break
+            except worker_cli.HarnessError:
+                time.sleep(0.05)
+        from agent_harness.cli import main
+
+        assert main(["up", "--port", str(port), "--state-dir", str(tmp_path)]) == 1
+        assert "does not execute runs" in capsys.readouterr().err
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
 def test_launcher_down_without_up_stops_nothing(tmp_path, capsys) -> None:
-    out = _cli(capsys, "down", "--port", str(_free_port()), "--state-dir", str(tmp_path))
+    out = _cli(capsys, "down", "--port", str(_free_port()), "--state-dir", str(tmp_path), "--task", "x")
     assert out["stopped"] is False

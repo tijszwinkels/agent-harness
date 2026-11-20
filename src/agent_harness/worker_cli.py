@@ -18,8 +18,10 @@ this launcher started.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -85,17 +87,16 @@ def cmd_spawn(args: argparse.Namespace) -> dict[str, Any]:
     base = args.url or harness_url()
     brief = _read_text(args.brief, args.brief_file, "brief")
     cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    sender = args.sender or self_address()
     session_body: dict[str, Any] = {
         "backend": args.backend,
         "project": {"path": cwd, "name": Path(cwd).name or cwd},
-        # A headless worker cannot answer permission prompts.
-        "bypass_permissions": not args.no_bypass,
+        "bypass_permissions": _spawn_bypass(base, args.bypass, sender),
     }
     for key in ("model", "effort", "title"):
         if getattr(args, key):
             session_body[key] = getattr(args, key)
     session = _request(f"{base}/v1/sessions", "POST", session_body)
-    sender = args.sender or self_address()
     sent = _send(base, session["id"], brief, sender)
     return {
         "address": session["id"],
@@ -103,7 +104,26 @@ def cmd_spawn(args: argparse.Namespace) -> dict[str, Any]:
         "status": sent["status"],
         "run_id": sent.get("run_id"),
         "reply_to": sender,
+        "bypass_permissions": session["bypass_permissions"],
     }
+
+
+def _spawn_bypass(base: str, explicit: bool | None, sender: str | None) -> bool:
+    """Permission bypass for a new worker.
+
+    An explicit flag wins. Otherwise a worker inherits its spawner's setting
+    when the spawner is a harness session (a restricted session cannot spawn
+    an unrestricted worker by default), and stays restricted otherwise.
+    """
+    if explicit is not None:
+        return explicit
+    if not sender:
+        return False
+    try:
+        parent = _request(f"{base}/v1/sessions/{_quote(sender)}")
+    except HarnessError:
+        return False
+    return bool(parent.get("origin") == "harness" and parent.get("bypass_permissions"))
 
 
 def _send(base: str, address: str, text: str, sender: str | None) -> dict[str, Any]:
@@ -172,70 +192,128 @@ def _state_file(args: argparse.Namespace) -> Path:
     return _state_dir(args) / f"launcher-{args.port}.json"
 
 
+def _private_file(path: Path, *, append: bool = False) -> int:
+    """Open ``path`` for writing, created 0600 (mail and transcripts are private)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    return os.open(path, flags, 0o600)
+
+
+def _probe(url: str, *, timeout: float = 3.0) -> dict[str, Any] | None:
+    """Mailbox status of the harness at ``url``; ``None`` when nothing answers.
+
+    Raises ``HarnessError`` for a server that answers but cannot deliver
+    messages (an older harness, or one serving without --execute-runs).
+    """
+    try:
+        _request(f"{url}/v1/backends", timeout=timeout)
+    except HarnessError as exc:
+        if "HTTP" in str(exc):
+            raise HarnessError(f"{url} answers but is not an agent-harness: {exc}") from exc
+        return None
+    try:
+        status = _request(f"{url}/v1/mailbox/status", timeout=timeout)
+    except HarnessError as exc:
+        raise HarnessError(f"the harness at {url} has no worker messaging (older version?): {exc}") from exc
+    if not status.get("executes_runs"):
+        raise HarnessError(f"the harness at {url} does not execute runs (serve without --execute-runs)")
+    return status
+
+
 def _is_harness(url: str) -> bool:
     try:
-        backends = _request(f"{url}/v1/backends", timeout=2.0)
+        return _probe(url, timeout=2.0) is not None
     except HarnessError:
         return False
-    return isinstance(backends, dict) and "data" in backends
 
 
-def _pid_matches(pid: int, port: int) -> bool:
-    """True when ``pid`` is still the harness we started (guards PID reuse)."""
+def _process_start_time(pid: int) -> str | None:
+    """Kernel start time of ``pid`` (Linux /proc); ``None`` if unavailable.
+
+    Recorded at ``up`` and compared before every signal, so a recycled pid is
+    never signalled. Without /proc there is no reliable identity, and ``down``
+    refuses to signal (fails closed).
+    """
     try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True  # no /proc (macOS): trust the recorded pid
-    words = [w.decode(errors="replace") for w in cmdline]
-    return "serve" in words and str(port) in words and any("agent" in w for w in words)
+        return None
+    fields = stat.rsplit(")", 1)[-1].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def _same_process(state: dict[str, Any]) -> bool:
+    started = state.get("start_time")
+    return started is not None and _process_start_time(int(state["pid"])) == started
 
 
 def cmd_up(args: argparse.Namespace) -> dict[str, Any]:
     url = f"http://{LOOPBACK}:{args.port}"
-    state_file = _state_file(args)
-    if _is_harness(url):
-        return {"url": url, "started": False, "pid": None, "env": {ENV_URL: url}}
-
+    task = args.task or secrets.token_hex(6)
     state_dir = _state_dir(args)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # One launcher at a time per port: two cold starts must not both start a
+    # harness on the same database.
+    lock_fd = _private_file(state_dir / f"launcher-{args.port}.lock", append=True)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if _probe(url) is not None:
+            return {"url": url, "started": False, "pid": None, "task": task, "env": {ENV_URL: url}}
+        return _start_harness(args, url, task, state_dir)
+    finally:
+        os.close(lock_fd)
+
+
+def _start_harness(args: argparse.Namespace, url: str, task: str, state_dir: Path) -> dict[str, Any]:
     database = args.database or str(state_dir / f"harness-{args.port}.db")
+    if not Path(database).exists():
+        os.close(_private_file(Path(database), append=True))
     log_path = state_dir / f"harness-{args.port}.log"
     argv = [
         sys.executable, "-m", "agent_harness.cli", "serve",
+        *args.serve_arg,
+        # Launcher-owned settings come LAST so a forwarded option can never
+        # override them (argparse keeps the last value): always loopback.
         "--host", LOOPBACK, "--port", str(args.port),
         "--execute-runs", "--database", database,
-        *args.serve_arg,
     ]
-    with open(log_path, "ab") as log:
+    log_fd = _private_file(log_path, append=True)
+    try:
         proc = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+            argv, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, start_new_session=True,
         )
+    finally:
+        os.close(log_fd)
     deadline = time.monotonic() + args.wait
-    while time.monotonic() < deadline:
+    while True:
         if proc.poll() is not None:
             raise HarnessError(f"harness exited with {proc.returncode}; see {log_path}")
         if _is_harness(url):
             break
+        if time.monotonic() >= deadline:
+            proc.terminate()
+            raise HarnessError(f"harness did not become ready within {args.wait}s; see {log_path}")
         time.sleep(0.2)
-    else:
-        proc.terminate()
-        raise HarnessError(f"harness did not become ready within {args.wait}s; see {log_path}")
-    state = {"url": url, "pid": proc.pid, "port": args.port, "task": args.task,
-             "database": database, "log": str(log_path)}
-    state_file.write_text(json.dumps(state))
-    return {"url": url, "started": True, "pid": proc.pid, "database": database,
+    state = {"url": url, "pid": proc.pid, "start_time": _process_start_time(proc.pid),
+             "port": args.port, "task": task, "database": database, "log": str(log_path)}
+    fd = _private_file(_state_file(args))
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(state))
+    return {"url": url, "started": True, "pid": proc.pid, "task": task, "database": database,
             "env": {ENV_URL: url}}
 
 
-def _wait_drained(url: str, timeout: float) -> dict[str, Any]:
+def _wait_drained(url: str, timeout: float) -> dict[str, Any] | None:
+    """Wait until no deliverable mail is pending and no run is active.
+
+    Returns the last status, or ``None`` if the harness could not be asked —
+    an unknown state is never treated as drained."""
     deadline = time.monotonic() + timeout
     while True:
-        status = _request(f"{url}/v1/mailbox/status")
-        if status["pending"] == 0 and status["active_runs"] == 0:
+        try:
+            status = _request(f"{url}/v1/mailbox/status", timeout=15.0)
+        except HarnessError:
+            status = None
+        if status is not None and status["pending"] == 0 and status["active_runs"] == 0:
             return status
         if time.monotonic() >= deadline:
             return status
@@ -255,21 +333,28 @@ def cmd_down(args: argparse.Namespace) -> dict[str, Any]:
         return {"url": url, "stopped": False, "reason": "not started by this launcher"}
 
     pid = int(state["pid"])
-    if not _pid_matches(pid, args.port):
+    if not _same_process(state):
         state_file.unlink(missing_ok=True)
-        return {"url": url, "stopped": False, "reason": "recorded harness is no longer running"}
+        return {"url": url, "stopped": False, "pid": pid,
+                "reason": "the recorded harness process is gone or cannot be verified; nothing signalled"}
 
-    status = _wait_drained(url, args.timeout) if _is_harness(url) else {"pending": 0, "active_runs": 0}
-    if (status["pending"] or status["active_runs"]) and not args.force:
+    status = _wait_drained(url, args.timeout)
+    busy = status is None or status["pending"] or status["active_runs"]
+    if busy and not args.force:
+        detail = "state unknown (no answer)" if status is None else (
+            f"pending={status['pending']}, active_runs={status['active_runs']}")
         raise HarnessError(
-            f"harness still busy after {args.timeout}s (pending={status['pending']}, "
-            f"active_runs={status['active_runs']}); rerun down, or pass --force"
+            f"harness not drained after {args.timeout}s ({detail}); rerun down, or pass --force"
         )
+    # Re-verify identity immediately before each signal.
+    if not _same_process(state):
+        state_file.unlink(missing_ok=True)
+        return {"url": url, "stopped": False, "pid": pid, "reason": "harness exited while draining"}
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _pid_alive(pid):
+    while time.monotonic() < deadline and _pid_alive(pid) and _same_process(state):
         time.sleep(0.2)
-    if _pid_alive(pid):
+    if _pid_alive(pid) and _same_process(state):
         os.kill(pid, signal.SIGKILL)
     state_file.unlink(missing_ok=True)
     return {"url": url, "stopped": True, "pid": pid, "drained": status}
@@ -314,7 +399,15 @@ def add_worker_parsers(subparsers: argparse._SubParsersAction) -> None:
     spawn.add_argument("--effort")
     spawn.add_argument("--cwd", help="Working directory (default: current).")
     spawn.add_argument("--title")
-    spawn.add_argument("--no-bypass-permissions", dest="no_bypass", action="store_true")
+    bypass = spawn.add_mutually_exclusive_group()
+    bypass.add_argument(
+        "--bypass-permissions", dest="bypass", action="store_true", default=None,
+        help="Run the worker with the backend's permission/sandbox bypass.",
+    )
+    bypass.add_argument(
+        "--no-bypass-permissions", dest="bypass", action="store_false",
+        help="Never bypass (default unless the spawner is a harness session that bypasses).",
+    )
     spawn.add_argument("brief", nargs="?", help="Brief text, or '-' for stdin.")
     spawn.add_argument("--brief-file", help="Read the brief from this file ('-' for stdin).")
     spawn.set_defaults(handler=cmd_spawn)
@@ -344,8 +437,12 @@ def add_worker_parsers(subparsers: argparse._SubParsersAction) -> None:
         p = subparsers.add_parser(name, help=helptext)
         p.add_argument("--port", type=int, default=8000)
         p.add_argument("--state-dir", help="Launcher state (default: $XDG_STATE_HOME/agent-harness).")
-        p.add_argument("--task", default="default", help="Launcher identity; down stops only what up --task started.")
         p.set_defaults(handler=handler)
+        if name == "up":
+            p.add_argument("--task", help="Launcher identity (default: a new random id, printed as 'task').")
+        else:
+            p.add_argument("--task", required=True,
+                           help="The 'task' printed by up; down stops only a harness that task started.")
         if name == "up":
             p.add_argument("--database", help="SQLite path (default: <state-dir>/harness-<port>.db).")
             p.add_argument("--wait", type=float, default=20.0, help="Seconds to wait for readiness.")

@@ -30,8 +30,17 @@ agent-harness worker inbox
 | `worker whoami` | Prints your address and the harness URL. | |
 
 `BRIEF`/`TEXT` may be `-` to read stdin; `--brief-file`/`--file` read a file.
-Spawned workers run with the backend's permission bypass (a headless worker
-cannot answer prompts); `--no-bypass-permissions` turns that off.
+A message body is at most 30,000 characters and may not contain NUL: it is
+handed to the worker's CLI as one argument. Put larger content in a file and
+send its path.
+
+Permissions: a headless worker cannot answer permission prompts, but a spawn
+must not widen what its spawner may do. By default a worker **inherits** the
+permission bypass of its spawner when the spawner is a harness session, and is
+restricted otherwise (an interactive session, or no known spawner). Pass
+`--bypass-permissions` or `--no-bypass-permissions` to choose explicitly. A
+task launcher that starts the first worker usually passes
+`--bypass-permissions` once; its descendants inherit it.
 
 ## Addresses
 
@@ -65,7 +74,8 @@ The harness decides from what it knows, not from process sniffing:
   pending mail as one user turn (oldest first, each with its sender and a
   reply hint). If the session is busy, the mail waits; when that run ends the
   harness delivers it. Each message is claimed by exactly one run (at most
-  once).
+  once). A batch is capped at 96 KiB so it fits one CLI argument; the rest is
+  delivered in the following turn.
 * **Interactive (`origin = external`)** — sessions the harness only observes
   from their transcript files, typically a person typing in the agent's own
   TUI. The harness never starts a turn there. Mail is stored as `unread` and
@@ -75,24 +85,41 @@ Delivery also runs at harness startup, so mail sent while the harness was down
 or not executing runs (no `--execute-runs`) is delivered when it can be.
 
 Durability: with `--database`, mail is stored in SQLite and survives restarts.
-A message already handed to a run is never handed out again, even if that run
-died with the harness (at most once, not exactly once).
+A message is durably claimed before its run starts and is never handed out
+again: not after a restart, not by a second harness process on the same
+database (claims are conditional updates). If the harness dies between the
+claim and the process start, that message is lost rather than delivered twice
+(at most once, not exactly once).
+
+Codex workers resume by the thread id the transcript observer binds from their
+first run, so the harness must observe the Codex sessions root (the default
+`serve` does; with `--no-observer` add `--observe-root <CODEX_HOME>/sessions`).
+Until that id is bound, mail for a Codex worker that already ran stays
+pending instead of starting a new conversation.
 
 Known limits:
 
 * A harness-origin session that someone has also opened in a TUI
   (`claude --resume …`) is still treated as turn-based.
 * Mail to an archived session stays pending.
+* Crash recovery: if the harness process is killed hard while a worker run is
+  in progress, that worker's CLI process can survive (it runs in its own
+  process group). On restart the harness marks the run failed and may resume
+  the same conversation for pending mail while the survivor still runs. This
+  is the harness's existing restart behaviour for every run, not specific to
+  messaging.
+* A Codex worker whose first run never produced a rollout keeps its mail
+  pending.
 * A worker that should be woken must have been launched by this harness. An
   agent started outside it (e.g. a Codex TUI) is interactive by this rule.
 
 ## Task launcher: `up` / `down`
 
 ```bash
-agent-harness up --port 8000        # prints {"url", "started", "pid", ...}
+agent-harness up --port 8000        # prints {"url", "started", "task", "pid", ...}
 export AGENT_HARNESS_URL=http://127.0.0.1:8000
 … run the task (agents call agent-harness worker …) …
-agent-harness down --port 8000
+agent-harness down --port 8000 --task <task printed by up>
 ```
 
 * `up` reuses a harness already answering on `127.0.0.1:PORT`, or starts
@@ -100,11 +127,20 @@ agent-harness down --port 8000
   <state-dir>/harness-PORT.db` detached and waits until it answers. It always
   binds loopback. State lives in `$XDG_STATE_HOME/agent-harness`
   (`--state-dir`).
-* `down` stops the harness **only if `up` with the same `--task` started it**
-  (the recorded pid is checked against its command line). Before stopping it
+  Forwarded `--serve-arg` options cannot override the loopback bind, port or
+  database. Reuse requires a harness that executes runs and has worker
+  messaging; anything else on the port is an error. Concurrent `up` calls for
+  one port are serialized with a lock file. The state directory is created
+  0700; state, log and default database files are created 0600.
+* `up` prints a `task` id (random unless `--task` is given). `down --task ID`
+  stops the harness **only if `up` with that task started it**. The pid is
+  checked against its recorded kernel start time before every signal; without
+  `/proc` (e.g. macOS) `down` refuses to signal at all. Before stopping it
   waits until no deliverable mail is pending and no runs are active
-  (`--timeout`, default 600 s); if still busy it refuses unless `--force`.
-  A reused harness keeps running and keeps delivering.
+  (`--timeout`, default 600 s). If the harness is still busy or does not
+  answer, it refuses unless `--force`. A reused harness keeps running and
+  keeps delivering. Stopping a harness that another task reuses ends that
+  task's deliveries too; the stored mail is delivered when it starts again.
 
 ## HTTP API
 

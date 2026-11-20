@@ -55,6 +55,10 @@ from agent_harness.settings import ObserverSettings
 
 logger = logging.getLogger(__name__)
 
+# Pending mail is batched into ONE CLI argument; Linux caps a single argv
+# string at 128 KiB (MAX_ARG_STRLEN). Larger batches are split over turns.
+MAIL_BATCH_MAX_BYTES = 96 * 1024
+
 OBSERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 # Idle interval after which `_sse_stream` injects an SSE comment (`:ka\n\n`)
@@ -506,7 +510,21 @@ def create_app(
                 return None
             if repo.has_active_run(session_id):
                 return None
-            claimed = repo.claim_pending_mail(session_id)
+            if (
+                session.backend == "codex"
+                and session.codex_resume_id is None
+                and repo.list_runs(session_id)
+            ):
+                # Codex resumes by the thread id the observer binds from the
+                # first run's rollout. Without it, ``codex exec`` would start
+                # a NEW conversation; keep the mail pending instead.
+                logger.warning(
+                    "Mail for codex session %s waits: no resume id bound yet "
+                    "(is the codex sessions root observed?)",
+                    session_id,
+                )
+                return None
+            claimed = repo.claim_pending_mail(session_id, MAIL_BATCH_MAX_BYTES)
             if not claimed:
                 return None
             ids = [mail.id for mail in claimed]
@@ -523,7 +541,12 @@ def create_app(
                     session_id, exc.status_code, exc.detail,
                 )
                 return None
-            repo.attach_mail_run(ids, launched.run_id)
+            try:
+                repo.attach_mail_run(ids, launched.run_id)
+            except Exception:
+                # The mail is already durably claimed, so it can never be
+                # handed out again; only the run link is missing.
+                logger.exception("Could not link mail to run %s", launched.run_id)
             logger.info(
                 "Delivered %d message(s) to session=%s run=%s", len(ids), session_id, launched.run_id,
             )
@@ -531,8 +554,9 @@ def create_app(
 
     async def _deliver_all_pending() -> None:
         # Startup sweep: mail stored before a restart, or while the harness
-        # could not execute runs, is delivered now.
-        repo.release_orphaned_mail_claims()
+        # could not execute runs, is delivered now. Claimed mail is never
+        # released here: a claim may belong to a run that already started,
+        # so retrying it could deliver twice (at most once beats twice).
         for session_id in repo.sessions_with_pending_mail():
             try:
                 await _deliver_pending(session_id)

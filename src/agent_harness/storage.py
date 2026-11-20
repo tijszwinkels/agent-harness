@@ -858,7 +858,10 @@ class SQLiteRepository:
             ).fetchall()
         return [row[0] for row in rows]
 
-    def claim_pending_mail(self, session_id: str) -> list[MailMessage]:
+    def claim_pending_mail(self, session_id: str, max_bytes: int | None = None) -> list[MailMessage]:
+        # Each row is claimed with a conditional update, so even a second
+        # connection to the same database (two harness processes) can never
+        # claim a message that another one already claimed.
         now = utc_now()
         with self._lock, self._connection:
             rows = self._connection.execute(
@@ -867,12 +870,22 @@ class SQLiteRepository:
                 (session_id,),
             ).fetchall()
             claimed = []
+            used = 0
             for row in rows:
-                mail = _model_from_row(row, "payload", MailMessage).model_copy(
-                    update={"state": "delivered", "delivered_at": now}
+                mail = _model_from_row(row, "payload", MailMessage)
+                size = len(mail.body.encode())
+                if claimed and max_bytes is not None and used + size > max_bytes:
+                    break
+                mail = mail.model_copy(update={"state": "delivered", "delivered_at": now})
+                cursor = self._connection.execute(
+                    "update mailbox set state = 'delivered', payload = ? "
+                    "where id = ? and state = 'pending'",
+                    (mail.model_dump_json(), mail.id),
                 )
-                self._upsert_mail(mail)
+                if cursor.rowcount != 1:
+                    continue
                 claimed.append(mail)
+                used += size
             return claimed
 
     def attach_mail_run(self, ids: list[str], run_id: str) -> None:
@@ -887,14 +900,6 @@ class SQLiteRepository:
                     self._upsert_mail(
                         mail.model_copy(update={"state": "pending", "delivered_at": None})
                     )
-
-    def release_orphaned_mail_claims(self) -> None:
-        with self._lock:
-            rows = self._connection.execute(
-                "select id from mailbox where state = 'delivered' "
-                "and json_extract(payload, '$.run_id') is null"
-            ).fetchall()
-        self.release_mail([row[0] for row in rows])
 
     def ack_mail(self, session_id: str, ids: list[str]) -> list[MailMessage]:
         now = utc_now()

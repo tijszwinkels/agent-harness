@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 BackendName = Literal["claude-code", "codex", "pi"]
 Origin = Literal["harness", "external"]
@@ -534,8 +534,18 @@ class MailMessage(HarnessModel):
 
 
 class SendMailRequest(HarnessModel):
-    body: str = Field(min_length=1, max_length=200_000)
+    # A body travels as one CLI argument (see ``api.MAIL_BATCH_MAX_BYTES``):
+    # 30,000 characters is at most 120 KB of UTF-8, under Linux's 128 KiB
+    # per-argument limit. Send a file path for anything larger.
+    body: str = Field(min_length=1, max_length=30_000)
     sender: str | None = Field(default=None, min_length=1)
+
+    @field_validator("body")
+    @classmethod
+    def _no_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("body must not contain NUL characters")
+        return value
 
 
 class SendMailResponse(HarnessModel):

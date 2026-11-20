@@ -564,18 +564,28 @@ class InMemoryRepository:
         with self._lock:
             return list(dict.fromkeys(m.to for m in self._mail.values() if m.state == "pending"))
 
-    def claim_pending_mail(self, session_id: str) -> list[MailMessage]:
-        """Mark every pending message for ``session_id`` delivered and return
-        them. A claimed message is never returned by a later claim, which is
-        what makes delivery at-most-once."""
+    def claim_pending_mail(self, session_id: str, max_bytes: int | None = None) -> list[MailMessage]:
+        """Mark pending messages for ``session_id`` delivered, oldest first,
+        and return them. A claimed message is never returned by a later claim
+        and is never released by a restart: delivery is at most once.
+
+        ``max_bytes`` bounds the UTF-8 size of the claimed bodies (the batch
+        becomes one CLI argument); the first message is always claimed.
+        """
         now = utc_now()
         with self._lock:
             claimed = []
+            used = 0
             for mail in self._mail.values():
-                if mail.to == session_id and mail.state == "pending":
-                    mail.state = "delivered"
-                    mail.delivered_at = now
-                    claimed.append(mail.model_copy(deep=True))
+                if mail.to != session_id or mail.state != "pending":
+                    continue
+                size = len(mail.body.encode())
+                if claimed and max_bytes is not None and used + size > max_bytes:
+                    break
+                mail.state = "delivered"
+                mail.delivered_at = now
+                claimed.append(mail.model_copy(deep=True))
+                used += size
             return claimed
 
     def attach_mail_run(self, ids: list[str], run_id: str) -> None:
@@ -592,14 +602,6 @@ class InMemoryRepository:
                 if mail is not None and mail.state == "delivered" and mail.run_id is None:
                     mail.state = "pending"
                     mail.delivered_at = None
-
-    def release_orphaned_mail_claims(self) -> None:
-        """Startup: a claim with no run attached never launched (claim, run
-        creation and attach happen in one event-loop step, and the CLI
-        process only spawns after it), so it is safe to retry."""
-        with self._lock:
-            orphans = [m.id for m in self._mail.values() if m.state == "delivered" and m.run_id is None]
-        self.release_mail(orphans)
 
     def ack_mail(self, session_id: str, ids: list[str]) -> list[MailMessage]:
         now = utc_now()

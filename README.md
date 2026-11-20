@@ -241,8 +241,11 @@ agent-harness worker inbox
   are never resumed: their messages are stored and read with `inbox`.
 - Every harness-launched run gets `AGENT_HARNESS_SESSION` (its own address)
   and `AGENT_HARNESS_URL`, so a worker can reply with no configuration.
-- `agent-harness up` / `down` let a task launcher reuse or start a
-  loopback-only harness and, on close, wait for pending deliveries and stop
+- A worker inherits its spawner's permission bypass (restricted when there
+  is no harness spawner); `--bypass-permissions` / `--no-bypass-permissions`
+  choose explicitly.
+- `agent-harness up` / `down --task <id>` let a task launcher reuse or start
+  a loopback-only harness and, on close, wait for pending deliveries and stop
   only a harness it started.
 
 ## Installation

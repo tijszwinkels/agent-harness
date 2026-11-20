@@ -6,6 +6,8 @@ from threading import RLock
 from agent_harness.models import (
     LiveStateRequest,
     CreateRunRequest,
+    MAIL_OVERHEAD_BYTES,
+    MailMessage,
     CreateSessionRequest,
     Event,
     Message,
@@ -70,6 +72,8 @@ class InMemoryRepository:
         self._sessions: dict[str, Session] = {}
         self._runs: dict[str, Run] = {}
         self._messages: dict[str, list[Message]] = {}
+        # Worker mailbox, in insertion order (see ``MailMessage``).
+        self._mail: dict[str, MailMessage] = {}
 
     def create_session(self, request: CreateSessionRequest) -> Session:
         session = Session(
@@ -538,6 +542,80 @@ class InMemoryRepository:
                 }
             )
 
+
+    # --- Worker mailbox -------------------------------------------------
+    # The SQLite repository implements the same methods durably.
+
+    def add_mail(self, message: MailMessage) -> MailMessage:
+        with self._lock:
+            if message.to not in self._sessions:
+                raise SessionNotFoundError(message.to)
+            self._mail[message.id] = message.model_copy(deep=True)
+        return message.model_copy(deep=True)
+
+    def list_mail(self, session_id: str, states: set[str] | None = None) -> list[MailMessage]:
+        with self._lock:
+            return [
+                mail.model_copy(deep=True)
+                for mail in self._mail.values()
+                if mail.to == session_id and (states is None or mail.state in states)
+            ]
+
+    def sessions_with_pending_mail(self) -> list[str]:
+        with self._lock:
+            return list(dict.fromkeys(m.to for m in self._mail.values() if m.state == "pending"))
+
+    def claim_pending_mail(self, session_id: str, max_bytes: int | None = None) -> list[MailMessage]:
+        """Mark pending messages for ``session_id`` delivered, oldest first,
+        and return them. A claimed message is never returned by a later claim
+        and is never released by a restart: delivery is at most once.
+
+        ``max_bytes`` bounds the UTF-8 size of the claimed bodies (the batch
+        becomes one CLI argument); the first message is always claimed.
+        """
+        now = utc_now()
+        with self._lock:
+            claimed = []
+            used = 0
+            for mail in self._mail.values():
+                if mail.to != session_id or mail.state != "pending":
+                    continue
+                size = len(mail.body.encode()) + MAIL_OVERHEAD_BYTES
+                if claimed and max_bytes is not None and used + size > max_bytes:
+                    break
+                mail.state = "delivered"
+                mail.delivered_at = now
+                claimed.append(mail.model_copy(deep=True))
+                used += size
+            return claimed
+
+    def attach_mail_run(self, ids: list[str], run_id: str) -> None:
+        with self._lock:
+            for mail_id in ids:
+                if mail_id in self._mail:
+                    self._mail[mail_id].run_id = run_id
+
+    def release_mail(self, ids: list[str]) -> None:
+        """Return claimed-but-never-launched messages to ``pending``."""
+        with self._lock:
+            for mail_id in ids:
+                mail = self._mail.get(mail_id)
+                if mail is not None and mail.state == "delivered" and mail.run_id is None:
+                    mail.state = "pending"
+                    mail.delivered_at = None
+
+    def ack_mail(self, session_id: str, ids: list[str]) -> list[MailMessage]:
+        now = utc_now()
+        with self._lock:
+            acked = []
+            for mail_id in ids:
+                mail = self._mail.get(mail_id)
+                if mail is None or mail.to != session_id or mail.state != "unread":
+                    continue
+                mail.state = "read"
+                mail.read_at = now
+                acked.append(mail.model_copy(deep=True))
+            return acked
 
 def _messages_equivalent(left: Message, right: Message) -> bool:
     return _message_key(left) == _message_key(right)

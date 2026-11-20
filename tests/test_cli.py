@@ -118,7 +118,7 @@ def test_serve_command_configures_observer_roots(monkeypatch, tmp_path) -> None:
     assert main(["serve", "--observe-root", str(root)]) == 0
 
     assert calls == [
-        ("create_app", {"observer_settings": calls[0][1]["observer_settings"]}),
+        ("create_app", {"observer_settings": calls[0][1]["observer_settings"], "self_url": "http://127.0.0.1:8000", "loopback_only": True}),
         ("run", (app,), {"host": "127.0.0.1", "port": 8000, "reload": False, "log_level": "info"}),
     ]
     assert calls[0][1]["observer_settings"].roots == (root,)
@@ -216,3 +216,12 @@ def test_serve_does_not_warn_on_loopback_hosts(monkeypatch, tmp_path, caplog, ho
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
         f"loopback host {host} must not trigger the public-bind warning"
     )
+
+
+def test_self_url_for_wildcard_and_ipv6_hosts() -> None:
+    from agent_harness.cli import _self_url
+
+    assert _self_url("127.0.0.1", 8877) == "http://127.0.0.1:8877"
+    assert _self_url("0.0.0.0", 1) == "http://127.0.0.1:1"
+    assert _self_url("::1", 2) == "http://[::1]:2"
+    assert _self_url("::", 3) == "http://[::1]:3"

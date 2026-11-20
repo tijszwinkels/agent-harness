@@ -89,6 +89,9 @@ All application endpoints are under `/v1` (health is also exposed unversioned).
 | GET | `/v1/sessions/{id}/events` | This session's events. |
 | GET | `/v1/events` | Global SSE event stream. |
 | GET | `/v1/events/max-sequence` | Highest sequence number (for replay/resume). |
+| POST/GET | `/v1/sessions/{id}/mailbox` | Send / list worker messages (see [Worker messaging](#worker-messaging)). |
+| POST | `/v1/sessions/{id}/mailbox/ack` | Mark inbox messages read. |
+| GET | `/v1/mailbox/status` | Undelivered mail and active runs. |
 
 The ASGI application import string is `agent_harness.api:app`.
 
@@ -217,6 +220,33 @@ Appending to an observed external session uses the same run endpoint. With
 Harness-created sessions launch a fresh non-interactive backend process and
 bind the backend's own session id from its output so subsequent turns resume
 in-context.
+
+## Worker messaging
+
+Agents can delegate to each other on one machine with three backend-neutral
+calls (details: [`docs/worker-messaging.md`](docs/worker-messaging.md)):
+
+```bash
+agent-harness worker spawn --backend codex "Review this branch; reply with findings."
+agent-harness worker send <address> "text"
+agent-harness worker inbox
+```
+
+- `spawn` starts a worker in a **fresh** session and returns its address at
+  once. `send` returns as soon as the message is stored.
+- **Turn-based workers** (sessions this harness launched) exit after each
+  turn. A message to one resumes the **same conversation in a new process**;
+  if it is busy, the message waits until the current run ends.
+- **Interactive sessions** (observed `origin=external` sessions, e.g. a TUI)
+  are never resumed: their messages are stored and read with `inbox`.
+- Every harness-launched run gets `AGENT_HARNESS_SESSION` (its own address)
+  and `AGENT_HARNESS_URL`, so a worker can reply with no configuration.
+- A worker inherits its spawner's permission bypass (restricted when there
+  is no harness spawner); `--bypass-permissions` / `--no-bypass-permissions`
+  choose explicitly.
+- `agent-harness up` / `down --task <id>` let a task launcher reuse or start
+  a loopback-only harness and, on close, wait for pending deliveries and stop
+  only a harness it started.
 
 ## Installation
 

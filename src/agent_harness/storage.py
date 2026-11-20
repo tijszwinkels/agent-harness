@@ -11,6 +11,8 @@ from pydantic import BaseModel
 from agent_harness.models import (
     LiveStateRequest,
     CreateRunRequest,
+    MAIL_OVERHEAD_BYTES,
+    MailMessage,
     CreateSessionRequest,
     Event,
     Message,
@@ -40,7 +42,7 @@ from agent_harness.repository import (
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TModel = TypeVar("TModel", bound=BaseModel)
 RUN_LIFECYCLE_EVENTS = {"run.started", "run.completed", "run.failed", "run.interrupted"}
 RUN_TERMINAL_EVENTS = RUN_LIFECYCLE_EVENTS - {"run.started"}
@@ -100,6 +102,16 @@ create table if not exists observer_offsets (
     next_offset integer not null,
     updated_at text not null
 );
+
+-- Worker mailbox (schema 5). A separate table: an older harness ignores it.
+create table if not exists mailbox (
+    id text primary key,
+    to_session text not null,
+    state text not null,
+    created_at text not null,
+    payload text not null
+);
+create index if not exists idx_mailbox_to_state on mailbox(to_session, state);
 
 create index if not exists idx_sessions_codex_resume_id
     on sessions(json_extract(payload, '$.codex_resume_id'))
@@ -820,6 +832,109 @@ class SQLiteRepository:
                         }
                     )
                 )
+
+
+    # --- Worker mailbox (see InMemoryRepository for the contract) --------
+
+    def add_mail(self, message: MailMessage) -> MailMessage:
+        with self._lock, self._connection:
+            if self._find_session_locked(message.to) is None:
+                raise SessionNotFoundError(message.to)
+            self._upsert_mail(message)
+        return message.model_copy(deep=True)
+
+    def list_mail(self, session_id: str, states: set[str] | None = None) -> list[MailMessage]:
+        with self._lock:
+            rows = self._connection.execute(
+                "select payload, state from mailbox where to_session = ? order by created_at, rowid",
+                (session_id,),
+            ).fetchall()
+        mail = [_model_from_row(row, "payload", MailMessage) for row in rows]
+        return [m for m in mail if states is None or m.state in states]
+
+    def sessions_with_pending_mail(self) -> list[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                "select distinct to_session from mailbox where state = 'pending'"
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def claim_pending_mail(self, session_id: str, max_bytes: int | None = None) -> list[MailMessage]:
+        # Each row is claimed with a conditional update, so even a second
+        # connection to the same database (two harness processes) can never
+        # claim a message that another one already claimed.
+        now = utc_now()
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                "select payload from mailbox where to_session = ? and state = 'pending' "
+                "order by created_at, rowid",
+                (session_id,),
+            ).fetchall()
+            claimed = []
+            used = 0
+            for row in rows:
+                mail = _model_from_row(row, "payload", MailMessage)
+                size = len(mail.body.encode()) + MAIL_OVERHEAD_BYTES
+                if claimed and max_bytes is not None and used + size > max_bytes:
+                    break
+                mail = mail.model_copy(update={"state": "delivered", "delivered_at": now})
+                cursor = self._connection.execute(
+                    "update mailbox set state = 'delivered', payload = ? "
+                    "where id = ? and state = 'pending'",
+                    (mail.model_dump_json(), mail.id),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                claimed.append(mail)
+                used += size
+            return claimed
+
+    def attach_mail_run(self, ids: list[str], run_id: str) -> None:
+        with self._lock, self._connection:
+            for mail in self._mail_by_ids_locked(ids):
+                self._upsert_mail(mail.model_copy(update={"run_id": run_id}))
+
+    def release_mail(self, ids: list[str]) -> None:
+        with self._lock, self._connection:
+            for mail in self._mail_by_ids_locked(ids):
+                if mail.state == "delivered" and mail.run_id is None:
+                    self._upsert_mail(
+                        mail.model_copy(update={"state": "pending", "delivered_at": None})
+                    )
+
+    def ack_mail(self, session_id: str, ids: list[str]) -> list[MailMessage]:
+        now = utc_now()
+        acked = []
+        with self._lock, self._connection:
+            for mail in self._mail_by_ids_locked(ids):
+                if mail.to != session_id or mail.state != "unread":
+                    continue
+                read = mail.model_copy(update={"state": "read", "read_at": now})
+                self._upsert_mail(read)
+                acked.append(read)
+        return acked
+
+    def _mail_by_ids_locked(self, ids: list[str]) -> list[MailMessage]:
+        found = []
+        for mail_id in ids:
+            row = self._connection.execute(
+                "select payload from mailbox where id = ?", (mail_id,)
+            ).fetchone()
+            if row is not None:
+                found.append(_model_from_row(row, "payload", MailMessage))
+        return found
+
+    def _upsert_mail(self, mail: MailMessage) -> None:
+        self._connection.execute(
+            """
+            insert into mailbox(id, to_session, state, created_at, payload)
+            values (?, ?, ?, ?, ?)
+            on conflict(id) do update set
+                state = excluded.state,
+                payload = excluded.payload
+            """,
+            (mail.id, mail.to, mail.state, mail.created_at.isoformat(), mail.model_dump_json()),
+        )
 
     def _initialize_schema(self) -> None:
         with self._lock, self._connection:

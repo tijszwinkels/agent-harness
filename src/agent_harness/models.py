@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 BackendName = Literal["claude-code", "codex", "pi"]
 Origin = Literal["harness", "external"]
@@ -474,3 +474,94 @@ class InterruptRunResponse(HarnessModel):
 
 class DataList(HarnessModel):
     data: list[Any]
+
+
+# --- Worker messaging (mailbox) ---------------------------------------------
+#
+# A mailbox message is addressed to a session id ("address"). Delivery depends
+# on who drives the recipient's turns (see ``delivery_mode_for``):
+#
+#   * ``resume`` — a harness-origin session is turn-based: the harness owns its
+#     CLI process lifecycle, so pending mail is handed to it as the next user
+#     turn in a NEW process (``--resume`` of the same conversation).
+#   * ``inbox``  — an external (observed) session is driven by someone else,
+#     typically a person in the agent's own TUI. The harness never starts a
+#     turn there; mail is stored until the session reads it with ``inbox``.
+#
+# States: ``pending`` (resume mode, not yet handed to a run), ``delivered``
+# (claimed by exactly one run — never handed out again), ``unread`` (inbox
+# mode, stored), ``read`` (acknowledged through the inbox).
+MailState = Literal["pending", "delivered", "unread", "read"]
+DeliveryMode = Literal["resume", "inbox"]
+
+# Addresses are session ids. ``<id>@<host>`` is reserved for cross-machine
+# routing (a follow-up); this slice only accepts local ids.
+_ADDRESS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def parse_address(address: str) -> str:
+    """Return the local session id for ``address`` or raise ``ValueError``."""
+    if "@" in address:
+        raise ValueError(
+            "remote addresses (<session>@<host>) are not supported yet; "
+            "this harness only routes to sessions on its own machine"
+        )
+    if not _ADDRESS_RE.match(address):
+        raise ValueError(f"invalid address: {address!r}")
+    return address
+
+
+def delivery_mode_for(session: Session) -> DeliveryMode:
+    # The rule is deliberately based on what the harness *knows*, not on
+    # process sniffing: it resumes only conversations it launched itself.
+    return "resume" if session.origin == "harness" else "inbox"
+
+
+# Bytes charged per message, beyond its body, when a batch is budgeted: its
+# rendered "--- message <id> from <sender> ---" header and separators. Ids
+# are 37 bytes and senders at most 128 (``_ADDRESS_RE``), so 256 is ample.
+MAIL_OVERHEAD_BYTES = 256
+
+
+class MailMessage(HarnessModel):
+    id: str = Field(default_factory=lambda: new_id("mail"))
+    to: str = Field(min_length=1)
+    # Sender address when known (the CLI fills it from the caller's
+    # environment); ``None`` for an anonymous sender such as a launcher.
+    sender: str | None = Field(default=None, min_length=1)
+    body: str = Field(min_length=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    state: MailState = "pending"
+    delivery: DeliveryMode = "resume"
+    # Run that carried this message (resume mode only).
+    run_id: str | None = None
+    delivered_at: datetime | None = None
+    read_at: datetime | None = None
+
+
+class SendMailRequest(HarnessModel):
+    # A body travels as one CLI argument (see ``api.MAIL_BATCH_MAX_BYTES``):
+    # 30,000 characters is at most 120 KB of UTF-8, under Linux's 128 KiB
+    # per-argument limit. Send a file path for anything larger.
+    body: str = Field(min_length=1, max_length=30_000)
+    sender: str | None = Field(default=None, min_length=1)
+
+    @field_validator("body")
+    @classmethod
+    def _no_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("body must not contain NUL characters")
+        return value
+
+
+class SendMailResponse(HarnessModel):
+    message: MailMessage
+    # ``delivered`` — handed to a run that is starting now; ``waiting`` —
+    # stored, delivered when the recipient's current run ends (or when the
+    # harness can execute runs); ``stored`` — inbox-only recipient.
+    status: Literal["delivered", "waiting", "stored"]
+    run_id: str | None = None
+
+
+class AckMailRequest(HarnessModel):
+    ids: list[str] = Field(min_length=1)

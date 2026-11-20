@@ -96,6 +96,8 @@ claim and the process start, that message is lost rather than delivered twice
 Codex workers resume by the thread id the transcript observer binds from their
 first run, so the harness must observe the Codex sessions root (the default
 `serve` does; with `--no-observer` add `--observe-root <CODEX_HOME>/sessions`).
+The observer recognizes Codex transcripts only under a `.codex/sessions` path,
+so a custom `CODEX_HOME` must itself be a directory named `.codex`.
 Until that id is bound, mail for a Codex worker that already ran stays
 pending instead of starting a new conversation; it is delivered as soon as the
 observer announces the id.

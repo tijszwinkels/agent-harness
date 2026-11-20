@@ -573,6 +573,89 @@ async def test_rendered_batch_with_many_small_messages_fits_one_argument() -> No
         assert sum(p.text.count("--- message ") for p in turns) == 400
 
 
+@pytest.mark.asyncio
+async def test_failure_after_run_row_insert_does_not_block_the_first_codex_turn(monkeypatch) -> None:
+    from agent_harness.orchestrator import CodexCommandBuilder
+
+    h = Harness(builders={"codex": CodexCommandBuilder()})
+    real_list_messages = h.repo.list_messages
+    fail = {"once": True}
+
+    def flaky_list_messages(session_id):
+        if fail["once"]:
+            fail["once"] = False
+            raise OSError("disk I/O error")
+        return real_list_messages(session_id)
+
+    async with _client(h.app) as client:
+        worker = await _new_session(client, "codex")
+        monkeypatch.setattr(h.repo, "list_messages", flaky_list_messages)
+        first = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "the brief"})).json()
+        assert first["status"] == "waiting" and h.spawned == []
+        # The unsubmitted run row is closed, not left queued.
+        assert [r.status for r in h.repo.list_runs(worker)] == ["failed"]
+
+        second = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "nudge"})).json()
+        assert second["status"] == "delivered"
+        await _settle()
+    assert len(h.spawned) == 1
+    argv = h.spawned[0].command.argv
+    # Still the first turn: a fresh ``codex exec``, carrying the brief once.
+    assert argv[:2] == ("codex", "exec") and argv[2] != "resume"
+    assert h.spawned[0].text.count("the brief") == 1 and "nudge" in h.spawned[0].text
+
+
+@pytest.mark.asyncio
+async def test_binding_watcher_survives_a_transient_storage_error(monkeypatch) -> None:
+    from agent_harness.models import Event
+    from agent_harness.orchestrator import CodexCommandBuilder
+
+    h = Harness(builders={"codex": CodexCommandBuilder()})
+    async with h.app.router.lifespan_context(h.app), _client(h.app) as client:
+        workers = []
+        for _ in range(2):
+            worker = await _new_session(client, "codex")
+            await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": "brief"})
+            await _settle()
+            h.spawned[-1].finish()
+            await _settle()
+            sent = (await client.post(f"/v1/sessions/{worker}/mailbox", json={"body": f"reply {worker}"})).json()
+            assert sent["status"] == "waiting"
+            workers.append(worker)
+
+        real_list_mail = h.repo.list_mail
+        fail = {"once": True}
+
+        def flaky_list_mail(session_id, states=None):
+            if fail["once"]:
+                fail["once"] = False
+                raise OSError("database is locked")
+            return real_list_mail(session_id, states)
+
+        monkeypatch.setattr(h.repo, "list_mail", flaky_list_mail)
+
+        async def bind(worker: str, uuid: str) -> None:
+            bound = h.repo.get_session(worker).model_copy(update={"codex_resume_id": uuid})
+            h.repo.upsert_session(bound)
+            await h.bus.publish(Event(event="session.updated", session_id=worker,
+                                      data={"session": bound.model_dump(mode="json")}))
+
+        await bind(workers[0], "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001")
+        for _ in range(200):
+            if len(h.spawned) == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert len(h.spawned) == 3 and f"reply {workers[0]}" in h.spawned[2].text
+
+        # The watcher is still alive for other sessions.
+        await bind(workers[1], "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0002")
+        for _ in range(200):
+            if len(h.spawned) == 4:
+                break
+            await asyncio.sleep(0.01)
+        assert len(h.spawned) == 4 and f"reply {workers[1]}" in h.spawned[3].text
+
+
 def test_launcher_refuses_reuse_of_a_harness_that_is_not_loopback_only(monkeypatch) -> None:
     def fake_request(url, method="GET", body=None, *, timeout=15.0):
         if url.endswith("/v1/backends"):

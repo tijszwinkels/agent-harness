@@ -385,6 +385,14 @@ def create_app(
                 logger.warning("Run command build failed: session=%s run=%s error=%s", session_id, run.id, exc)
                 repo.finish_run(session_id, run.id, status="failed")
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            except Exception:
+                # E.g. a transient storage error after the row was inserted.
+                # Nothing was submitted; a ``queued`` row no manager owns
+                # would block every later run (and mail) for this session.
+                logger.exception("Run preparation failed: session=%s run=%s", session_id, run.id)
+                with suppress(Exception):
+                    repo.finish_run(session_id, run.id, status="failed")
+                raise
 
             # ``on_start`` is invoked by the RunManager at the exact moment
             # the subprocess actually spawns — that may be right now (no
@@ -517,7 +525,9 @@ def create_app(
             if (
                 session.backend == "codex"
                 and session.codex_resume_id is None
-                and repo.list_runs(session_id)
+                # Only a run whose process started can own a codex thread;
+                # a run that failed before launch never did.
+                and any(run.started_at is not None for run in repo.list_runs(session_id))
             ):
                 # Codex resumes by the thread id the observer binds from the
                 # first run's rollout. Without it, ``codex exec`` would start
@@ -563,38 +573,63 @@ def create_app(
             )
             return launched.run_id, ids
 
+    binding_retries: set[asyncio.Task[None]] = set()
+
     async def _watch_codex_bindings() -> None:
         """Deliver mail that waited for a codex resume id once it is bound.
 
         The observer binds the id from the first run's rollout, possibly
-        after that run ended; it announces it with ``session.updated``.
+        after that run ended; it announces it with ``session.updated``. Each
+        event is handled in its own task, so a failure (e.g. a transient
+        storage error) affects only that event; the subscription itself is
+        re-established after an error.
         """
-        after = await events.max_sequence()
-        async for event in events.subscribe(after=after):
-            if event is None or event.event != "session.updated" or not event.session_id:
-                continue
-            session_data = event.data.get("session")
-            if not isinstance(session_data, dict) or not session_data.get("codex_resume_id"):
-                continue
-            if not repo.list_mail(event.session_id, {"pending"}):
-                continue
-            # The in-memory bus materializes after publishing; give the
-            # repository a moment to carry the id.
-            for _ in range(10):
-                try:
-                    if repo.get_session(event.session_id).codex_resume_id:
-                        break
-                except SessionNotFoundError:
-                    break
-                await asyncio.sleep(0.1)
+        after = 0
+        while True:
             try:
-                await _deliver_pending(event.session_id)
+                if after == 0:
+                    after = await events.max_sequence()
+                async for event in events.subscribe(after=after):
+                    if event is None:
+                        continue
+                    after = max(after, event.sequence or 0)
+                    if event.event != "session.updated" or not event.session_id:
+                        continue
+                    session_data = event.data.get("session")
+                    if not isinstance(session_data, dict) or not session_data.get("codex_resume_id"):
+                        continue
+                    task = asyncio.create_task(_deliver_after_binding(event.session_id))
+                    binding_retries.add(task)
+                    task.add_done_callback(binding_retries.discard)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                logger.exception("Mail delivery after codex binding failed: %s", event.session_id)
+                logger.exception("Codex binding watcher failed; resubscribing")
+                await asyncio.sleep(1.0)
+
+    async def _deliver_after_binding(session_id: str) -> None:
+        delay = 0.1
+        for _ in range(8):
+            try:
+                if not repo.list_mail(session_id, {"pending"}):
+                    return
+                # The in-memory bus materializes after publishing, so the
+                # repository may carry the id a moment later.
+                if repo.get_session(session_id).codex_resume_id:
+                    await _deliver_pending(session_id)
+                    if not repo.list_mail(session_id, {"pending"}) or repo.has_active_run(session_id):
+                        return
+            except SessionNotFoundError:
+                return
+            except Exception:
+                logger.exception("Mail delivery after codex binding failed: %s", session_id)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 5.0)
 
     async def _on_started() -> None:
         if run_manager is not None:
             app.state.mail_binding_task = asyncio.create_task(_watch_codex_bindings())
+            app.state.mail_binding_retries = binding_retries
         await _deliver_all_pending()
 
     async def _deliver_all_pending() -> None:
@@ -847,10 +882,13 @@ def _lifespan(
         try:
             yield
         finally:
+            for retry in list(getattr(app.state, "mail_binding_retries", ())):
+                retry.cancel()
             mail_task = getattr(app.state, "mail_binding_task", None)
             if mail_task is not None:
                 mail_task.cancel()
-                with suppress(asyncio.CancelledError):
+                # Whatever happened to it, observer cleanup below must run.
+                with suppress(asyncio.CancelledError, Exception):
                     await mail_task
             if observer_task is not None:
                 await _stop_observer_task(observer_task, stop_event)

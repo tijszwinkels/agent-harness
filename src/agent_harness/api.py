@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -15,7 +16,14 @@ from starlette.responses import StreamingResponse
 
 from agent_harness.backends import BackendRegistry, default_backend_registry
 from agent_harness.events import DurableEventBus, InMemoryEventBus
+from agent_harness.messaging import format_delivery_turn, harness_env
 from agent_harness.models import (
+    AckMailRequest,
+    MailMessage,
+    SendMailRequest,
+    SendMailResponse,
+    delivery_mode_for,
+    parse_address,
     LiveStateRequest,
     LiveStateResponse,
     CreateRunRequest,
@@ -32,6 +40,7 @@ from agent_harness.observer import ExternalTranscriptObserver, TranscriptWatchSe
 from agent_harness.orchestrator import (
     BackendCommandBuilder,
     CommandBuildError,
+    ProcessCommand,
     RunManager,
     RunProcessResult,
     claude_conversation_exists,
@@ -77,8 +86,15 @@ def create_app(
     run_manager: RunManager | None = None,
     command_builders: Mapping[str, BackendCommandBuilder] | None = None,
     cors_origins: Sequence[str] | None = None,
+    self_url: str | None = None,
 ) -> FastAPI:
+    """``self_url`` is the base URL this harness is reachable at; it is
+    handed to every launched run as ``AGENT_HARNESS_URL`` so a worker can
+    send messages back without configuration."""
     repo = repository or InMemoryRepository()
+    # Serializes mailbox claims against run creation, so two triggers for
+    # the same idle session can never both start a delivery run.
+    delivery_lock = asyncio.Lock()
     events = event_bus or _event_bus_for_repository(repo)
     backends = backend_registry or default_backend_registry()
     settings = observer_settings or ObserverSettings()
@@ -94,6 +110,7 @@ def create_app(
             watch_service_factory=watch_service_factory,
             task_factory=task_factory,
             run_manager=run_manager,
+            on_started=lambda: _deliver_all_pending(),
         ),
     )
 
@@ -337,6 +354,14 @@ def create_app(
                     message=message,
                     is_first_run=is_first_run,
                 )
+                # Every harness-launched run learns its own address and the
+                # harness URL, so ``agent-harness worker send/spawn`` works
+                # from inside it with no flags.
+                if isinstance(command, ProcessCommand):
+                    command = dataclasses.replace(
+                        command,
+                        env={**command.env, **harness_env(session_id=session.id, url=self_url)},
+                    )
             except KeyError as exc:
                 logger.warning("No command builder configured for backend: %s", session.backend)
                 # The run is in the repo but cannot be launched — leaving it
@@ -375,6 +400,7 @@ def create_app(
                     )
                 _schedule_run_result_materialization(
                     run_manager, repo, session_id=_session_id, run_id=_run_id,
+                    on_finished=_deliver_pending,
                 )
 
             result = run_manager.submit(
@@ -460,6 +486,132 @@ def create_app(
             run = repo.get_run(child.id, launched.run_id)
 
         return ForkSessionResponse(session=child, run=run)
+
+    async def _deliver_pending(session_id: str) -> str | None:
+        """Hand all pending mail for an idle turn-based session to ONE new run.
+
+        Returns the run id when a run was created. Messages stay ``pending``
+        while the session is busy (a queued or running run) — the trigger at
+        that run's end delivers them — and when this harness does not execute
+        runs at all.
+        """
+        if run_manager is None:
+            return None
+        async with delivery_lock:
+            try:
+                session = repo.get_session(session_id)
+            except SessionNotFoundError:
+                return None
+            if delivery_mode_for(session) != "resume" or session.status == "archived":
+                return None
+            if repo.has_active_run(session_id):
+                return None
+            claimed = repo.claim_pending_mail(session_id)
+            if not claimed:
+                return None
+            ids = [mail.id for mail in claimed]
+            try:
+                launched = await _create_and_launch_run(
+                    session_id,
+                    CreateRunRequest(message=format_delivery_turn(session, claimed)),
+                )
+            except HTTPException as exc:
+                # Nothing was launched; put the mail back for the next trigger.
+                repo.release_mail(ids)
+                logger.warning(
+                    "Mail delivery could not start a run: session=%s status=%s detail=%s",
+                    session_id, exc.status_code, exc.detail,
+                )
+                return None
+            repo.attach_mail_run(ids, launched.run_id)
+            logger.info(
+                "Delivered %d message(s) to session=%s run=%s", len(ids), session_id, launched.run_id,
+            )
+            return launched.run_id
+
+    async def _deliver_all_pending() -> None:
+        # Startup sweep: mail stored before a restart, or while the harness
+        # could not execute runs, is delivered now.
+        repo.release_orphaned_mail_claims()
+        for session_id in repo.sessions_with_pending_mail():
+            try:
+                await _deliver_pending(session_id)
+            except Exception:
+                logger.exception("Startup mail delivery failed: session=%s", session_id)
+
+    @app.post("/v1/sessions/{session_id}/mailbox", status_code=status.HTTP_202_ACCEPTED)
+    async def send_mail(session_id: str, request: SendMailRequest) -> SendMailResponse:
+        try:
+            parse_address(session_id)
+            if request.sender is not None:
+                parse_address(request.sender)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        try:
+            session = repo.get_session(session_id)
+        except SessionNotFoundError as exc:
+            logger.warning("Mail send failed because session was not found: %s", session_id)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found") from exc
+
+        mode = delivery_mode_for(session)
+        mail = repo.add_mail(
+            MailMessage(
+                to=session_id,
+                sender=request.sender,
+                body=request.body,
+                delivery=mode,
+                state="pending" if mode == "resume" else "unread",
+            )
+        )
+        await events.publish(
+            Event(
+                event="mail.received",
+                session_id=session_id,
+                data={"mail_id": mail.id, "sender": mail.sender, "delivery": mode},
+            )
+        )
+        if mode == "inbox":
+            return SendMailResponse(message=mail, status="stored")
+
+        run_id = await _deliver_pending(session_id)
+        current = next(
+            (m for m in repo.list_mail(session_id) if m.id == mail.id), mail
+        )
+        if run_id is not None and current.run_id == run_id:
+            return SendMailResponse(message=current, status="delivered", run_id=run_id)
+        return SendMailResponse(message=current, status="waiting")
+
+    @app.get("/v1/mailbox/status")
+    async def mailbox_status() -> dict[str, object]:
+        # Used by ``agent-harness down`` to wait until every deliverable
+        # message has been handed to a run and those runs have finished.
+        pending = 0
+        for session_id in repo.sessions_with_pending_mail():
+            try:
+                session = repo.get_session(session_id)
+            except SessionNotFoundError:
+                continue
+            if session.status == "archived":
+                continue
+            pending += len(repo.list_mail(session_id, {"pending"}))
+        counter = getattr(run_manager, "active_run_count", None)
+        return {
+            "pending": pending,
+            "active_runs": counter() if callable(counter) else 0,
+            "executes_runs": run_manager is not None,
+        }
+
+    @app.get("/v1/sessions/{session_id}/mailbox")
+    async def list_mail(session_id: str, state: list[str] | None = Query(default=None)) -> dict[str, object]:
+        if not repo.has_session(session_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        return {"data": repo.list_mail(session_id, set(state) if state else None)}
+
+    @app.post("/v1/sessions/{session_id}/mailbox/ack")
+    async def ack_mail(session_id: str, request: AckMailRequest) -> dict[str, object]:
+        if not repo.has_session(session_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        return {"data": repo.ack_mail(session_id, request.ids)}
 
     @app.get("/v1/sessions/{session_id}/runs")
     async def list_runs(session_id: str) -> dict[str, object]:
@@ -567,6 +719,7 @@ def _lifespan(
     watch_service_factory: WatchServiceFactory | None,
     task_factory: TaskFactory | None,
     run_manager: RunManager | None,
+    on_started: Callable[[], Awaitable[None]] | None = None,
 ):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -612,6 +765,12 @@ def _lifespan(
                     with suppress(asyncio.CancelledError):
                         await observer_task
                 raise
+
+        if on_started is not None:
+            try:
+                await on_started()
+            except Exception:
+                logger.exception("Startup hook failed")
 
         try:
             yield
@@ -708,6 +867,7 @@ def _schedule_run_result_materialization(
     *,
     session_id: str,
     run_id: str,
+    on_finished: Callable[[str], Awaitable[object]] | None = None,
 ) -> None:
     wait = getattr(run_manager, "wait", None)
     finish_run = getattr(repository, "finish_run", None)
@@ -720,6 +880,7 @@ def _schedule_run_result_materialization(
             finish_run,
             session_id=session_id,
             run_id=run_id,
+            on_finished=on_finished,
         )
     )
 
@@ -730,6 +891,7 @@ async def _materialize_run_result(
     *,
     session_id: str,
     run_id: str,
+    on_finished: Callable[[str], Awaitable[object]] | None = None,
 ) -> None:
     try:
         result: RunProcessResult = await wait(run_id)
@@ -739,6 +901,12 @@ async def _materialize_run_result(
         finish_run(session_id, run_id, status=result.status, stop_reason=stop_reason)
     except Exception:
         logger.exception("Failed to materialize run result: session=%s run=%s", session_id, run_id)
+    if on_finished is not None:
+        # The session may now be idle: deliver mail that waited for this run.
+        try:
+            await on_finished(session_id)
+        except Exception:
+            logger.exception("Post-run mail delivery failed: session=%s", session_id)
 
 
 async def _stop_observer_task(

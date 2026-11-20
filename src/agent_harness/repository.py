@@ -6,6 +6,7 @@ from threading import RLock
 from agent_harness.models import (
     LiveStateRequest,
     CreateRunRequest,
+    MailMessage,
     CreateSessionRequest,
     Event,
     Message,
@@ -70,6 +71,8 @@ class InMemoryRepository:
         self._sessions: dict[str, Session] = {}
         self._runs: dict[str, Run] = {}
         self._messages: dict[str, list[Message]] = {}
+        # Worker mailbox, in insertion order (see ``MailMessage``).
+        self._mail: dict[str, MailMessage] = {}
 
     def create_session(self, request: CreateSessionRequest) -> Session:
         session = Session(
@@ -538,6 +541,78 @@ class InMemoryRepository:
                 }
             )
 
+
+    # --- Worker mailbox -------------------------------------------------
+    # The SQLite repository implements the same methods durably.
+
+    def add_mail(self, message: MailMessage) -> MailMessage:
+        with self._lock:
+            if message.to not in self._sessions:
+                raise SessionNotFoundError(message.to)
+            self._mail[message.id] = message.model_copy(deep=True)
+        return message.model_copy(deep=True)
+
+    def list_mail(self, session_id: str, states: set[str] | None = None) -> list[MailMessage]:
+        with self._lock:
+            return [
+                mail.model_copy(deep=True)
+                for mail in self._mail.values()
+                if mail.to == session_id and (states is None or mail.state in states)
+            ]
+
+    def sessions_with_pending_mail(self) -> list[str]:
+        with self._lock:
+            return list(dict.fromkeys(m.to for m in self._mail.values() if m.state == "pending"))
+
+    def claim_pending_mail(self, session_id: str) -> list[MailMessage]:
+        """Mark every pending message for ``session_id`` delivered and return
+        them. A claimed message is never returned by a later claim, which is
+        what makes delivery at-most-once."""
+        now = utc_now()
+        with self._lock:
+            claimed = []
+            for mail in self._mail.values():
+                if mail.to == session_id and mail.state == "pending":
+                    mail.state = "delivered"
+                    mail.delivered_at = now
+                    claimed.append(mail.model_copy(deep=True))
+            return claimed
+
+    def attach_mail_run(self, ids: list[str], run_id: str) -> None:
+        with self._lock:
+            for mail_id in ids:
+                if mail_id in self._mail:
+                    self._mail[mail_id].run_id = run_id
+
+    def release_mail(self, ids: list[str]) -> None:
+        """Return claimed-but-never-launched messages to ``pending``."""
+        with self._lock:
+            for mail_id in ids:
+                mail = self._mail.get(mail_id)
+                if mail is not None and mail.state == "delivered" and mail.run_id is None:
+                    mail.state = "pending"
+                    mail.delivered_at = None
+
+    def release_orphaned_mail_claims(self) -> None:
+        """Startup: a claim with no run attached never launched (claim, run
+        creation and attach happen in one event-loop step, and the CLI
+        process only spawns after it), so it is safe to retry."""
+        with self._lock:
+            orphans = [m.id for m in self._mail.values() if m.state == "delivered" and m.run_id is None]
+        self.release_mail(orphans)
+
+    def ack_mail(self, session_id: str, ids: list[str]) -> list[MailMessage]:
+        now = utc_now()
+        with self._lock:
+            acked = []
+            for mail_id in ids:
+                mail = self._mail.get(mail_id)
+                if mail is None or mail.to != session_id or mail.state != "unread":
+                    continue
+                mail.state = "read"
+                mail.read_at = now
+                acked.append(mail.model_copy(deep=True))
+            return acked
 
 def _messages_equivalent(left: Message, right: Message) -> bool:
     return _message_key(left) == _message_key(right)

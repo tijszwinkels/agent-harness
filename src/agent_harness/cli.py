@@ -12,6 +12,7 @@ from agent_harness.orchestrator import RunManager
 from agent_harness.rollout_discovery import RolloutDiscovery
 from agent_harness.settings import ObserverSettings
 from agent_harness.storage import open_sqlite_repository
+from agent_harness.worker_cli import add_worker_parsers, run_handler
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    add_worker_parsers(subparsers)
+
     args = parser.parse_args(argv)
+    if args.command in ("worker", "up", "down"):
+        return run_handler(args)
     if args.command == "serve":
         if args.idle_timeout_seconds is not None and args.idle_timeout_seconds <= 0:
             parser.error("--idle-timeout-seconds must be positive")
@@ -144,6 +149,18 @@ def _observer_settings_from_args(args: argparse.Namespace) -> ObserverSettings:
     )
 
 
+def _self_url(host: str, port: int) -> str:
+    # The URL handed to launched runs as AGENT_HARNESS_URL. A wildcard bind
+    # is still reachable on loopback from this machine.
+    if host in ("0.0.0.0", ""):
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
 def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings):
     if (
         not observer_settings.enabled
@@ -155,7 +172,7 @@ def _app_for_serve(args: argparse.Namespace, observer_settings: ObserverSettings
         # which cannot carry per-invocation CORS config.
         return "agent_harness.api:app"
 
-    kwargs = {"observer_settings": observer_settings}
+    kwargs = {"observer_settings": observer_settings, "self_url": _self_url(args.host, args.port)}
     if args.cors_origin:
         kwargs["cors_origins"] = args.cors_origin
     repository = open_sqlite_repository(args.database) if args.database else None

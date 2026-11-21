@@ -1668,6 +1668,10 @@ class RunManager:
             )
         return run_process
 
+    def active_run_count(self) -> int:
+        """Runs this manager is running or holding in a session queue."""
+        return len(self._active) + sum(len(queue) for queue in self._queues.values())
+
     def drop_queued(self, session_id: str) -> list[str]:
         # Pop every queued entry for ``session_id`` and return their run ids.
         # The caller is responsible for reflecting the drop in the repository
